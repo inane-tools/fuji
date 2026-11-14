@@ -91,5 +91,7 @@ pub const RADIUS_DIALOG: Pixels = px(16.);
 
 // Layout
 pub const SIDEBAR_WIDTH: Pixels = px(232.);
+/// The sidebar as a strip of icons.
+pub const SIDEBAR_COMPACT_WIDTH: Pixels = px(60.);
 pub const CONTENT_PADDING: f32 = 24.;
 pub const CONTROL_HEIGHT: Pixels = px(32.);

@@ -13,12 +13,27 @@ dirs = "7.0.0"
 fuji-icloud.workspace = true
 futures = "0.3.34"
 gpui.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jiff = "0.2.43"
 keyring = { version = "3.6", features = ["windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+raw-window-handle = "0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 unicode-segmentation = "1.13.3"
+
+[target.'cfg(windows)'.dependencies]
+# The same version GPUI uses, for the clipboard and drag-out glue in platform.rs.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }

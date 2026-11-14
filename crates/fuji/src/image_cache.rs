@@ -36,6 +36,11 @@ impl LruImageCache {
         }
     }
 
+    /// Change how many images are kept; a smaller cache shrinks as it's used.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+    }
+
     fn evict_oldest(&mut self, window: &mut Window, cx: &mut App) {
         let Some(oldest) = self
             .items

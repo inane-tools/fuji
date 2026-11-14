@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 pub const PREVIEWS_KEPT: usize = 300;
 
-fn account_dir(dsid: &str) -> PathBuf {
+/// Everything cached for one account.
+pub fn account_dir(dsid: &str) -> PathBuf {
     let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
     let base = if cfg!(windows) {
         base.join("fuji").join("cache")

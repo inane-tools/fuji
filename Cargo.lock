@@ -1992,10 +1992,12 @@ dependencies = [
  "image",
  "jiff",
  "keyring",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "unicode-segmentation",
+ "windows 0.61.3",
 ]
 
 [[package]]

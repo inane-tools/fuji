@@ -8,8 +8,10 @@ mod asset;
 pub mod auth;
 mod cookies;
 pub mod photos;
+mod profile;
 pub mod srp;
 
 pub use asset::{Asset, AssetId, AssetKind, Resource};
 pub use auth::{Account, AuthClient, AuthError, SavedSession, SignInStep, TrustedPhone};
 pub use photos::{Album, PhotosClient, PhotosError};
+pub use profile::account_picture;

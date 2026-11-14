@@ -1,4 +1,4 @@
-//! Mosaic layout: justified rows grouped under year, month and day headers.
+//! Mosaic layout: justified rows grouped under month and day headers.
 //!
 //! Each day's photos flow into rows of about `target_height`; a full row is
 //! scaled so its photos, at their real proportions, exactly fill the width.
@@ -16,13 +16,15 @@ use crate::index::IndexItem;
 pub struct Params {
     pub width: f32,
     pub padding_x: f32,
+    /// Extra room on the right, for the timeline scrubber.
+    pub padding_right: f32,
     pub target_height: f32,
     pub gap: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowKind {
-    Year(String),
+    /// "March 2024".
     Month(String),
     Day(String),
     Tiles(Vec<Tile>),
@@ -40,6 +42,9 @@ pub struct Tile {
 pub struct Row {
     pub y: f32,
     pub height: f32,
+    /// The first item the row is about: a header's day or month starts
+    /// there, a tile row's first photo is it.
+    pub first: usize,
     pub kind: RowKind,
 }
 
@@ -48,11 +53,20 @@ pub struct Layout {
     pub rows: Vec<Row>,
     pub height: f32,
     pub width: f32,
+    /// Where each month starts, top to bottom (newest first).
+    pub months: Vec<MonthMark>,
     /// For each tile row, (row index, first item index); for lookups.
     tile_rows: Vec<(usize, usize)>,
 }
 
-pub const YEAR_HEIGHT: f32 = 76.;
+/// The top of a month's section, for the timeline scrubber.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MonthMark {
+    pub y: f32,
+    pub year: i16,
+    pub month: i8,
+}
+
 pub const MONTH_HEIGHT: f32 = 52.;
 pub const DAY_HEIGHT: f32 = 36.;
 /// Space after a day's photos.
@@ -71,6 +85,24 @@ impl Layout {
         start..end.max(start)
     }
 
+    /// The first tile row that ends below `y`: what's at the top of a
+    /// viewport scrolled to `y`.
+    pub fn tile_row_at(&self, y: f32) -> Option<&Row> {
+        let start = self.rows.partition_point(|row| row.y + row.height <= y);
+        self.rows[start..]
+            .iter()
+            .find(|row| matches!(row.kind, RowKind::Tiles(_)))
+    }
+
+    /// The month showing at content position `y`.
+    pub fn month_at(&self, y: f32) -> Option<MonthMark> {
+        let after = self.months.partition_point(|mark| mark.y <= y);
+        self.months
+            .get(after.saturating_sub(1))
+            .or(self.months.first())
+            .copied()
+    }
+
     /// The tile row containing item `index`.
     pub fn row_of_item(&self, index: usize) -> Option<&Row> {
         let pos = self.tile_rows.partition_point(|&(_, first)| first <= index);
@@ -83,74 +115,114 @@ impl Layout {
     }
 }
 
-/// Lay out `items` (newest first). `today` and `tz` decide labels like
-/// "Today" and which year counts as current.
-pub fn build(items: &[IndexItem], params: Params, today: Date, tz: &TimeZone) -> Layout {
+/// A stretch of the timeline to act on at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Span {
+    Day,
+    Month,
+    Year,
+}
+
+/// The run of items around `index` from the same day, month or year.
+/// `days` is newest first, so such items are next to each other.
+pub fn span(days: &[Option<Date>], index: usize, span: Span) -> Range<usize> {
+    let Some(&day) = days.get(index) else {
+        return 0..0;
+    };
+    let same = |other: &Option<Date>| match (day, *other) {
+        (Some(a), Some(b)) => match span {
+            Span::Day => a == b,
+            Span::Month => (a.year(), a.month()) == (b.year(), b.month()),
+            Span::Year => a.year() == b.year(),
+        },
+        (None, None) => true,
+        _ => false,
+    };
+    let start = days[..index]
+        .iter()
+        .rposition(|d| !same(d))
+        .map_or(0, |i| i + 1);
+    let end = days[index..]
+        .iter()
+        .position(|d| !same(d))
+        .map_or(days.len(), |i| index + i);
+    start..end
+}
+
+/// The local calendar day of every item (`None` when the date is unknown).
+/// Worked out once per index, so re-laying out (resizing, zooming) is cheap.
+pub fn days(items: &[IndexItem], tz: &TimeZone) -> Vec<Option<Date>> {
+    items.iter().map(|item| day_of(item.date, tz)).collect()
+}
+
+/// Lay out `items` (newest first), whose days are `days` (see [`days`]).
+/// `today` decides labels like "Today".
+pub fn build(items: &[IndexItem], days: &[Option<Date>], params: Params, today: Date) -> Layout {
+    debug_assert_eq!(items.len(), days.len());
     let mut layout = Layout {
         width: params.width,
         ..Layout::default()
     };
-    let inner = (params.width - 2. * params.padding_x).max(params.target_height);
+    let inner =
+        (params.width - 2. * params.padding_x - params.padding_right).max(params.target_height);
     let mut y = TOP_PADDING;
 
-    let mut last_year = None;
     let mut last_month = None;
+    let mut seen_unknown = false;
     let mut start = 0;
-    while start < items.len() {
-        let date = day_of(items[start].date, tz);
+    let count = items.len().min(days.len());
+    while start < count {
+        let date = days[start];
         let mut end = start + 1;
-        while end < items.len() && day_of(items[end].date, tz) == date {
+        while end < count && days[end] == date {
             end += 1;
         }
 
         if let Some(date) = date {
-            if last_year != Some(date.year()) {
-                if date.year() != today.year() {
-                    push(
-                        &mut layout,
-                        &mut y,
-                        YEAR_HEIGHT,
-                        RowKind::Year(date.year().to_string()),
-                    );
-                }
-                last_year = Some(date.year());
-                last_month = None;
-            }
-            if last_month != Some(date.month()) {
+            if last_month != Some((date.year(), date.month())) {
+                layout.months.push(MonthMark {
+                    y,
+                    year: date.year(),
+                    month: date.month(),
+                });
                 push(
                     &mut layout,
                     &mut y,
                     MONTH_HEIGHT,
-                    RowKind::Month(month_name(date.month()).into()),
+                    start,
+                    RowKind::Month(format!("{} {}", month_name(date.month()), date.year())),
                 );
-                last_month = Some(date.month());
+                last_month = Some((date.year(), date.month()));
             }
-        } else if last_year.is_some() || start == 0 {
+        } else if !seen_unknown || last_month.is_some() {
             push(
                 &mut layout,
                 &mut y,
                 MONTH_HEIGHT,
+                start,
                 RowKind::Month("Unknown date".into()),
             );
-            last_year = None;
+            seen_unknown = true;
             last_month = None;
         }
         push(
             &mut layout,
             &mut y,
             DAY_HEIGHT,
+            start,
             RowKind::Day(day_label(date, today)),
         );
 
         for (height, tiles) in justify(&items[start..end], start, inner, params) {
-            let tiles = tiles
+            let tiles: Vec<Tile> = tiles
                 .into_iter()
                 .map(|t| Tile {
                     x: t.x + params.padding_x,
                     ..t
                 })
                 .collect();
-            push(&mut layout, &mut y, height, RowKind::Tiles(tiles));
+            let first = tiles.first().map_or(start, |t| t.index);
+            push(&mut layout, &mut y, height, first, RowKind::Tiles(tiles));
             y += params.gap;
         }
         y += DAY_SPACING - params.gap;
@@ -160,15 +232,14 @@ pub fn build(items: &[IndexItem], params: Params, today: Date, tz: &TimeZone) ->
     layout
 }
 
-fn push(layout: &mut Layout, y: &mut f32, height: f32, kind: RowKind) {
-    if let RowKind::Tiles(tiles) = &kind
-        && let Some(first) = tiles.first()
-    {
-        layout.tile_rows.push((layout.rows.len(), first.index));
+fn push(layout: &mut Layout, y: &mut f32, height: f32, first: usize, kind: RowKind) {
+    if let RowKind::Tiles(_) = &kind {
+        layout.tile_rows.push((layout.rows.len(), first));
     }
     layout.rows.push(Row {
         y: *y,
         height,
+        first,
         kind,
     });
     *y += height;
@@ -227,7 +298,7 @@ fn day_of(ms: i64, tz: &TimeZone) -> Option<Date> {
     Some(ts.to_zoned(tz.clone()).date())
 }
 
-fn month_name(month: i8) -> &'static str {
+pub fn month_name(month: i8) -> &'static str {
     const NAMES: [&str; 12] = [
         "January",
         "February",
@@ -276,6 +347,7 @@ mod tests {
     const PARAMS: Params = Params {
         width: 1000.,
         padding_x: 0.,
+        padding_right: 0.,
         target_height: 200.,
         gap: 4.,
     };
@@ -296,6 +368,10 @@ mod tests {
         }
     }
 
+    fn build_utc(items: &[IndexItem], params: Params, today: Date) -> Layout {
+        build(items, &days(items, &TimeZone::UTC), params, today)
+    }
+
     fn tile_rows(layout: &Layout) -> Vec<(f32, Vec<Tile>)> {
         layout
             .rows
@@ -313,7 +389,7 @@ mod tests {
         let items: Vec<_> = (0..12)
             .map(|i| item(today, [1.5, 0.75, 1.0, 1.33][i % 4]))
             .collect();
-        let layout = build(&items, PARAMS, today, &TimeZone::UTC);
+        let layout = build_utc(&items, PARAMS, today);
         let rows = tile_rows(&layout);
         let (last, full) = rows.split_last().unwrap();
         for (height, tiles) in full {
@@ -331,7 +407,7 @@ mod tests {
     fn photos_keep_their_proportions() {
         let today = date(2026, 11, 14);
         let items = vec![item(today, 1.5), item(today, 0.75), item(today, 1.0)];
-        let layout = build(&items, PARAMS, today, &TimeZone::UTC);
+        let layout = build_utc(&items, PARAMS, today);
         for (height, tiles) in tile_rows(&layout) {
             for tile in tiles {
                 let aspect = items[tile.index].aspect;
@@ -350,12 +426,11 @@ mod tests {
             item(date(2026, 10, 30), 1.),
             item(date(2025, 12, 24), 1.),
         ];
-        let layout = build(&items, PARAMS, today, &TimeZone::UTC);
+        let layout = build_utc(&items, PARAMS, today);
         let headers: Vec<String> = layout
             .rows
             .iter()
             .filter_map(|r| match &r.kind {
-                RowKind::Year(s) => Some(format!("Y {s}")),
                 RowKind::Month(s) => Some(format!("M {s}")),
                 RowKind::Day(s) => Some(format!("D {s}")),
                 RowKind::Tiles(_) => None,
@@ -364,17 +439,42 @@ mod tests {
         assert_eq!(
             headers,
             [
-                "M November",
+                "M November 2026",
                 "D Today",
                 "D Yesterday",
                 "D Monday 2 November",
-                "M October",
+                "M October 2026",
                 "D Friday 30 October",
-                "Y 2025",
-                "M December",
+                "M December 2025",
                 "D Wednesday 24 December",
             ]
         );
+        // One mark per month, top to bottom, findable by position.
+        let marks: Vec<(i16, i8)> = layout.months.iter().map(|m| (m.year, m.month)).collect();
+        assert_eq!(marks, [(2026, 11), (2026, 10), (2025, 12)]);
+        assert_eq!(layout.month_at(0.).map(|m| m.month), Some(11));
+        let october = layout.months[1];
+        assert_eq!(layout.month_at(october.y + 1.), Some(october));
+        assert_eq!(layout.month_at(layout.height).map(|m| m.year), Some(2025));
+        // Days, months and years as runs of items.
+        let days = days(&items, &TimeZone::UTC);
+        assert_eq!(span(&days, 1, Span::Day), 1..2);
+        assert_eq!(span(&days, 1, Span::Month), 0..3);
+        assert_eq!(span(&days, 3, Span::Month), 3..4);
+        assert_eq!(span(&days, 0, Span::Year), 0..4);
+        assert_eq!(span(&days, 4, Span::Year), 4..5);
+        assert_eq!(span(&days, 9, Span::Day), 0..0);
+        // Headers know where their day or month starts.
+        let firsts: Vec<usize> = layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Month(_)))
+            .map(|r| r.first)
+            .collect();
+        assert_eq!(firsts, [0, 3, 4]);
+        // The first photos below a position.
+        let row = layout.tile_row_at(october.y).unwrap();
+        assert!(matches!(&row.kind, RowKind::Tiles(t) if t[0].index == 3));
     }
 
     #[test]
@@ -388,7 +488,7 @@ mod tests {
                 )
             })
             .collect();
-        let layout = build(&items, PARAMS, today, &TimeZone::UTC);
+        let layout = build_utc(&items, PARAMS, today);
         for pair in layout.rows.windows(2) {
             assert!(pair[1].y >= pair[0].y + pair[0].height - 0.01);
         }
@@ -416,7 +516,7 @@ mod tests {
     fn extreme_shapes_are_clamped() {
         let today = date(2026, 11, 14);
         let items = vec![item(today, 10.), item(today, 0.05), item(today, f32::NAN)];
-        let layout = build(&items, PARAMS, today, &TimeZone::UTC);
+        let layout = build_utc(&items, PARAMS, today);
         for (height, tiles) in tile_rows(&layout) {
             for t in tiles {
                 let a = t.width / height;
@@ -430,7 +530,7 @@ mod tests {
         let today = date(2026, 11, 14);
         let mut undated = item(today, 1.);
         undated.date = 0;
-        let layout = build(&[item(today, 1.), undated], PARAMS, today, &TimeZone::UTC);
+        let layout = build_utc(&[item(today, 1.), undated], PARAMS, today);
         assert!(
             layout
                 .rows

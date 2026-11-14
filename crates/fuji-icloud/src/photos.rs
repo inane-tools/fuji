@@ -89,6 +89,9 @@ pub struct PhotosClient {
     agent: Agent,
     cookies: CookieLog,
     endpoint: String,
+    /// Where new photos are sent, if the account has the upload service.
+    upload_endpoint: Option<String>,
+    dsid: String,
     query: Vec<(&'static str, String)>,
 }
 
@@ -106,6 +109,11 @@ impl PhotosClient {
                 "{}/database/1/com.apple.photos.cloud/production/private",
                 root.trim_end_matches('/')
             ),
+            upload_endpoint: account
+                .webservices
+                .get("uploadimagews")
+                .map(|root| format!("{}/upload", root.trim_end_matches('/'))),
+            dsid: account.dsid.clone(),
             query: vec![
                 ("clientBuildNumber", CLIENT_BUILD_NUMBER.into()),
                 ("clientMasteringNumber", CLIENT_MASTERING_NUMBER.into()),
@@ -283,6 +291,34 @@ impl PhotosClient {
         result.map_err(io_error)
     }
 
+    /// Add a photo or video file to the library, the way icloud.com's
+    /// upload button does. `filename` decides the type (by its extension).
+    pub fn upload(&self, filename: &str, bytes: &[u8]) -> Result<(), PhotosError> {
+        let endpoint = self
+            .upload_endpoint
+            .as_deref()
+            .ok_or(PhotosError::NotAvailable)?;
+        let mut resp = self
+            .agent
+            .post(endpoint)
+            .query("filename", filename)
+            .query("dsid", &self.dsid)
+            .header("Origin", "https://www.icloud.com")
+            .header("Referer", "https://www.icloud.com/")
+            .content_type("application/octet-stream")
+            .send(bytes)?;
+        self.cookies.record(&resp);
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(error_for(status, &text));
+        }
+        match upload_error(&text) {
+            Some(message) => Err(PhotosError::Unexpected { status, message }),
+            None => Ok(()),
+        }
+    }
+
     fn post(&self, path: &str, body: &Value) -> Result<Value, PhotosError> {
         let mut req = self.agent.post(format!("{}/{}", self.endpoint, path));
         for (key, value) in &self.query {
@@ -314,6 +350,21 @@ impl PhotosClient {
         }
         Ok(data)
     }
+}
+
+/// The upload service reports failures in a 200 response's `errors` list.
+fn upload_error(body: &str) -> Option<String> {
+    let data: Value = serde_json::from_str(body).ok()?;
+    let errors = data.get("errors")?.as_array()?;
+    let first = errors.first()?;
+    Some(
+        first
+            .get("message")
+            .or_else(|| first.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("iCloud didn't accept the file")
+            .to_string(),
+    )
 }
 
 fn error_for(status: u16, body: &str) -> PhotosError {
@@ -705,6 +756,16 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn upload_errors_are_read() {
+        assert_eq!(upload_error(r#"{"records":[]}"#), None);
+        assert_eq!(upload_error(r#"{"errors":[]}"#), None);
+        assert_eq!(
+            upload_error(r#"{"errors":[{"message":"Unsupported type"}]}"#).as_deref(),
+            Some("Unsupported type")
         );
     }
 

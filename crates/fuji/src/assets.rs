@@ -2,7 +2,7 @@
 //!
 //! Icons are Phosphor (MIT, see assets/icons/LICENSE-phosphor), extracted
 //! from the icon font as small SVGs: regular weight when idle, fill when
-//! active. Gabarito is under the OFL (assets/OFL-Gabarito.txt).
+//! active. A few simple ones (check, plus, sliders, ...) are drawn for fuji. Gabarito is under the OFL (assets/OFL-Gabarito.txt).
 
 use std::borrow::Cow;
 
@@ -47,6 +47,16 @@ impl AssetSource for Assets {
                 "play-fill",
                 "live",
                 "warning",
+                // Drawn for fuji in the same style.
+                "check",
+                "plus",
+                "minus",
+                "sidebar",
+                "settings",
+                "settings-active",
+                "open",
+                "select",
+                "upload",
             ]
         );
         Ok(bytes.map(Cow::Borrowed))
@@ -80,6 +90,9 @@ mod tests {
             "close",
             "play-fill",
             "warning",
+            "check",
+            "settings-active",
+            "upload",
         ] {
             let bytes = Assets.load(&format!("icons/{name}.svg")).unwrap().unwrap();
             assert!(bytes.starts_with(b"<svg"));

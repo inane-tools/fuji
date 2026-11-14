@@ -2,12 +2,14 @@
 //!
 //! Shows the grid thumbnail at once (scaled up), then fades in the large
 //! JPEG preview when it arrives. Neighbouring previews are fetched ahead so
-//! arrowing through photos feels instant. Copy puts the preview on the
-//! clipboard; Download saves the original file (HEIC, RAW, MOV, ...).
+//! arrowing through photos feels instant. Copying, downloading and dragging
+//! the photo out are the gallery's ([`crate::transfer`]); its messages and
+//! the right-click menu show over the viewer.
 //!
 //! The image is letterboxed on black and can be zoomed (wheel, Ctrl+wheel or
 //! pinch, double-click, +/-/0) and dragged when zoomed. Zoom changes ease in
-//! over a few frames; the math lives in [`crate::zoom`].
+//! over a few frames; the math lives in [`crate::zoom`]. Opening, closing
+//! and stepping between photos are eased too.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -16,20 +18,20 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fuji_icloud::{Asset, AssetId, AssetKind, PhotosClient, PhotosError, Resource};
+use fuji_icloud::{Asset, AssetId, AssetKind, PhotosClient, Resource};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle,
-    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Image, ImageFormat,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, WeakEntity, Window, actions, bounce, canvas, div,
-    ease_in_out, ease_out_quint, img, prelude::*, px,
+    Animation, AnimationExt as _, App, Bounds, Context, CursorStyle, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollWheelEvent, Subscription,
+    WeakEntity, Window, actions, bounce, canvas, div, ease_in_out, img, prelude::*, px,
 };
 
+use crate::anim::{self, Eased};
 use crate::assets::icon;
 use crate::grid::PhotoGrid;
 use crate::image_cache::LruImageCache;
 use crate::zoom::{Geometry, View};
-use crate::{net, theme, thumbs};
+use crate::{net, theme, thumbs, ui};
 
 actions!(
     viewer,
@@ -42,7 +44,12 @@ const CONTEXT: &str = "Viewer";
 const MAX_PREVIEW_REQUESTS: usize = 3;
 /// How far ahead and behind to fetch previews.
 const PREFETCH: usize = 2;
-const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the fade out takes before the viewer is removed.
+const CLOSE_MS: u64 = 130;
+/// How far a photo slides in when stepping to it.
+const SLIDE: f32 = 56.;
+/// How far the pointer moves with the button down before a drag-out starts.
+const DRAG_THRESHOLD: f32 = 6.;
 /// Space around the image when it fits.
 const MARGIN: f32 = 16.;
 /// Zoom step for one wheel notch or key press.
@@ -75,17 +82,6 @@ pub enum ViewerEvent {
     Closed { index: usize },
 }
 
-#[derive(Clone)]
-enum Status {
-    Working(SharedString),
-    Done {
-        message: SharedString,
-        /// Offer "Show in folder" for a saved file.
-        reveal: Option<PathBuf>,
-    },
-    Failed(SharedString),
-}
-
 pub struct Viewer {
     grid: WeakEntity<PhotoGrid>,
     client: Arc<PhotosClient>,
@@ -95,11 +91,6 @@ pub struct Viewer {
     previews_ready: HashMap<AssetId, Arc<Path>>,
     previews_failed: HashSet<AssetId>,
     previews_in_flight: HashSet<AssetId>,
-    /// Copy was pressed before the preview arrived.
-    copy_pending: Option<AssetId>,
-    status: Option<Status>,
-    /// Bumped on every status change, so old timeouts don't clear new messages.
-    status_generation: u64,
     image_cache: Entity<LruImageCache>,
     _grid_observer: Subscription,
     /// What's on screen now, and where it's easing to.
@@ -109,6 +100,13 @@ pub struct Viewer {
     /// The image area's bounds from the last paint.
     stage_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     drag: Option<Drag>,
+    /// Where the button went down on a photo that fits: it may be dragged out.
+    press: Option<Point<Pixels>>,
+    /// 0 to 1 as the viewer opens: the photo settles into place.
+    appear: Eased,
+    /// 1 or -1 down to 0 after stepping to the next or previous photo.
+    slide: Eased,
+    closing: bool,
 }
 
 struct Drag {
@@ -146,9 +144,6 @@ impl Viewer {
             previews_ready: HashMap::new(),
             previews_failed: HashSet::new(),
             previews_in_flight: HashSet::new(),
-            copy_pending: None,
-            status: None,
-            status_generation: 0,
             image_cache: cx.new(|cx| LruImageCache::new(PREFETCH * 2 + 4, cx)),
             _grid_observer: observer,
             view: View::FIT,
@@ -156,6 +151,14 @@ impl Viewer {
             last_frame: None,
             stage_bounds: Rc::new(Cell::new(None)),
             drag: None,
+            press: None,
+            appear: {
+                let mut appear = Eased::new(0.);
+                appear.set(1.);
+                appear
+            },
+            slide: Eased::new(0.),
+            closing: false,
         };
         // The grid is mid-update while it creates us; read it once it's done.
         let this = cx.weak_entity();
@@ -228,18 +231,10 @@ impl Viewer {
                 this.previews_in_flight.remove(&id);
                 match result {
                     Some(Ok(path)) => {
-                        this.previews_ready.insert(id.clone(), path.into());
-                        if this.copy_pending.as_ref() == Some(&id) {
-                            this.copy_pending = None;
-                            this.copy_current(cx);
-                        }
+                        this.previews_ready.insert(id, path.into());
                     }
                     _ => {
-                        this.previews_failed.insert(id.clone());
-                        if this.copy_pending.as_ref() == Some(&id) {
-                            this.copy_pending = None;
-                            this.set_status(Status::Failed("Couldn't load the photo.".into()), cx);
-                        }
+                        this.previews_failed.insert(id);
                     }
                 }
                 this.load_around(cx);
@@ -255,11 +250,14 @@ impl Viewer {
         if count == 0 || index >= count || index == self.index {
             return;
         }
+        // The new photo slides in from the side it came from.
+        self.slide.jump(if index > self.index { 1. } else { -1. });
+        self.slide.set(0.);
         self.index = index;
-        self.copy_pending = None;
         self.view = View::FIT;
         self.target = View::FIT;
         self.drag = None;
+        self.press = None;
         self.load_around(cx);
         cx.notify();
     }
@@ -374,6 +372,8 @@ impl Viewer {
                 start_view: self.target,
             });
             cx.notify();
+        } else {
+            self.press = Some(event.position);
         }
     }
 
@@ -383,6 +383,20 @@ impl Viewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(start) = self.press {
+            let moved = event.position - start;
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.press = None;
+            } else if f32::from(moved.x).hypot(f32::from(moved.y)) > DRAG_THRESHOLD {
+                // Dragging a photo that fits carries it out as a file.
+                self.press = None;
+                let index = self.index;
+                if let Some(grid) = self.grid.upgrade() {
+                    grid.update(cx, |grid, cx| grid.start_drag(vec![index], window, cx));
+                }
+            }
+            return;
+        }
         let Some(drag) = &self.drag else {
             return;
         };
@@ -405,6 +419,7 @@ impl Viewer {
     }
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
+        self.press = None;
         if self.drag.take().is_some() {
             cx.notify();
         }
@@ -418,6 +433,11 @@ impl Viewer {
             .map_or(1. / 60., |t| (now - t).as_secs_f32())
             .clamp(0.001, 0.05);
         self.last_frame = Some(now);
+
+        let settling = self.appear.tick(13., 0.004) | self.slide.tick(15., 0.004);
+        if settling {
+            window.request_animation_frame();
+        }
 
         // Keep both in bounds if the window was resized.
         if let Some(g) = self.geometry(window, cx) {
@@ -444,7 +464,25 @@ impl Viewer {
     }
 
     fn close(&mut self, _: &Close, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(ViewerEvent::Closed { index: self.index });
+        self.begin_close(cx);
+    }
+
+    /// Fade out, then tell the gallery to remove the viewer.
+    fn begin_close(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        cx.notify();
+        let wait = Duration::from_millis(if anim::reduced() { 0 } else { CLOSE_MS });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| {
+                cx.emit(ViewerEvent::Closed { index: this.index })
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn copy(&mut self, _: &CopyImage, _: &mut Window, cx: &mut Context<Self>) {
@@ -452,39 +490,10 @@ impl Viewer {
     }
 
     fn copy_current(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.asset(self.index, cx) else {
-            return;
-        };
-        let Some(path) = self.previews_ready.get(&asset.id).cloned() else {
-            // Copy once the preview arrives.
-            self.copy_pending = Some(asset.id);
-            self.set_status(Status::Working("Copying\u{2026}".into()), cx);
-            return;
-        };
-        self.set_status(Status::Working("Copying\u{2026}".into()), cx);
-        cx.spawn(async move |this, cx| {
-            let bytes = cx
-                .background_spawn(async move { std::fs::read(&path) })
-                .await;
-            this.update(cx, |this, cx| match bytes {
-                Ok(bytes) => {
-                    cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
-                        ImageFormat::Jpeg,
-                        bytes,
-                    )));
-                    this.set_status(
-                        Status::Done {
-                            message: "Copied to clipboard".into(),
-                            reveal: None,
-                        },
-                        cx,
-                    );
-                }
-                Err(_) => this.set_status(Status::Failed("Couldn't copy the photo.".into()), cx),
-            })
-            .ok();
-        })
-        .detach();
+        let index = self.index;
+        if let Some(grid) = self.grid.upgrade() {
+            grid.update(cx, |grid, cx| grid.copy(vec![index], cx));
+        }
     }
 
     fn download(&mut self, _: &Download, _: &mut Window, cx: &mut Context<Self>) {
@@ -492,78 +501,18 @@ impl Viewer {
     }
 
     fn download_current(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.status, Some(Status::Working(_))) {
-            return;
+        let index = self.index;
+        if let Some(grid) = self.grid.upgrade() {
+            grid.update(cx, |grid, cx| grid.download(vec![index], cx));
         }
-        let Some(asset) = self.asset(self.index, cx) else {
-            return;
-        };
-        let Some(original) = asset.original.clone() else {
-            self.set_status(
-                Status::Failed("The original isn't available for this item.".into()),
-                cx,
-            );
-            return;
-        };
-        let name = suggested_name(&asset, &original);
-        let folder = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(std::env::temp_dir);
-        let chosen = cx.prompt_for_new_path(&folder, Some(&name));
-        let client = self.client.clone();
-
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(path))) = chosen.await else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                this.set_status(Status::Working("Downloading original\u{2026}".into()), cx)
-            })
-            .ok();
-            let target = path.clone();
-            let result = net::run(move || client.download_to(&original, &target)).await;
-            this.update(cx, |this, cx| {
-                let status = match result {
-                    Some(Ok(_)) => Status::Done {
-                        message: format!(
-                            "Saved {}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
-                        )
-                        .into(),
-                        reveal: Some(path),
-                    },
-                    Some(Err(PhotosError::SessionExpired)) => {
-                        Status::Failed("Your session expired. Sign in again to download.".into())
-                    }
-                    Some(Err(err)) => Status::Failed(err.to_string().into()),
-                    None => Status::Failed("Download failed.".into()),
-                };
-                this.set_status(status, cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 
-    fn set_status(&mut self, status: Status, cx: &mut Context<Self>) {
-        self.status_generation += 1;
-        let generation = self.status_generation;
-        let finished = !matches!(status, Status::Working(_));
-        self.status = Some(status);
-        cx.notify();
-        if finished {
-            // Clear the message after a moment, unless something newer replaced it.
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(STATUS_TIMEOUT).await;
-                this.update(cx, |this, cx| {
-                    if this.status_generation == generation {
-                        this.status = None;
-                        cx.notify();
-                    }
-                })
-                .ok();
-            })
-            .detach();
+    fn open_menu(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let index = self.index;
+        if let Some(grid) = self.grid.upgrade() {
+            grid.update(cx, |grid, cx| {
+                grid.open_viewer_menu(index, event.position, cx)
+            });
         }
     }
 
@@ -584,34 +533,6 @@ impl Viewer {
             group_digits(count)
         );
 
-        let status: Option<AnyElement> = self.status.clone().map(|status| match status {
-            Status::Working(text) => div()
-                .text_color(theme::text_muted())
-                .child(text)
-                .with_animation(
-                    "status-pulse",
-                    Animation::new(Duration::from_millis(1100))
-                        .repeat()
-                        .with_easing(bounce(ease_in_out)),
-                    |el, t| el.opacity(0.5 + 0.5 * t),
-                )
-                .into_any_element(),
-            Status::Done { message, reveal } => div()
-                .flex()
-                .gap_2()
-                .child(div().text_color(theme::text()).child(message))
-                .when_some(reveal, |el, path| {
-                    el.child(link("reveal", "Show in folder", move |_, _, cx| {
-                        cx.reveal_path(&path)
-                    }))
-                })
-                .into_any_element(),
-            Status::Failed(text) => div()
-                .text_color(theme::danger())
-                .child(text)
-                .into_any_element(),
-        });
-
         div()
             .flex()
             .items_center()
@@ -620,10 +541,10 @@ impl Viewer {
             .px_4()
             .flex_none()
             .text_sm()
-            .child(icon_button(
+            .child(ui::icon_button(
                 "close",
                 "close",
-                cx.listener(|this, _, window, cx| this.close(&Close, window, cx)),
+                cx.listener(|this, _, _, cx| this.begin_close(cx)),
             ))
             .child(
                 div()
@@ -640,7 +561,6 @@ impl Viewer {
                     }),
             )
             .child(div().flex_1())
-            .children(status)
             .when_some(zoom_percent, |el, percent| {
                 // Click to go back to fit.
                 el.child(
@@ -661,15 +581,15 @@ impl Viewer {
                         .child(format!("{percent}%")),
                 )
             })
-            .child(text_button(
+            .child(ui::text_button(
                 "copy",
-                "copy",
+                Some("copy"),
                 "Copy",
                 cx.listener(|this, _, _, cx| this.copy_current(cx)),
             ))
-            .child(text_button(
+            .child(ui::text_button(
                 "download",
-                "download",
+                Some("download"),
                 "Download",
                 cx.listener(|this, _, _, cx| this.download_current(cx)),
             ))
@@ -707,8 +627,20 @@ impl Render for Viewer {
             _ => None,
         });
 
+        let closing = self.closing;
         let geometry = self.geometry(window, cx);
-        let rect = geometry.map(|g| g.rect(self.view));
+        // Settle in from slightly small on opening; slide in when stepping.
+        let (appear, slide) = (self.appear.get(), self.slide.get());
+        let layer_opacity = (1. - slide.abs()).clamp(0., 1.);
+        let rect = geometry.map(|g| {
+            let mut r = g.rect(self.view);
+            let scale = 0.955 + 0.045 * appear;
+            r.x += r.w * (1. - scale) / 2. + slide * SLIDE;
+            r.y += r.h * (1. - scale) / 2.;
+            r.w *= scale;
+            r.h *= scale;
+            r
+        });
         let zoom_percent = geometry
             .filter(|_| !self.target.is_fit())
             .map(|g| (self.target.zoom / g.actual_size_zoom() * 100.).round() as u32);
@@ -727,7 +659,8 @@ impl Render for Viewer {
                 .left(px(r.x))
                 .top(px(r.y))
                 .w(px(r.w))
-                .h(px(r.h)),
+                .h(px(r.h))
+                .opacity(layer_opacity),
             None => el.absolute().size_0(),
         };
         let bounds_cell = self.stage_bounds.clone();
@@ -748,6 +681,7 @@ impl Render for Viewer {
             })
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::open_menu))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -781,9 +715,8 @@ impl Render for Viewer {
                         .child(img(path).size_full().object_fit(ObjectFit::Contain))
                         .with_animation(
                             ElementId::NamedInteger("preview-fade".into(), index as u64),
-                            Animation::new(Duration::from_millis(220))
-                                .with_easing(ease_out_quint()),
-                            |el, t| el.opacity(t),
+                            anim::ease(anim::NORMAL),
+                            move |el, t| el.opacity(t * layer_opacity),
                         ),
                 )
             })
@@ -858,9 +791,13 @@ impl Render for Viewer {
             .child(top_bar)
             .child(stage)
             .with_animation(
-                "viewer-open",
-                Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
-                |el, t| el.opacity(t),
+                if closing {
+                    "viewer-close"
+                } else {
+                    "viewer-open"
+                },
+                anim::ease(if closing { CLOSE_MS } else { 180 }),
+                move |el, t| el.opacity(if closing { 1. - t } else { t }),
             )
     }
 }
@@ -892,22 +829,6 @@ fn natural_size(asset: &Asset) -> Option<(f32, f32)> {
     } else {
         (long_edge * ratio, long_edge)
     })
-}
-
-fn suggested_name(asset: &Asset, original: &Resource) -> String {
-    if let Some(name) = asset.filename.as_deref().filter(|n| !n.is_empty()) {
-        return name.to_string();
-    }
-    let ext = match original.file_type.as_str() {
-        "public.heic" => "HEIC",
-        "public.heif" => "HEIF",
-        "public.png" => "PNG",
-        "com.apple.quicktime-movie" => "MOV",
-        "public.mpeg-4" => "MP4",
-        "com.adobe.raw-image" => "DNG",
-        _ => "JPG",
-    };
-    format!("photo.{ext}")
 }
 
 fn format_date(ms: i64) -> Option<String> {
@@ -944,65 +865,6 @@ fn pill(text: &'static str) -> gpui::Div {
 }
 
 type ClickHandler = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>;
-
-/// Square icon button: color-only hover.
-fn icon_button(
-    id: &'static str,
-    glyph: &'static str,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .size(theme::CONTROL_HEIGHT)
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(theme::RADIUS_CONTROL)
-        .cursor_pointer()
-        .hover(|el| el.bg(theme::hover()))
-        .on_click(on_click)
-        .child(icon(glyph, px(18.), theme::text_title()))
-}
-
-/// Secondary button recipe: subtle fill, brighter on hover.
-fn text_button(
-    id: &'static str,
-    glyph: &'static str,
-    label: &'static str,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .h(theme::CONTROL_HEIGHT)
-        .px(px(12.))
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .rounded(theme::RADIUS_CONTROL)
-        .cursor_pointer()
-        .bg(theme::fill())
-        .text_size(px(12.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme::text_title())
-        .hover(|el| el.bg(theme::fill_hover()).text_color(theme::text()))
-        .on_click(on_click)
-        .child(icon(glyph, px(15.), theme::text_title()))
-        .child(label)
-}
-
-fn link(
-    id: &'static str,
-    label: &'static str,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .text_color(theme::accent_text())
-        .cursor_pointer()
-        .hover(|el| el.text_color(theme::text()))
-        .on_click(on_click)
-        .child(label)
-}
 
 /// A tall, invisible hit area along one edge, with a chevron that shows on hover.
 fn edge_button(
@@ -1055,32 +917,5 @@ mod tests {
         assert_eq!(format_date(0), None);
         let text = format_date(1_700_000_000_000).unwrap();
         assert!(text.contains("2023"), "{text}");
-    }
-
-    #[test]
-    fn names_fall_back_to_type() {
-        let original = Resource {
-            url: String::new(),
-            width: 0,
-            height: 0,
-            size: 0,
-            file_type: "public.heic".into(),
-        };
-        let mut asset = Asset {
-            id: AssetId("a".into()),
-            kind: AssetKind::Photo,
-            filename: None,
-            width: 0,
-            height: 0,
-            aspect: 1.,
-            favorite: false,
-            created_at_ms: 0,
-            thumbnail: None,
-            preview: None,
-            original: None,
-        };
-        assert_eq!(suggested_name(&asset, &original), "photo.HEIC");
-        asset.filename = Some("IMG_1234.HEIC".into());
-        assert_eq!(suggested_name(&asset, &original), "IMG_1234.HEIC");
     }
 }

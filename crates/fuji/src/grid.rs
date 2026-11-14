@@ -1,4 +1,4 @@
-﻿//! The gallery: a mosaic of the album under year, month and day headers.
+//! The gallery: a mosaic of the album under month and day headers.
 //!
 //! - The album's index (date, shape, type of every item) comes from a disk
 //!   cache at once, and is refreshed from iCloud in the background.
@@ -8,41 +8,107 @@
 //!   fetched for what's visible, using download URLs from full records loaded
 //!   by page.
 //! - Decoded thumbnails live in a bounded GPU cache, so memory stays flat.
+//! - Scrolling and zooming ease toward their targets; a timeline scrubber on
+//!   the right jumps through the years.
+//! - Photos can be selected, copied, downloaded, dragged out as files, and
+//!   pasted in (uploaded). The work is in [`crate::transfer`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fuji_icloud::{Album, Asset, AssetId, PhotosClient, PhotosError, Resource};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, ElementId, Entity, EventEmitter, Focusable,
-    FontWeight, ObjectFit, ScrollHandle, SharedString, Subscription, Window, bounce, div,
-    ease_in_out, ease_out_quint, img, point, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Subscription, Window, actions, bounce, div, ease_in_out, img, point, prelude::*,
+    px,
 };
+use jiff::civil::Date;
 
+use crate::anim::{self, Eased};
 use crate::assets::icon;
 use crate::image_cache::LruImageCache;
 use crate::index::{self, IndexItem, Kind};
-use crate::layout::{self, Layout, RowKind};
+use crate::layout::{self, Layout, RowKind, Span};
+use crate::scrubber::{self, Track};
+use crate::settings::{self, Settings};
+use crate::transfer::PendingUpload;
+use crate::ui::{self, MenuItem, Status};
 use crate::viewer::{Viewer, ViewerEvent};
 use crate::{net, theme, thumbs};
 
+actions!(
+    gallery,
+    [
+        CopySelection,
+        Paste,
+        DownloadSelection,
+        Cancel,
+        SelectAll,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset
+    ]
+);
+
+const CONTEXT: &str = "Gallery";
+
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-c", CopySelection, Some(CONTEXT)),
+        KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("ctrl-s", DownloadSelection, Some(CONTEXT)),
+        KeyBinding::new("escape", Cancel, Some(CONTEXT)),
+        KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("ctrl-=", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new("ctrl-+", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new("ctrl--", ZoomOut, Some(CONTEXT)),
+        KeyBinding::new("ctrl-0", ZoomReset, Some(CONTEXT)),
+    ]);
+}
+
 /// Items per full-record page (with download URLs).
-const PAGE: usize = 100;
+pub(crate) const PAGE: usize = 100;
 /// Full-record pages kept in memory.
 const MAX_PAGES: usize = 40;
 const MAX_PAGE_REQUESTS: usize = 2;
+/// Pages waiting to be requested. Older ones are dropped: after a fast
+/// scroll, what was passed on the way no longer matters.
+const MAX_QUEUED_PAGES: usize = 6;
 /// Items per index-scan request (small records, no URLs).
 const SCAN_PAGE: usize = 200;
 const MAX_SCAN_REQUESTS: usize = 6;
 const MAX_THUMB_REQUESTS: usize = 8;
 /// Extra content kept built above and below the viewport.
 const OVERSCAN: f32 = 600.;
-/// Decoded thumbnails kept in memory: a couple of screenfuls.
+/// Decoded thumbnails kept in memory, at least; more when zoomed out.
 const IMAGE_CACHE_SIZE: usize = 120;
-const TARGET_ROW_HEIGHT: f32 = 200.;
 const TILE_GAP: f32 = 4.;
+
+/// How far one wheel notch scrolls.
+const WHEEL_STEP: f32 = 120.;
+/// GPUI reports a wheel notch as 3 "lines".
+const LINES_PER_NOTCH: f32 = 3.;
+/// How quickly scrolling and zooming ease to their targets (per second).
+const SCROLL_RATE: f32 = 16.;
+const ZOOM_RATE: f32 = 14.;
+/// Zoom change for one wheel notch or key press.
+const ZOOM_STEP: f32 = 1.2;
+/// Past this many viewports from its target, the gallery is "flying": it
+/// draws placeholders instead of loading thumbnails it's about to leave.
+const FLYING_VIEWPORTS: f32 = 1.5;
+
+/// The strip on the right holding the timeline scrubber.
+const SCRUBBER_WIDTH: f32 = 48.;
+const SCRUBBER_INSET: f32 = 14.;
+/// How long the scrubber's date stays up after scrolling.
+const SCRUBBER_LINGER: Duration = Duration::from_millis(900);
+/// How far the pointer moves with the button down before a drag starts.
+const DRAG_THRESHOLD: f32 = 6.;
+const TOAST_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub enum GridEvent {
     SessionExpired,
@@ -60,22 +126,64 @@ struct Scan {
     count: usize,
     next_rank: usize,
     in_flight: usize,
-    /// Pages received, by first rank.
+    /// Pages received but not yet joined to the run from the start, by first rank.
     pages: HashMap<usize, Vec<IndexItem>>,
+    /// Rank up to which pages have been joined.
+    joined: usize,
+    /// The new index so far, when it replaces a cached one at the end.
+    fresh: Vec<IndexItem>,
     /// Show results as they arrive (nothing cached to show meanwhile).
     progressive: bool,
 }
 
+/// The photo to keep still under the pointer while the zoom changes.
+struct ZoomAnchor {
+    index: usize,
+    /// How far down its row (0 to 1) the anchor point is.
+    fraction: f32,
+    /// The anchor point, from the top of the gallery's viewport.
+    screen_y: f32,
+}
+
+#[derive(Default)]
+struct Scrub {
+    dragging: bool,
+    /// Pointer position along the track while over the scrubber.
+    hover: Option<f32>,
+    /// When the gallery last scrolled; the date shows for a moment after.
+    scrolled: Option<Instant>,
+    generation: u64,
+}
+
+enum MenuKind {
+    /// On one or more photos.
+    Items(Vec<usize>),
+    /// On a day or month header, whose first item is `first`.
+    Header { first: usize, month: bool },
+    /// On the gallery itself.
+    Background,
+    /// On the photo open in the viewer.
+    Viewer(usize),
+}
+
+struct OpenMenu {
+    serial: u64,
+    position: Point<Pixels>,
+    kind: MenuKind,
+}
+
 pub struct PhotoGrid {
-    client: Arc<PhotosClient>,
+    pub(crate) client: Arc<PhotosClient>,
     account_dir: PathBuf,
     thumb_dir: Arc<PathBuf>,
-    preview_dir: Arc<PathBuf>,
+    pub(crate) preview_dir: Arc<PathBuf>,
     album: Album,
     /// Bumped on album change so results for the old album are ignored.
     generation: u64,
     state: LoadState,
     index: Vec<IndexItem>,
+    /// The calendar day of each index item.
+    days: Vec<Option<Date>>,
     scan: Option<Scan>,
     layout: Option<Layout>,
     layout_dirty: bool,
@@ -84,6 +192,7 @@ pub struct PhotoGrid {
     page_ids: HashMap<usize, Vec<AssetId>>,
     page_lru: VecDeque<usize>,
     pages_requested: HashSet<usize>,
+    /// Pages to request, most urgent last.
     page_queue: Vec<usize>,
     pages_in_flight: usize,
     // Thumbnails.
@@ -95,11 +204,44 @@ pub struct PhotoGrid {
     thumb_queue: Vec<(AssetId, Resource)>,
     error: Option<SharedString>,
     image_cache: Entity<LruImageCache>,
+    image_cache_size: usize,
     viewer: Option<(Entity<Viewer>, Subscription)>,
+    focus_handle: FocusHandle,
+    // Motion.
     scroll: ScrollHandle,
+    /// The scroll position (content top), easing to where the wheel or the
+    /// scrubber sent it.
+    scroller: Eased,
+    max_scroll: f32,
+    row_height: Eased,
+    zoom_anchor: Option<ZoomAnchor>,
+    scrub: Scrub,
+    track: Option<Track>,
+    // Selection and pointer.
+    selected: BTreeSet<usize>,
+    /// Where a shift-click range starts.
+    select_anchor: Option<usize>,
+    /// A tile the button went down on, and where: a drag may follow.
+    press: Option<(usize, Point<Pixels>)>,
+    /// Swallow the click that ends a press which became a drag.
+    pub(crate) suppress_click: bool,
+    pub(crate) dragging_out: bool,
+    menu: Option<OpenMenu>,
+    menu_serial: u64,
+    // Feedback.
+    toast: Option<(u64, Status)>,
+    toast_serial: u64,
+    pub(crate) pending_upload: Option<PendingUpload>,
+    _settings: Subscription,
 }
 
 impl EventEmitter<GridEvent> for PhotoGrid {}
+
+impl Focusable for PhotoGrid {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl PhotoGrid {
     pub fn new(
@@ -116,8 +258,20 @@ impl PhotoGrid {
             .unwrap_or_else(|| thumb_dir.to_path_buf());
 
         let prune_dir = preview_dir.clone();
-        cx.background_spawn(async move { thumbs::prune(&prune_dir, thumbs::PREVIEWS_KEPT) })
-            .detach();
+        cx.background_spawn(async move {
+            thumbs::prune(&prune_dir, thumbs::PREVIEWS_KEPT);
+            crate::export::clean();
+        })
+        .detach();
+
+        // Follow the zoom when it's changed in Settings.
+        let settings = cx.observe_global::<Settings>(|this, cx| {
+            let height = Settings::get(cx).row_height;
+            if (this.row_height.target() - height).abs() > 0.01 {
+                this.row_height.set(height);
+                cx.notify();
+            }
+        });
 
         let mut grid = Self {
             client,
@@ -128,6 +282,7 @@ impl PhotoGrid {
             generation: 0,
             state: LoadState::Loading,
             index: Vec::new(),
+            days: Vec::new(),
             scan: None,
             layout: None,
             layout_dirty: true,
@@ -144,8 +299,27 @@ impl PhotoGrid {
             thumb_queue: Vec::new(),
             error: None,
             image_cache: cx.new(|cx| LruImageCache::new(IMAGE_CACHE_SIZE, cx)),
+            image_cache_size: IMAGE_CACHE_SIZE,
             viewer: None,
+            focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            scroller: Eased::new(0.),
+            max_scroll: 0.,
+            row_height: Eased::new(Settings::get(cx).row_height),
+            zoom_anchor: None,
+            scrub: Scrub::default(),
+            track: None,
+            selected: BTreeSet::new(),
+            select_anchor: None,
+            press: None,
+            suppress_click: false,
+            dragging_out: false,
+            menu: None,
+            menu_serial: 0,
+            toast: None,
+            toast_serial: 0,
+            pending_upload: None,
+            _settings: settings,
         };
         grid.list_disk_thumbs(cx);
         grid.load_album(cx);
@@ -159,7 +333,15 @@ impl PhotoGrid {
         }
     }
 
-    // ---- What the viewer reads -------------------------------------------
+    /// The thumbnail and preview caches were deleted: forget what was in them.
+    pub fn cache_cleared(&mut self, cx: &mut Context<Self>) {
+        self.disk_thumbs = Some(Arc::new(HashSet::new()));
+        self.thumbs_ready.clear();
+        self.thumbs_failed.clear();
+        cx.notify();
+    }
+
+    // ---- What the viewer and transfers read --------------------------------
 
     pub fn item_count(&self) -> usize {
         self.index.len()
@@ -192,6 +374,7 @@ impl PhotoGrid {
         self.generation += 1;
         self.state = LoadState::Loading;
         self.index.clear();
+        self.days.clear();
         self.scan = None;
         self.layout = None;
         self.layout_dirty = true;
@@ -206,30 +389,55 @@ impl PhotoGrid {
         self.thumb_queue.clear();
         self.error = None;
         self.viewer = None;
+        self.selected.clear();
+        self.select_anchor = None;
+        self.menu = None;
+        self.zoom_anchor = None;
+        self.scroller.jump(0.);
         self.scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
 
         let generation = self.generation;
         let path = index::cache_path(&self.account_dir, self.album);
-        let client = self.client.clone();
-        let album = self.album;
         cx.spawn(async move |this, cx| {
             // Cached index first, so the gallery shows right away.
-            let cached = cx.background_spawn(async move { index::load(&path) }).await;
+            let cached = cx
+                .background_spawn(async move {
+                    let items = index::load(&path)?;
+                    let days = layout::days(&items, &jiff::tz::TimeZone::system());
+                    Some((items, days))
+                })
+                .await;
             let had_cache = cached.is_some();
             this.update(cx, |this, cx| {
                 if this.generation == generation
-                    && let Some(items) = cached
+                    && let Some((items, days)) = cached
                 {
                     this.index = items;
+                    this.days = days;
                     this.state = LoadState::Ready;
                     this.layout_dirty = true;
                     cx.notify();
                 }
+                // Then refresh from iCloud.
+                if this.generation == generation {
+                    this.refresh(!had_cache, cx);
+                }
             })
             .ok();
+        })
+        .detach();
+    }
 
-            // Then refresh from iCloud.
+    /// Ask iCloud how many items the album has and rescan it.
+    pub(crate) fn refresh(&mut self, progressive: bool, cx: &mut Context<Self>) {
+        if self.scan.is_some() {
+            return;
+        }
+        let generation = self.generation;
+        let client = self.client.clone();
+        let album = self.album;
+        cx.spawn(async move |this, cx| {
             let count = net::run(move || {
                 client.check_ready()?;
                 client.count(album)
@@ -240,7 +448,7 @@ impl PhotoGrid {
                     return;
                 }
                 match count {
-                    Some(Ok(count)) => this.start_scan(count, !had_cache, cx),
+                    Some(Ok(count)) => this.start_scan(count, progressive, cx),
                     Some(Err(PhotosError::SessionExpired)) => cx.emit(GridEvent::SessionExpired),
                     Some(Err(err)) => this.fail(err.to_string(), cx),
                     None => this.fail("Something went wrong loading the library.".into(), cx),
@@ -252,19 +460,25 @@ impl PhotoGrid {
     }
 
     fn start_scan(&mut self, count: usize, progressive: bool, cx: &mut Context<Self>) {
+        if self.scan.is_some() {
+            return;
+        }
         if count == 0 {
-            self.index.clear();
+            self.set_index(Vec::new());
             self.state = LoadState::Ready;
-            self.layout_dirty = true;
-            index::save(&index::cache_path(&self.account_dir, self.album), &[]);
+            self.save_index(cx);
             cx.notify();
             return;
         }
+        // Showing pages as they arrive only works from an empty gallery.
+        let progressive = progressive && self.index.is_empty();
         self.scan = Some(Scan {
             count,
             next_rank: 0,
             in_flight: 0,
             pages: HashMap::new(),
+            joined: 0,
+            fresh: Vec::new(),
             progressive,
         });
         self.pump_scan(cx);
@@ -285,16 +499,18 @@ impl PhotoGrid {
             let album = self.album;
             let generation = self.generation;
             cx.spawn(async move |this, cx| {
-                let result = net::run(move || client.scan(album, start, limit)).await;
+                let result = net::run(move || {
+                    client
+                        .scan(album, start, limit)
+                        .map(|assets| assets.iter().map(IndexItem::from).collect::<Vec<_>>())
+                })
+                .await;
                 this.update(cx, |this, cx| {
                     if this.generation != generation {
                         return;
                     }
                     match result {
-                        Some(Ok(assets)) => {
-                            let items = assets.iter().map(IndexItem::from).collect();
-                            this.scan_page_done(start, items, cx);
-                        }
+                        Some(Ok(items)) => this.scan_page_done(start, items, cx),
                         Some(Err(PhotosError::SessionExpired)) => {
                             cx.emit(GridEvent::SessionExpired)
                         }
@@ -321,31 +537,65 @@ impl PhotoGrid {
         scan.in_flight -= 1;
         scan.pages.insert(start, items);
 
-        // The contiguous prefix received so far.
-        let mut prefix = Vec::new();
-        let mut rank = 0;
-        while let Some(page) = scan.pages.get(&rank) {
-            prefix.extend_from_slice(page);
-            rank += SCAN_PAGE.min(scan.count - rank);
-            if page.is_empty() || rank >= scan.count {
-                break;
-            }
+        // Join the pages that now continue the run from the start. Each item
+        // is moved once, however the pages arrive.
+        let mut arrived = Vec::new();
+        while let Some(page) = scan.pages.remove(&scan.joined) {
+            scan.joined += SCAN_PAGE.min(scan.count - scan.joined);
+            arrived.extend(page);
         }
-        let done = rank >= scan.count && scan.in_flight == 0 && scan.next_rank >= scan.count;
+        let done = scan.in_flight == 0 && scan.next_rank >= scan.count;
+        let progressive = scan.progressive;
 
+        if progressive {
+            if !arrived.is_empty() {
+                let tz = jiff::tz::TimeZone::system();
+                self.days.extend(layout::days(&arrived, &tz));
+                self.index.extend(arrived);
+                self.state = LoadState::Ready;
+                self.layout_dirty = true;
+            }
+        } else {
+            scan.fresh.extend(arrived);
+        }
         if done {
-            self.scan = None;
-            index::save(&index::cache_path(&self.account_dir, self.album), &prefix);
-            self.index = prefix;
+            let scan = self.scan.take();
+            if !progressive && let Some(scan) = scan {
+                self.set_index(scan.fresh);
+            }
             self.state = LoadState::Ready;
-            self.layout_dirty = true;
-        } else if scan.progressive && prefix.len() > self.index.len() {
-            self.index = prefix;
-            self.state = LoadState::Ready;
-            self.layout_dirty = true;
+            self.save_index(cx);
         }
         self.pump_scan(cx);
         cx.notify();
+    }
+
+    /// Replace the index, keeping the selection on the same photos.
+    fn set_index(&mut self, items: Vec<IndexItem>) {
+        if !self.selected.is_empty() {
+            let chosen: HashSet<&str> = self
+                .selected
+                .iter()
+                .filter_map(|&ix| self.index.get(ix).map(|item| item.id.as_str()))
+                .collect();
+            self.selected = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| chosen.contains(item.id.as_str()))
+                .map(|(ix, _)| ix)
+                .collect();
+            self.select_anchor = None;
+        }
+        self.days = layout::days(&items, &jiff::tz::TimeZone::system());
+        self.index = items;
+        self.layout_dirty = true;
+    }
+
+    fn save_index(&self, cx: &mut Context<Self>) {
+        let path = index::cache_path(&self.account_dir, self.album);
+        let items = self.index.clone();
+        cx.background_spawn(async move { index::save(&path, &items) })
+            .detach();
     }
 
     // ---- Full records (download URLs) ------------------------------------
@@ -353,6 +603,11 @@ impl PhotoGrid {
     fn request_page(&mut self, page: usize) {
         if self.pages_requested.insert(page) {
             self.page_queue.push(page);
+            // Forget the stalest requests; they're asked for again if needed.
+            while self.page_queue.len() > MAX_QUEUED_PAGES {
+                let stale = self.page_queue.remove(0);
+                self.pages_requested.remove(&stale);
+            }
         }
     }
 
@@ -384,7 +639,9 @@ impl PhotoGrid {
                     }
                     Some(Err(err)) => {
                         this.pages_requested.remove(&page);
-                        this.page_queue.clear();
+                        for queued in this.page_queue.drain(..) {
+                            this.pages_requested.remove(&queued);
+                        }
                         this.fail(err.to_string(), cx);
                     }
                     None => {
@@ -544,35 +801,375 @@ impl PhotoGrid {
 
     // ---- Viewer ---------------------------------------------------------------
 
-    fn open_viewer(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_viewer(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.index.len() {
+            return;
+        }
         let grid = cx.entity();
         let client = self.client.clone();
         let preview_dir = self.preview_dir.clone();
         let viewer = cx.new(|cx| Viewer::new(&grid, client, preview_dir, index, cx));
-        let subscription = cx.subscribe(&viewer, |this, _, event, cx| match event {
-            ViewerEvent::Closed { index } => this.close_viewer(*index, cx),
-        });
+        let subscription =
+            cx.subscribe_in(&viewer, window, |this, _, event, window, cx| match event {
+                ViewerEvent::Closed { index } => this.close_viewer(*index, window, cx),
+            });
         viewer.focus_handle(cx).focus(window);
         self.viewer = Some((viewer, subscription));
+        self.menu = None;
+        self.press = None;
         cx.notify();
     }
 
-    fn close_viewer(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn close_viewer(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.viewer = None;
+        self.menu = None;
+        self.focus_handle.focus(window);
         // Keep the photo you were looking at in view.
         if let Some(row) = self.layout.as_ref().and_then(|l| l.row_of_item(index)) {
             let viewport = f32::from(self.scroll.bounds().size.height);
-            let offset = self.scroll.offset();
-            let top = -f32::from(offset.y);
+            let top = -f32::from(self.scroll.offset().y);
             if row.y < top || row.y + row.height > top + viewport {
                 let target = (row.y + row.height / 2. - viewport / 2.).max(0.);
-                self.scroll.set_offset(point(offset.x, px(-target)));
+                self.jump_to(target);
             }
         }
         cx.notify();
     }
 
-    // ---- Errors -------------------------------------------------------------
+    // ---- Scrolling and zooming ----------------------------------------------
+
+    fn top(&self) -> f32 {
+        -f32::from(self.scroll.offset().y)
+    }
+
+    /// Scroll to `top` at once.
+    fn jump_to(&mut self, top: f32) {
+        let top = top.max(0.);
+        self.scroller.jump(top);
+        self.scroll.set_offset(point(px(0.), px(-top)));
+    }
+
+    /// Ease the scroll position toward `top`.
+    fn scroll_toward(&mut self, top: f32, cx: &mut Context<Self>) {
+        if !self.scroller.is_moving() {
+            self.scroller.jump(self.top());
+        }
+        self.scroller.set(top.clamp(0., self.max_scroll));
+        self.show_scrubber_date(cx);
+        cx.notify();
+    }
+
+    /// Show the scrubber's date for a moment.
+    fn show_scrubber_date(&mut self, cx: &mut Context<Self>) {
+        self.scrub.scrolled = Some(Instant::now());
+        self.scrub.generation += 1;
+        let generation = self.scrub.generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SCRUBBER_LINGER).await;
+            this.update(cx, |this, cx| {
+                if this.scrub.generation == generation {
+                    this.scrub.scrolled = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn on_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let zoom = event.modifiers.control || event.modifiers.platform;
+        match event.delta {
+            ScrollDelta::Lines(lines) => {
+                let notches = lines.y / LINES_PER_NOTCH;
+                if zoom {
+                    self.zoom_by(ZOOM_STEP.powf(notches), Some(event.position), cx);
+                } else {
+                    let from = if self.scroller.is_moving() {
+                        self.scroller.target()
+                    } else {
+                        self.top()
+                    };
+                    self.scroll_toward(from - notches * WHEEL_STEP, cx);
+                }
+            }
+            // A touchpad already scrolls smoothly: follow the fingers.
+            ScrollDelta::Pixels(delta) => {
+                if zoom {
+                    let factor = (f32::from(delta.y) * 0.005).exp();
+                    self.zoom_by(factor, Some(event.position), cx);
+                } else {
+                    let top = (self.top() - f32::from(delta.y)).clamp(0., self.max_scroll);
+                    self.jump_to(top);
+                    self.show_scrubber_date(cx);
+                    cx.notify();
+                }
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    /// Change the size of the mosaic's rows, keeping the photo under `at`
+    /// (window coordinates; the middle of the gallery if `None`) in place.
+    fn zoom_by(&mut self, factor: f32, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let target = (self.row_height.target() * factor)
+            .clamp(settings::MIN_ROW_HEIGHT, settings::MAX_ROW_HEIGHT);
+        self.zoom_to(target, at, cx);
+    }
+
+    fn zoom_to(&mut self, target: f32, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        if (target - self.row_height.target()).abs() < 0.01 {
+            return;
+        }
+        if self.zoom_anchor.is_none()
+            && let Some(layout) = &self.layout
+        {
+            let bounds = self.scroll.bounds();
+            let viewport = f32::from(bounds.size.height);
+            let screen_y = at
+                .map(|p| f32::from(p.y - bounds.top()))
+                .filter(|y| (0. ..=viewport).contains(y))
+                .unwrap_or(viewport / 2.);
+            let y = self.top() + screen_y;
+            self.zoom_anchor = layout.tile_row_at(y).and_then(|row| {
+                let RowKind::Tiles(tiles) = &row.kind else {
+                    return None;
+                };
+                Some(ZoomAnchor {
+                    index: tiles.first()?.index,
+                    fraction: ((y - row.y) / row.height).clamp(0., 1.),
+                    screen_y,
+                })
+            });
+        }
+        // The anchor decides the scroll position while zooming.
+        self.scroller.jump(self.top());
+        self.row_height.set(target);
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(ZOOM_STEP, None, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(1. / ZOOM_STEP, None, cx);
+    }
+
+    fn zoom_reset(&mut self, _: &ZoomReset, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_to(settings::DEFAULT_ROW_HEIGHT, None, cx);
+    }
+
+    /// Scroll to the scrubber position under the pointer.
+    fn scrub_to(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(track) = self.track else {
+            return;
+        };
+        let y = f32::from(pointer.y - self.scroll.bounds().top()) - SCRUBBER_INSET;
+        self.scrub.hover = Some(y.clamp(0., track.length));
+        self.scroll_toward(track.scroll_for(y), cx);
+    }
+
+    // ---- Selection ------------------------------------------------------------
+
+    /// What an action on tile `index` applies to: the whole selection if the
+    /// tile is part of it, otherwise just the tile.
+    fn targets_for(&self, index: usize) -> Vec<usize> {
+        if self.selected.contains(&index) {
+            self.selected.iter().copied().collect()
+        } else {
+            vec![index]
+        }
+    }
+
+    /// Whether every photo of the day, month or year around `index` is selected.
+    fn span_selected(&self, index: usize, span: Span) -> bool {
+        let range = layout::span(&self.days, index, span);
+        !range.is_empty() && self.selected.range(range.clone()).count() == range.len()
+    }
+
+    /// Select the whole day, month or year around `index`, or deselect it
+    /// if it's all selected already.
+    fn toggle_span(&mut self, index: usize, span: Span, cx: &mut Context<Self>) {
+        let range = layout::span(&self.days, index, span);
+        if self.span_selected(index, span) {
+            self.selected.retain(|ix| !range.contains(ix));
+        } else {
+            self.selected.extend(range);
+            self.select_anchor = Some(index);
+        }
+        cx.notify();
+    }
+
+    fn toggle_selected(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.selected.remove(&index) {
+            self.selected.insert(index);
+        }
+        self.select_anchor = Some(index);
+        cx.notify();
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected.clear();
+        self.select_anchor = None;
+        cx.notify();
+    }
+
+    fn tile_clicked(
+        &mut self,
+        index: usize,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if std::mem::take(&mut self.suppress_click) {
+            return;
+        }
+        let modifiers = event.modifiers();
+        if modifiers.shift
+            && let Some(anchor) = self.select_anchor
+        {
+            self.selected.extend(anchor.min(index)..=anchor.max(index));
+            cx.notify();
+        } else if modifiers.control || modifiers.platform || !self.selected.is_empty() {
+            self.toggle_selected(index, cx);
+        } else {
+            self.open_viewer(index, window, cx);
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_some() {
+            return;
+        }
+        if self.menu.take().is_none() && self.pending_upload.take().is_none() {
+            self.selected.clear();
+            self.select_anchor = None;
+        }
+        cx.notify();
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_none() {
+            self.selected = (0..self.index.len()).collect();
+            cx.notify();
+        }
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_none() && !self.selected.is_empty() {
+            self.copy(self.selected.iter().copied().collect(), cx);
+        }
+    }
+
+    fn download_selection(
+        &mut self,
+        _: &DownloadSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.viewer.is_none() && !self.selected.is_empty() {
+            self.download(self.selected.iter().copied().collect(), cx);
+        }
+    }
+
+    fn paste_action(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_none() {
+            self.paste(cx);
+        }
+    }
+
+    // ---- Pointer --------------------------------------------------------------
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = event.pressed_button == Some(MouseButton::Left);
+        if self.scrub.dragging {
+            if held {
+                self.scrub_to(event.position, cx);
+            } else {
+                self.scrub.dragging = false;
+                cx.notify();
+            }
+            return;
+        }
+        let Some((index, start)) = self.press else {
+            return;
+        };
+        if !held {
+            self.press = None;
+            return;
+        }
+        let moved = event.position - start;
+        if f32::from(moved.x).hypot(f32::from(moved.y)) > DRAG_THRESHOLD {
+            self.press = None;
+            self.start_drag(self.targets_for(index), window, cx);
+        }
+    }
+
+    fn end_press(&mut self, cx: &mut Context<Self>) {
+        self.press = None;
+        if std::mem::take(&mut self.scrub.dragging) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_viewer_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu(MenuKind::Viewer(index), position, cx);
+    }
+
+    fn open_menu(&mut self, kind: MenuKind, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu_serial += 1;
+        self.menu = Some(OpenMenu {
+            serial: self.menu_serial,
+            position,
+            kind,
+        });
+        cx.notify();
+    }
+
+    // ---- Feedback -------------------------------------------------------------
+
+    pub(crate) fn set_status(&mut self, status: Status, cx: &mut Context<Self>) {
+        self.toast_serial += 1;
+        let serial = self.toast_serial;
+        let finished = !matches!(status, Status::Working(_));
+        self.toast = Some((serial, status));
+        cx.notify();
+        if finished {
+            // Clear the message after a moment, unless something newer replaced it.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(TOAST_TIMEOUT).await;
+                this.update(cx, |this, cx| {
+                    if this.toast.as_ref().is_some_and(|(s, _)| *s == serial) {
+                        this.toast = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self.toast, Some((_, Status::Working(_))))
+    }
 
     fn fail(&mut self, message: String, cx: &mut Context<Self>) {
         if matches!(self.state, LoadState::Loading) {
@@ -606,15 +1203,15 @@ impl PhotoGrid {
         if !(self.layout_dirty || stale) || width <= 0. {
             return;
         }
-        let tz = jiff::tz::TimeZone::system();
-        let today = jiff::Zoned::now().with_time_zone(tz.clone()).date();
+        let today = jiff::Zoned::now().date();
         let params = layout::Params {
             width,
             padding_x: theme::CONTENT_PADDING,
-            target_height: TARGET_ROW_HEIGHT,
+            padding_right: SCRUBBER_WIDTH - theme::CONTENT_PADDING,
+            target_height: self.row_height.get(),
             gap: TILE_GAP,
         };
-        self.layout = Some(layout::build(&self.index, params, today, &tz));
+        self.layout = Some(layout::build(&self.index, &self.days, params, today));
         self.layout_dirty = false;
     }
 
@@ -633,25 +1230,86 @@ impl PhotoGrid {
         };
         let count = matches!(self.state, LoadState::Ready)
             .then(|| format_count(self.scan.as_ref().map_or(self.index.len(), |s| s.count)));
+        let chosen = self.selected.len();
+
+        let tools = if chosen > 0 {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme::accent_text())
+                        .child(format!("{} selected", group_digits(chosen))),
+                )
+                .child(ui::text_button(
+                    "selection-copy",
+                    Some("copy"),
+                    "Copy",
+                    cx.listener(|this, _, window, cx| {
+                        this.copy_selection(&CopySelection, window, cx)
+                    }),
+                ))
+                .child(ui::text_button(
+                    "selection-download",
+                    Some("download"),
+                    "Download",
+                    cx.listener(|this, _, window, cx| {
+                        this.download_selection(&DownloadSelection, window, cx)
+                    }),
+                ))
+                .child(ui::icon_button(
+                    "selection-clear",
+                    "close",
+                    cx.listener(|this, _, _, cx| this.clear_selection(cx)),
+                ))
+                .with_animation("selection-tools", anim::ease(anim::NORMAL), |el, t| {
+                    el.opacity(t)
+                })
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(ui::icon_button(
+                    "zoom-out",
+                    "minus",
+                    cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
+                ))
+                .child(ui::icon_button(
+                    "zoom-in",
+                    "plus",
+                    cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx)),
+                ))
+                .into_any_element()
+        };
 
         div()
             .flex_none()
             .flex()
-            .items_baseline()
+            .items_center()
             .gap_3()
             .px(px(theme::CONTENT_PADDING))
-            .pt(px(20.))
+            .pt(px(12.))
             .pb(px(8.))
             .child(
                 div()
-                    .text_size(px(26.))
-                    .font_weight(FontWeight::EXTRA_BOLD)
-                    .text_color(theme::text())
-                    .child(album_title(self.album)),
+                    .flex()
+                    .items_baseline()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(26.))
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_color(theme::text())
+                            .child(album_title(self.album)),
+                    )
+                    .when_some(count, |el, count| {
+                        el.child(div().text_sm().text_color(theme::text_meta()).child(count))
+                    }),
             )
-            .when_some(count, |el, count| {
-                el.child(div().text_sm().text_color(theme::text_meta()).child(count))
-            })
             .child(div().flex_1())
             .when_some(status, |el, status| {
                 el.child(div().text_xs().text_color(theme::text_meta()).child(status))
@@ -668,6 +1326,249 @@ impl PhotoGrid {
                         .child(retry_link(cx)),
                 )
             })
+            .when(matches!(self.state, LoadState::Ready), |el| el.child(tools))
+    }
+
+    fn render_menu(&self, menu: &OpenMenu, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let this = cx.weak_entity();
+        // Each entry runs against the grid, once the menu has closed.
+        let run = |f: fn(&mut Self, &[usize], &mut Window, &mut Context<Self>),
+                   targets: Vec<usize>| {
+            let this = this.clone();
+            move |window: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| f(this, &targets, window, cx))
+                    .ok();
+            }
+        };
+        let mut items = Vec::new();
+        match &menu.kind {
+            MenuKind::Items(targets) => {
+                let many = targets.len() > 1;
+                if !many {
+                    items.push(MenuItem::new(
+                        "open",
+                        "Open",
+                        run(
+                            |this, t, window, cx| this.open_viewer(t[0], window, cx),
+                            targets.clone(),
+                        ),
+                    ));
+                }
+                items.push(
+                    MenuItem::new(
+                        "copy",
+                        if many {
+                            format!("Copy {} items", targets.len())
+                        } else {
+                            "Copy".into()
+                        },
+                        run(|this, t, _, cx| this.copy(t.to_vec(), cx), targets.clone()),
+                    )
+                    .hint("Ctrl+C"),
+                );
+                items.push(
+                    MenuItem::new(
+                        "download",
+                        if many {
+                            format!("Download {} originals\u{2026}", targets.len())
+                        } else {
+                            "Download original\u{2026}".into()
+                        },
+                        run(
+                            |this, t, _, cx| this.download(t.to_vec(), cx),
+                            targets.clone(),
+                        ),
+                    )
+                    .hint("Ctrl+S"),
+                );
+                let all_selected = targets.iter().all(|ix| self.selected.contains(ix));
+                items.push(
+                    MenuItem::new(
+                        "select",
+                        if all_selected { "Deselect" } else { "Select" },
+                        run(
+                            |this, t, _, cx| {
+                                if t.iter().all(|ix| this.selected.contains(ix)) {
+                                    for ix in t {
+                                        this.selected.remove(ix);
+                                    }
+                                } else {
+                                    this.selected.extend(t.iter().copied());
+                                    this.select_anchor = t.first().copied();
+                                }
+                                cx.notify();
+                            },
+                            targets.clone(),
+                        ),
+                    )
+                    .separated(),
+                );
+                if !self.selected.is_empty() {
+                    items.push(MenuItem::new(
+                        "close",
+                        "Clear selection",
+                        run(|this, _, _, cx| this.clear_selection(cx), Vec::new()),
+                    ));
+                }
+            }
+            MenuKind::Background => {
+                items.push(
+                    MenuItem::new(
+                        "upload",
+                        "Paste to add to iCloud",
+                        run(|this, _, _, cx| this.paste(cx), Vec::new()),
+                    )
+                    .hint("Ctrl+V"),
+                );
+                items.push(
+                    MenuItem::new(
+                        "select",
+                        "Select all",
+                        run(
+                            |this, _, window, cx| this.select_all(&SelectAll, window, cx),
+                            Vec::new(),
+                        ),
+                    )
+                    .hint("Ctrl+A"),
+                );
+                items.push(
+                    MenuItem::new(
+                        "plus",
+                        "Zoom in",
+                        run(
+                            |this, _, window, cx| this.zoom_in(&ZoomIn, window, cx),
+                            Vec::new(),
+                        ),
+                    )
+                    .hint("Ctrl+=")
+                    .separated(),
+                );
+                items.push(
+                    MenuItem::new(
+                        "minus",
+                        "Zoom out",
+                        run(
+                            |this, _, window, cx| this.zoom_out(&ZoomOut, window, cx),
+                            Vec::new(),
+                        ),
+                    )
+                    .hint("Ctrl+-"),
+                );
+            }
+            MenuKind::Header { first, month } => {
+                let first = *first;
+                let year = self
+                    .days
+                    .get(first)
+                    .copied()
+                    .flatten()
+                    .map(|day| day.year());
+                let mut spans = vec![(Span::Month, "month".to_string())];
+                if !*month {
+                    spans.insert(0, (Span::Day, "day".to_string()));
+                }
+                if let Some(year) = year {
+                    spans.push((Span::Year, format!("all of {year}")));
+                }
+                for (span, what) in spans {
+                    let verb = if self.span_selected(first, span) {
+                        "Deselect"
+                    } else {
+                        "Select"
+                    };
+                    let label = match span {
+                        Span::Year => format!("{verb} {what}"),
+                        _ => format!("{verb} this {what}"),
+                    };
+                    let this = this.clone();
+                    items.push(MenuItem::new("select", label, move |_, cx| {
+                        this.update(cx, |this, cx| this.toggle_span(first, span, cx))
+                            .ok();
+                    }));
+                }
+                if !self.selected.is_empty() {
+                    items.push(
+                        MenuItem::new(
+                            "close",
+                            "Clear selection",
+                            run(|this, _, _, cx| this.clear_selection(cx), Vec::new()),
+                        )
+                        .separated(),
+                    );
+                }
+            }
+            MenuKind::Viewer(index) => {
+                let target = vec![*index];
+                items.push(
+                    MenuItem::new(
+                        "copy",
+                        "Copy",
+                        run(|this, t, _, cx| this.copy(t.to_vec(), cx), target.clone()),
+                    )
+                    .hint("Ctrl+C"),
+                );
+                items.push(
+                    MenuItem::new(
+                        "download",
+                        "Download original\u{2026}",
+                        run(|this, t, _, cx| this.download(t.to_vec(), cx), target),
+                    )
+                    .hint("Ctrl+S"),
+                );
+            }
+        }
+        let this = cx.weak_entity();
+        ui::context_menu(menu.serial, menu.position, items, move |_, cx| {
+            this.update(cx, |this, cx| {
+                this.menu = None;
+                cx.notify();
+            })
+            .ok();
+        })
+    }
+
+    fn render_upload_dialog(
+        &self,
+        upload: &PendingUpload,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let count = upload.items.len();
+        let title = if count == 1 {
+            "Add to iCloud Photos?".to_string()
+        } else {
+            format!("Add {count} items to iCloud Photos?")
+        };
+        let mut names: Vec<&str> = upload
+            .items
+            .iter()
+            .take(3)
+            .map(|i| i.name.as_str())
+            .collect();
+        if count > 3 {
+            names.push("\u{2026}");
+        }
+        let body = format!(
+            "{} will be uploaded to your library and appear on all your devices.",
+            names.join(", ")
+        );
+        let confirm = cx.weak_entity();
+        let cancel = cx.weak_entity();
+        ui::confirm_dialog(
+            title,
+            body,
+            "Add",
+            move |_, cx| {
+                confirm.update(cx, |this, cx| this.confirm_upload(cx)).ok();
+            },
+            move |_, cx| {
+                cancel
+                    .update(cx, |this, cx| {
+                        this.pending_upload = None;
+                        cx.notify();
+                    })
+                    .ok();
+            },
+        )
     }
 }
 
@@ -701,8 +1602,37 @@ impl Render for PhotoGrid {
             }
             LoadState::Ready => self.render_mosaic(window, cx),
         };
+        // Fade the album in when it changes.
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(body)
+            .with_animation(
+                ElementId::NamedInteger("album".into(), self.generation),
+                anim::ease(anim::NORMAL),
+                |el, t| el.opacity(t),
+            );
+
+        let menu = self.menu.as_ref().map(|menu| self.render_menu(menu, cx));
+        let dialog = self
+            .pending_upload
+            .as_ref()
+            .map(|upload| self.render_upload_dialog(upload, cx));
 
         div()
+            .id("gallery-root")
+            .key_context(CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_action))
+            .on_action(cx.listener(Self::download_selection))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
             .size_full()
             .relative()
             .flex()
@@ -713,6 +1643,11 @@ impl Render for PhotoGrid {
             .when_some(self.viewer.as_ref(), |el, (viewer, _)| {
                 el.child(viewer.clone())
             })
+            .children(dialog)
+            .when_some(self.toast.clone(), |el, (serial, status)| {
+                el.child(ui::toast(serial, status))
+            })
+            .children(menu)
     }
 }
 
@@ -731,56 +1666,89 @@ impl PhotoGrid {
         } else {
             f32::from(window.viewport_size().height)
         };
+
+        // Zoom: re-lay out at the eased row height, holding the anchor still.
+        let zooming = self.row_height.tick(ZOOM_RATE, 0.25);
+        if zooming {
+            self.layout_dirty = true;
+            window.request_animation_frame();
+        }
         self.ensure_layout(width);
         let Some(layout) = self.layout.take() else {
             return div().flex_1().into_any_element();
         };
+        self.max_scroll = (layout.height - viewport_h).max(0.);
+        if let Some(anchor) = &self.zoom_anchor {
+            if let Some(row) = layout.row_of_item(anchor.index) {
+                let top = row.y + anchor.fraction * row.height - anchor.screen_y;
+                self.jump_to(top.clamp(0., self.max_scroll));
+            }
+            if !zooming {
+                self.zoom_anchor = None;
+            }
+        }
+        if !zooming && (Settings::get(cx).row_height - self.row_height.get()).abs() > 0.01 {
+            // The zoom settled: remember it.
+            let height = self.row_height.get();
+            cx.defer(move |cx| Settings::update(cx, |settings| settings.row_height = height));
+        }
 
-        let top = -f32::from(self.scroll.offset().y);
+        // Scroll: ease toward where the wheel or the scrubber pointed.
+        if self.scroller.is_moving() {
+            self.scroller
+                .set(self.scroller.target().min(self.max_scroll));
+            self.scroller.tick(SCROLL_RATE, 0.5);
+            let top = self.scroller.get();
+            self.scroll.set_offset(point(px(0.), px(-top)));
+            window.request_animation_frame();
+        }
+        let top = self.top().clamp(0., self.max_scroll);
+        let flying = self.scroller.is_moving()
+            && !zooming
+            && (self.scroller.target() - top).abs() > viewport_h * FLYING_VIEWPORTS;
+
         let rows = layout.rows_in(top - OVERSCAN, top + viewport_h + OVERSCAN);
-        let on_screen = layout.rows_in(top, top + viewport_h);
+        if !flying {
+            // Thumbnails for what's on screen, top to bottom.
+            let on_screen = layout.rows_in(top, top + viewport_h);
+            let visible: Vec<usize> = layout.rows[on_screen]
+                .iter()
+                .filter_map(|row| match &row.kind {
+                    RowKind::Tiles(tiles) => Some(tiles.iter().map(|t| t.index)),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            self.request_visible(&visible, cx);
+        }
 
-        // Thumbnails for what's on screen, top to bottom.
-        let visible: Vec<usize> = layout.rows[on_screen]
-            .iter()
-            .filter_map(|row| match &row.kind {
-                RowKind::Tiles(tiles) => Some(tiles.iter().map(|t| t.index)),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        self.request_visible(&visible, cx);
-
-        let mut children: Vec<AnyElement> = Vec::with_capacity(rows.len() * 4);
+        let selecting = !self.selected.is_empty();
+        let menu_targets: &[usize] = match &self.menu {
+            Some(OpenMenu {
+                kind: MenuKind::Items(targets),
+                ..
+            }) => targets,
+            _ => &[],
+        };
+        let mut children: Vec<AnyElement> = Vec::with_capacity(rows.len() * 6);
+        let mut tiles_built = 0;
         for row in &layout.rows[rows] {
             match &row.kind {
-                RowKind::Year(label) => children.push(
-                    header_row(row.y, row.height)
-                        .items_end()
-                        .pb(px(8.))
-                        .text_size(px(32.))
-                        .font_weight(FontWeight::EXTRA_BOLD)
-                        .text_color(theme::text())
-                        .child(label.clone())
-                        .into_any_element(),
-                ),
                 RowKind::Month(label) => children.push(
-                    header_row(row.y, row.height)
+                    self.render_header_row(row, label, true, selecting, cx)
                         .items_end()
                         .pb(px(6.))
                         .text_size(px(20.))
                         .font_weight(FontWeight::EXTRA_BOLD)
                         .text_color(theme::text())
-                        .child(label.clone())
                         .into_any_element(),
                 ),
                 RowKind::Day(label) => children.push(
-                    header_row(row.y, row.height)
+                    self.render_header_row(row, label, false, selecting, cx)
                         .items_center()
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::text_title())
-                        .child(label.clone())
                         .into_any_element(),
                 ),
                 RowKind::Tiles(tiles) => {
@@ -788,106 +1756,432 @@ impl PhotoGrid {
                         let Some(item) = self.index.get(t.index) else {
                             continue;
                         };
-                        let thumb = self.thumbs_ready.get(&item.asset_id()).cloned();
-                        let ix = t.index;
+                        let thumb = (!flying)
+                            .then(|| self.thumbs_ready.get(&item.asset_id()).cloned())
+                            .flatten();
+                        let look = TileLook {
+                            selected: self.selected.contains(&t.index),
+                            selecting,
+                            highlighted: menu_targets.contains(&t.index),
+                        };
+                        tiles_built += 1;
                         children.push(
-                            tile(ix, item, thumb)
-                                .absolute()
+                            self.render_tile(t.index, item, thumb, look, cx)
                                 .left(px(t.x))
                                 .top(px(row.y))
                                 .w(px(t.width))
                                 .h(px(row.height))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_viewer(ix, window, cx)
-                                }))
                                 .into_any_element(),
                         );
                     }
                 }
             }
         }
+
+        // Zoomed out, more tiles are on screen than the cache usually holds.
+        let wanted = (tiles_built * 3 / 2).max(IMAGE_CACHE_SIZE);
+        if wanted != self.image_cache_size && !zooming {
+            self.image_cache_size = wanted;
+            self.image_cache
+                .update(cx, |cache, _| cache.set_capacity(wanted));
+        }
+
+        let track = Track {
+            content: layout.height,
+            viewport: viewport_h,
+            length: (viewport_h - 2. * SCRUBBER_INSET).max(1.),
+        };
+        self.track = Some(track);
+        let scrubber =
+            (self.max_scroll > 0.).then(|| self.render_scrubber(&layout, track, top, cx));
         let height = layout.height;
         self.layout = Some(layout);
 
         div()
+            .image_cache(self.image_cache.clone())
+            .id("gallery-area")
             .flex_1()
             .min_h_0()
-            .image_cache(self.image_cache.clone())
+            .relative()
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_press(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_press(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| this.focus_handle.focus(window)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.focus_handle.focus(window);
+                    this.open_menu(MenuKind::Background, event.position, cx);
+                }),
+            )
             .child(
                 div()
                     .id("gallery")
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    .child(div().relative().w_full().h(px(height)).children(children)),
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(height))
+                            .on_scroll_wheel(cx.listener(Self::on_wheel))
+                            .children(children),
+                    ),
             )
+            .children(scrubber)
             .into_any_element()
+    }
+
+    /// A month or day header. Its mark (on hover, or while selecting)
+    /// selects everything under it; right-click offers the year too.
+    fn render_header_row(
+        &self,
+        row: &layout::Row,
+        label: &str,
+        month: bool,
+        selecting: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let first = row.first;
+        let span = if month { Span::Month } else { Span::Day };
+        let chosen = selecting && self.span_selected(first, span);
+        let group = SharedString::from(format!("header-{first}-{month}"));
+        let mark = div()
+            .id("mark")
+            .size(px(18.))
+            .flex_none()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_span(first, span, cx);
+                cx.stop_propagation();
+            }))
+            .map(|el| {
+                if chosen {
+                    el.bg(theme::accent())
+                        .child(icon("check", px(11.), gpui::white()))
+                } else {
+                    el.border_2()
+                        .border_color(theme::text_meta())
+                        .opacity(if selecting { 0.8 } else { 0. })
+                        .group_hover(group.clone(), |el| el.opacity(1.))
+                }
+            });
+        div()
+            .id(ElementId::NamedInteger(
+                if month { "month-header" } else { "day-header" }.into(),
+                first as u64,
+            ))
+            .group(group)
+            .absolute()
+            .left(px(theme::CONTENT_PADDING))
+            .right(px(SCRUBBER_WIDTH))
+            .top(px(row.y))
+            .h(px(row.height))
+            .flex()
+            .gap(px(10.))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.focus_handle.focus(window);
+                    this.open_menu(MenuKind::Header { first, month }, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(label.to_string())
+            .child(
+                // Centre the mark on the label's line.
+                div()
+                    .h(px(if month { 26. } else { 18. }))
+                    .flex()
+                    .items_center()
+                    .child(mark),
+            )
+    }
+
+    fn render_tile(
+        &self,
+        index: usize,
+        item: &IndexItem,
+        thumb: Option<Arc<Path>>,
+        look: TileLook,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let group = SharedString::from(format!("tile-{index}"));
+        let duration = match item.kind {
+            Kind::Video(secs) => Some(format!("{}:{:02}", secs / 60, secs % 60)),
+            _ => None,
+        };
+        let picture = div()
+            .absolute()
+            .overflow_hidden()
+            .rounded(theme::RADIUS_TILE)
+            .bg(theme::placeholder())
+            .when_some(thumb, |el, path| {
+                el.child(
+                    img(path)
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        // Fade in when the thumbnail arrives.
+                        .with_animation(
+                            ElementId::NamedInteger("thumb-fade".into(), index as u64),
+                            anim::ease(180),
+                            |el, t| el.opacity(t),
+                        ),
+                )
+            })
+            // Hover: one flat scrim step, no lift or glow.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .when(look.highlighted, |el| el.bg(gpui::white().opacity(0.12)))
+                    .group_hover(group.clone(), |el| el.bg(gpui::white().opacity(0.07))),
+            )
+            .when_some(duration, |el, duration| {
+                el.child(
+                    badge()
+                        .right(px(6.))
+                        .child(icon("play-fill", px(10.), gpui::white()))
+                        .child(duration),
+                )
+            })
+            .when(item.kind == Kind::Live, |el| {
+                el.child(
+                    badge()
+                        .right(px(6.))
+                        .child(icon("live", px(12.), gpui::white())),
+                )
+            })
+            .when(item.favorite, |el| {
+                el.child(
+                    badge()
+                        .left(px(6.))
+                        .child(icon("heart-fill", px(11.), gpui::white())),
+                )
+            });
+        // A selected photo steps back inside an accent frame.
+        let picture = if look.selected {
+            picture
+                .with_animation(
+                    ElementId::NamedInteger("tile-select".into(), index as u64),
+                    anim::ease(anim::FAST),
+                    |el, t| el.inset(px(6. * t)),
+                )
+                .into_any_element()
+        } else {
+            picture.inset_0().into_any_element()
+        };
+
+        // The round mark in the corner: shows on hover, selects on click.
+        let mark = div()
+            .id(ElementId::NamedInteger("tile-mark".into(), index as u64))
+            .absolute()
+            .top(px(6.))
+            .left(px(6.))
+            .size(px(22.))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_selected(index, cx);
+                cx.stop_propagation();
+            }))
+            .map(|el| {
+                if look.selected {
+                    el.bg(theme::accent())
+                        .child(icon("check", px(13.), gpui::white()))
+                } else {
+                    el.bg(theme::scrim(0.35))
+                        .border_2()
+                        .border_color(gpui::white().opacity(0.9))
+                        .opacity(if look.selecting { 0.75 } else { 0. })
+                        .group_hover(group.clone(), |el| el.opacity(1.))
+                }
+            });
+
+        div()
+            .id(ElementId::NamedInteger("tile".into(), index as u64))
+            .group(group)
+            .absolute()
+            .rounded(theme::RADIUS_TILE)
+            .cursor_pointer()
+            .when(look.selected, |el| el.bg(theme::accent_soft()))
+            .child(picture)
+            .child(mark)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                    this.press = Some((index, event.position));
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.focus_handle.focus(window);
+                    let targets = this.targets_for(index);
+                    this.open_menu(MenuKind::Items(targets), event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_click(cx.listener(move |this, event, window, cx| {
+                this.tile_clicked(index, event, window, cx)
+            }))
+    }
+
+    fn render_scrubber(
+        &mut self,
+        layout: &Layout,
+        track: Track,
+        top: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let thumb = track.position(top);
+        let active = self.scrub.dragging || self.scrub.hover.is_some();
+        // The date follows the pointer when it's over the track, and the
+        // scroll position otherwise.
+        let pointer = self.scrub.hover.filter(|_| !self.scrub.dragging);
+        let date_at = pointer.unwrap_or(thumb);
+        let date = (active || self.scrub.scrolled.is_some())
+            .then(|| layout.month_at(track.scroll_for(date_at) + 1.))
+            .flatten()
+            .map(|mark| format!("{} {}", layout::month_name(mark.month), mark.year));
+
+        let years = scrubber::year_labels(&layout.months, track, 20.);
+        let ticks = scrubber::month_ticks(&layout.months, track, 6.);
+        let ink = if active {
+            theme::text_muted()
+        } else {
+            theme::text_meta()
+        };
+
+        div()
+            .id("scrubber")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(SCRUBBER_WIDTH))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.scrub.dragging = true;
+                    this.scrub_to(event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if let Some(track) = this.track {
+                    let y =
+                        f32::from(event.position.y - this.scroll.bounds().top()) - SCRUBBER_INSET;
+                    this.scrub.hover = Some(y.clamp(0., track.length));
+                    cx.notify();
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered && !this.scrub.dragging {
+                    this.scrub.hover = None;
+                    cx.notify();
+                }
+            }))
+            .children(ticks.into_iter().map(|y| {
+                div()
+                    .absolute()
+                    .right(px(10.))
+                    .top(px(SCRUBBER_INSET + y))
+                    .w(px(4.))
+                    .h(px(1.))
+                    .bg(theme::line())
+            }))
+            .children(years.into_iter().map(|(y, year)| {
+                div()
+                    .absolute()
+                    .right(px(18.))
+                    .top(px(SCRUBBER_INSET + y - 7.))
+                    .h(px(14.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ink)
+                    .child(year.to_string())
+            }))
+            .when_some(pointer, |el, y| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(6.))
+                        .right(px(6.))
+                        .top(px(SCRUBBER_INSET + y))
+                        .h(px(1.))
+                        .bg(theme::text_meta()),
+                )
+            })
+            // Where the gallery is scrolled to.
+            .child(
+                div()
+                    .absolute()
+                    .right(px(4.))
+                    .top(px(SCRUBBER_INSET + thumb - 10.))
+                    .w(px(3.))
+                    .h(px(20.))
+                    .rounded_full()
+                    .bg(if active {
+                        theme::accent_text()
+                    } else {
+                        theme::accent()
+                    }),
+            )
+            .when_some(date, |el, date| {
+                el.child(
+                    div()
+                        .absolute()
+                        .right(px(SCRUBBER_WIDTH + 4.))
+                        .top(px(SCRUBBER_INSET + date_at - 14.))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(8.))
+                        .bg(theme::popover())
+                        .border_1()
+                        .border_color(theme::line())
+                        .shadow_lg()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .whitespace_nowrap()
+                        .child(date)
+                        .with_animation("scrubber-date", anim::ease(anim::FAST), |el, t| {
+                            el.opacity(t)
+                        }),
+                )
+            })
     }
 }
 
-fn header_row(y: f32, height: f32) -> gpui::Div {
-    div()
-        .absolute()
-        .left(px(theme::CONTENT_PADDING))
-        .right(px(theme::CONTENT_PADDING))
-        .top(px(y))
-        .h(px(height))
-        .flex()
-}
-
-fn tile(index: usize, item: &IndexItem, thumb: Option<Arc<Path>>) -> gpui::Stateful<gpui::Div> {
-    let duration = match item.kind {
-        Kind::Video(secs) => Some(format!("{}:{:02}", secs / 60, secs % 60)),
-        _ => None,
-    };
-    div()
-        .id(ElementId::NamedInteger("tile".into(), index as u64))
-        .overflow_hidden()
-        .rounded(theme::RADIUS_TILE)
-        .bg(theme::placeholder())
-        .cursor_pointer()
-        .when_some(thumb, |el, path| {
-            el.child(
-                img(path)
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    // Fade in when the thumbnail arrives.
-                    .with_animation(
-                        ElementId::NamedInteger("thumb-fade".into(), index as u64),
-                        Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
-                        |el, t| el.opacity(t),
-                    ),
-            )
-        })
-        // Hover: one flat scrim step, no lift or glow.
-        .child(
-            div()
-                .absolute()
-                .inset_0()
-                .hover(|el| el.bg(gpui::white().opacity(0.07))),
-        )
-        .when_some(duration, |el, duration| {
-            el.child(
-                badge()
-                    .right(px(6.))
-                    .child(icon("play-fill", px(10.), gpui::white()))
-                    .child(duration),
-            )
-        })
-        .when(item.kind == Kind::Live, |el| {
-            el.child(
-                badge()
-                    .right(px(6.))
-                    .child(icon("live", px(12.), gpui::white())),
-            )
-        })
-        .when(item.favorite, |el| {
-            el.child(
-                badge()
-                    .left(px(6.))
-                    .child(icon("heart-fill", px(11.), gpui::white())),
-            )
-        })
+#[derive(Clone, Copy)]
+struct TileLook {
+    selected: bool,
+    /// Something is selected, so every tile shows its mark.
+    selecting: bool,
+    /// The open context menu applies to this tile.
+    highlighted: bool,
 }
 
 /// A small label on a tile, readable on any photo.
@@ -920,13 +2214,11 @@ fn centered(content: impl IntoElement) -> AnyElement {
 }
 
 fn retry_link(cx: &mut Context<PhotoGrid>) -> impl IntoElement + use<> {
-    div()
-        .id("retry")
-        .text_color(theme::accent_text())
-        .cursor_pointer()
-        .hover(|el| el.text_color(theme::text()))
-        .on_click(cx.listener(|this, _, _, cx| this.retry(cx)))
-        .child("Retry")
+    ui::link(
+        "retry",
+        "Retry",
+        cx.listener(|this, _, _, cx| this.retry(cx)),
+    )
 }
 
 pub fn album_title(album: Album) -> &'static str {
