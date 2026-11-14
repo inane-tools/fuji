@@ -1,14 +1,17 @@
 //! Access to an iCloud Photos library.
 //!
-//! Apple has no public API for iCloud Photos, so the real client will use the
-//! private web endpoints that icloud.com uses (Apple ID SRP sign-in, 2FA, then
-//! CloudKit queries). Until that exists, [`MockLibrary`] provides fake assets so
-//! the UI can be built and tested.
+//! Apple has no public API for iCloud Photos, so this uses the private web
+//! endpoints that icloud.com uses: Apple ID SRP sign-in and two-factor
+//! authentication ([`auth`]), then CloudKit queries (not written yet). Until
+//! the photo queries exist, [`MockLibrary`] provides fake assets for the UI.
 
 mod asset;
+pub mod auth;
 mod mock;
+pub mod srp;
 
 pub use asset::{Asset, AssetId, AssetKind};
+pub use auth::{Account, AuthClient, AuthError, SavedSession, SignInStep, TrustedPhone};
 pub use mock::MockLibrary;
 
 /// A source of photos and videos, newest first.

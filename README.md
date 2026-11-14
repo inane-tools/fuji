@@ -9,8 +9,12 @@ your iCloud library without a Mac.
 
 ## Status
 
-Early scaffold. The window, sidebar and a virtualized photo grid run against
-fake data; there is no iCloud access yet.
+Early. Apple ID sign-in works end to end in code (SRP, two-factor by trusted
+device or SMS, session trust, iCloud account login) and the session is kept in
+the OS keychain. The photo grid still shows fake data.
+
+`cargo test -p fuji-icloud -- --ignored` runs a live check that Apple accepts
+fuji's sign-in request (it uses a made-up address, not your account).
 
 ## Stack
 

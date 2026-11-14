@@ -125,7 +125,7 @@ fn tile(index: usize, asset: &Asset) -> impl IntoElement + use<> {
                     .bottom_1()
                     .left_1()
                     .text_xs()
-                    .text_color(theme::accent())
+                    .text_color(theme::favorite())
                     .child("\u{2665}"),
             )
         })

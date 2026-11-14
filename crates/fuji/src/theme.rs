@@ -28,7 +28,23 @@ pub fn text_muted() -> Hsla {
 }
 
 pub fn accent() -> Hsla {
+    hsla(0.58, 0.85, 0.6, 1.)
+}
+
+pub fn favorite() -> Hsla {
     hsla(0.97, 0.75, 0.62, 1.)
+}
+
+pub fn button() -> Hsla {
+    hsla(0.58, 0.8, 0.52, 1.)
+}
+
+pub fn field() -> Hsla {
+    hsla(0., 0., 0.13, 1.)
+}
+
+pub fn danger() -> Hsla {
+    hsla(0.01, 0.75, 0.66, 1.)
 }
 
 pub fn selected() -> Hsla {

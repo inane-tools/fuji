@@ -9,3 +9,7 @@ publish.workspace = true
 [dependencies]
 fuji-icloud.workspace = true
 gpui.workspace = true
+keyring = { version = "3.6", features = ["windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+unicode-segmentation = "1.13.3"
