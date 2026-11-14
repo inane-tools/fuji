@@ -9,7 +9,38 @@ your iCloud library without a Mac.
 
 ## Status
 
-Early planning. Nothing works yet.
+Early scaffold. The window, sidebar and a virtualized photo grid run against
+fake data; there is no iCloud access yet.
+
+## Stack
+
+Pure Rust, with [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework)
+for a fast, smooth, low-memory app. GPUI is pre-1.0, so it is pinned to an
+exact version in the workspace `Cargo.toml`; upgrade it on purpose.
+
+| Crate | What it is |
+| --- | --- |
+| `crates/fuji` | The desktop app (GPUI) |
+| `crates/fuji-icloud` | Library model and the iCloud Photos client (currently a `MockLibrary`) |
+
+## Building
+
+Requires stable Rust (see `rust-toolchain.toml`).
+
+```sh
+cargo run -p fuji
+```
+
+**Linux** needs Vulkan drivers plus the Wayland/X11 development headers, for
+example on Debian/Ubuntu:
+
+```sh
+sudo apt install libvulkan1 libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev
+```
+
+**Windows** needs the MSVC build tools. Keep the checkout at a short path: build
+artifacts nest deeply and fail to link past Windows' 260-character path limit.
+If that happens, set `CARGO_TARGET_DIR` to a short folder such as `C:\t\fuji`.
 
 ## Goals
 

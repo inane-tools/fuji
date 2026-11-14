@@ -1,0 +1,11 @@
+[package]
+name = "fuji"
+description = "iCloud Photos client for Windows and Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fuji-icloud.workspace = true
+gpui.workspace = true

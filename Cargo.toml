@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+fuji-icloud = { path = "crates/fuji-icloud" }
+# GPUI is pre-1.0 and changes often: keep it pinned and upgrade on purpose.
+gpui = "=0.2.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Keep dependencies optimized in debug builds so the UI stays smooth while developing.
+[profile.dev.package."*"]
+opt-level = 2
