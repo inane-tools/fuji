@@ -1,0 +1,26 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# Build output
+/build/
+/dist/
+/target/
+/out/
+node_modules/
+__pycache__/
+*.pyc
+
+# Local secrets and session data (never commit Apple ID tokens or cookies)
+.env
+.env.*
+*.session
+*.cookies
+/cache/
