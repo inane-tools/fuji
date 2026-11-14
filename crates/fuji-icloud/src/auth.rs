@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use ureq::Agent;
 use ureq::http::Response;
 
+use crate::cookies::CookieLog;
 use crate::srp::{self, Protocol, SrpClient};
 
 const AUTH_ROOT: &str = "https://idmsa.apple.com";
@@ -105,6 +106,7 @@ struct State {
 pub struct AuthClient {
     agent: Agent,
     state: Mutex<State>,
+    cookies: CookieLog,
 }
 
 #[derive(Deserialize)]
@@ -135,7 +137,23 @@ impl AuthClient {
                 client_id: format!("auth-{}", uuid::Uuid::new_v4()),
                 ..Default::default()
             }),
+            cookies: CookieLog::default(),
         }
+    }
+
+    /// iCloud's cookies, for saving (encrypted) between runs.
+    pub fn export_cookies(&self) -> String {
+        self.cookies.export()
+    }
+
+    /// Restore cookies saved by [`Self::export_cookies`]. Returns how many loaded.
+    pub fn import_cookies(&self, json: &str) -> usize {
+        self.cookies.import(json, &self.agent)
+    }
+
+    /// Shared with other iCloud clients so their responses' cookies are kept too.
+    pub(crate) fn cookie_log(&self) -> CookieLog {
+        self.cookies.clone()
     }
 
     /// Continue from a saved session (keeps the trust token, so no new code is needed).
@@ -177,7 +195,24 @@ impl AuthClient {
     }
 
     /// Sign in again with the saved session token, without a password.
+    ///
+    /// Tries the saved iCloud web session first (`/validate`, using the
+    /// restored cookies), which Apple doesn't treat as a new sign-in. Only if
+    /// that has expired does it log in to iCloud again with the session token.
     pub fn resume(&self) -> Result<Account, AuthError> {
+        if !self.cookies.is_empty() {
+            match self.validate() {
+                Ok(SignInStep::Done(account)) => {
+                    debug("resume: continued the saved iCloud session (validate)");
+                    return Ok(account);
+                }
+                Ok(SignInStep::NeedsCode) => debug("resume: validate wants a code"),
+                Err(err) => debug(&format!("resume: validate failed: {err}")),
+            }
+        } else {
+            debug("resume: no saved cookies");
+        }
+        debug("resume: logging in to iCloud again with the session token");
         if self.state.lock().unwrap().session_token.is_none() {
             return Err(AuthError::SessionExpired);
         }
@@ -379,6 +414,24 @@ impl AuthClient {
         }
     }
 
+    /// Check the current iCloud web session (cookies) and get the account.
+    fn validate(&self) -> Result<SignInStep, AuthError> {
+        let apple_id = self.state.lock().unwrap().apple_id.clone();
+        let mut resp = self
+            .agent
+            .post(format!("{SETUP_ENDPOINT}/validate"))
+            .header("Origin", HOME_ENDPOINT)
+            .header("Referer", format!("{HOME_ENDPOINT}/"))
+            .content_type("text/plain")
+            .send("null")?;
+        self.capture(&resp);
+        if !resp.status().is_success() {
+            return Err(unexpected(resp.status().as_u16(), &mut resp));
+        }
+        let data: Value = resp.body_mut().read_json()?;
+        parse_account_login(&data, apple_id)
+    }
+
     /// Exchange the Apple ID session token for an iCloud web session.
     fn account_login(&self) -> Result<SignInStep, AuthError> {
         let (body, apple_id) = {
@@ -445,7 +498,8 @@ impl AuthClient {
     }
 
     /// Keep the session headers Apple sends back.
-    fn capture<B>(&self, resp: &Response<B>) {
+    fn capture(&self, resp: &Response<ureq::Body>) {
+        self.cookies.record(resp);
         let headers = resp.headers();
         let get = |name: &str| {
             headers
@@ -470,6 +524,13 @@ impl AuthClient {
         if let Some(v) = get("X-Apple-ID-Account-Country") {
             st.account_country = Some(v);
         }
+    }
+}
+
+/// Diagnostics on stderr when `FUJI_DEBUG` is set. Never logs secrets.
+fn debug(message: &str) {
+    if std::env::var_os("FUJI_DEBUG").is_some() {
+        eprintln!("fuji-icloud: {message}");
     }
 }
 

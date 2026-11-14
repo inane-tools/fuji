@@ -19,6 +19,7 @@ use ureq::Agent;
 
 use crate::asset::{Asset, AssetId, AssetKind, Resource};
 use crate::auth::{Account, AuthClient};
+use crate::cookies::CookieLog;
 
 const CLIENT_BUILD_NUMBER: &str = "2522Project44";
 const CLIENT_MASTERING_NUMBER: &str = "2522B2";
@@ -86,6 +87,7 @@ impl Album {
 
 pub struct PhotosClient {
     agent: Agent,
+    cookies: CookieLog,
     endpoint: String,
     query: Vec<(&'static str, String)>,
 }
@@ -99,6 +101,7 @@ impl PhotosClient {
             .ok_or(PhotosError::NotAvailable)?;
         Ok(Self {
             agent: auth.agent(),
+            cookies: auth.cookie_log(),
             endpoint: format!(
                 "{}/database/1/com.apple.photos.cloud/production/private",
                 root.trim_end_matches('/')
@@ -214,6 +217,7 @@ impl PhotosClient {
     /// Download a small resource (thumbnail or preview) into memory.
     pub fn download(&self, resource: &Resource) -> Result<Vec<u8>, PhotosError> {
         let mut resp = self.agent.get(&resource.url).call()?;
+        self.cookies.record(&resp);
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(error_for(status, ""));
@@ -229,6 +233,7 @@ impl PhotosClient {
     /// Writes to a temporary file next to `path` and renames it when complete.
     pub fn download_to(&self, resource: &Resource, path: &Path) -> Result<u64, PhotosError> {
         let mut resp = self.agent.get(&resource.url).call()?;
+        self.cookies.record(&resp);
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(error_for(status, ""));
@@ -267,6 +272,7 @@ impl PhotosClient {
             .header("Referer", "https://www.icloud.com/")
             .content_type("text/plain")
             .send(serde_json::to_vec(body).expect("serializable query"))?;
+        self.cookies.record(&resp);
         let status = resp.status().as_u16();
         let text = resp.body_mut().read_to_string()?;
         if !(200..300).contains(&status) {

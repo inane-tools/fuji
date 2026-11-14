@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use fuji_icloud::{Account, Album, AuthClient, PhotosClient, SavedSession};
 use gpui::{
-    Animation, AnimationExt as _, Context, Entity, FontWeight, SharedString, Subscription, Window,
-    bounce, div, ease_in_out, ease_out_quint, prelude::*,
+    Animation, AnimationExt as _, Context, Entity, FontWeight, SharedString, Subscription, Task,
+    Window, bounce, div, ease_in_out, ease_out_quint, prelude::*,
 };
 
 use crate::grid::{GridEvent, PhotoGrid};
@@ -66,6 +66,8 @@ enum Screen {
         /// `None` if iCloud Photos isn't available for the account.
         grid: Option<Entity<PhotoGrid>>,
         _grid_subscription: Option<Subscription>,
+        /// Saves the session's cookies now and then, and when the app quits.
+        _persist: (Task<()>, Subscription),
     },
 }
 
@@ -100,10 +102,11 @@ impl FujiApp {
             let task_auth = auth.clone();
             let result = cx
                 .background_spawn(async move {
+                    session_store::restore_cookies(&task_auth);
                     let account = task_auth.resume();
                     if account.is_ok() {
-                        // Apple rotates the tokens; keep the new ones.
-                        session_store::save(&task_auth.saved_session());
+                        // Apple rotates tokens and cookies; keep the new ones.
+                        session_store::persist(&task_auth);
                     }
                     account
                 })
@@ -177,6 +180,7 @@ impl FujiApp {
             account,
             grid,
             _grid_subscription: subscription,
+            _persist: keep_session_saved(auth, cx),
         };
         cx.notify();
     }
@@ -318,6 +322,29 @@ impl Render for FujiApp {
             )
             .into_any_element()
     }
+}
+
+/// iCloud refreshes its cookies as the app talks to it; save them every few
+/// minutes and on quit so the next launch can continue this session.
+fn keep_session_saved(
+    auth: Arc<AuthClient>,
+    cx: &mut Context<FujiApp>,
+) -> (Task<()>, Subscription) {
+    const EVERY: Duration = Duration::from_secs(5 * 60);
+    let periodic_auth = auth.clone();
+    let periodic = cx.spawn(async move |_, cx| {
+        loop {
+            cx.background_executor().timer(EVERY).await;
+            let auth = periodic_auth.clone();
+            cx.background_spawn(async move { session_store::persist(&auth) })
+                .await;
+        }
+    });
+    let on_quit = cx.on_app_quit(move |_, cx| {
+        let auth = auth.clone();
+        cx.background_spawn(async move { session_store::persist(&auth) })
+    });
+    (periodic, on_quit)
 }
 
 fn resuming() -> impl IntoElement {

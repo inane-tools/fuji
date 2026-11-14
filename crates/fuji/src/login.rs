@@ -149,7 +149,7 @@ impl LoginView {
                     let step = auth.sign_in(&apple_id, &password);
                     // Persist on the background thread too: keychain calls can block.
                     if let Ok(SignInStep::Done(_)) = &step {
-                        session_store::save(&auth.saved_session());
+                        session_store::persist(&auth);
                     }
                     step
                 })
@@ -207,7 +207,7 @@ impl LoginView {
                         None => auth.submit_device_code(&code),
                     };
                     if account.is_ok() {
-                        session_store::save(&auth.saved_session());
+                        session_store::persist(&auth);
                     }
                     account
                 })

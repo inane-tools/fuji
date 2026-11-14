@@ -3,8 +3,19 @@
 //!
 //! Each value is its own entry, because Windows limits one credential to
 //! 2560 bytes and Apple's tokens are long. The password is never stored.
+//!
+//! iCloud's web cookies are too large for a keychain entry, so they're kept
+//! in a file encrypted with AES-256-GCM; only the key is in the keychain.
+//! Keeping them lets a restart continue the same iCloud session instead of
+//! signing in again (which makes Apple email the account holder).
 
-use fuji_icloud::SavedSession;
+use std::path::PathBuf;
+
+use aes_gcm::aead::{Aead, Generate, Key, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use fuji_icloud::{AuthClient, SavedSession};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +23,8 @@ const SERVICE: &str = "fuji";
 const ACCOUNT: &str = "account";
 const SESSION_TOKEN: &str = "session-token";
 const TRUST_TOKEN: &str = "trust-token";
+const COOKIE_KEY: &str = "cookie-key";
+const NONCE_LEN: usize = 12;
 
 #[derive(Serialize, Deserialize)]
 struct AccountInfo {
@@ -71,4 +84,72 @@ pub fn save(session: &SavedSession) {
 /// next sign-in on this machine needs the password but not a new code.
 pub fn sign_out() {
     write(SESSION_TOKEN, None);
+    clear_cookies();
+}
+
+/// Save everything needed to pick the session up again: tokens and cookies.
+/// Blocking (keychain and disk); call off the UI thread.
+pub fn persist(auth: &AuthClient) {
+    save(&auth.saved_session());
+    save_cookies(&auth.export_cookies());
+}
+
+/// Restore saved cookies into `auth`. Returns how many were loaded.
+pub fn restore_cookies(auth: &AuthClient) -> usize {
+    load_cookies().map_or(0, |json| auth.import_cookies(&json))
+}
+
+fn cookie_file() -> Option<PathBuf> {
+    Some(dirs::data_local_dir()?.join("fuji").join("session.bin"))
+}
+
+fn cookie_cipher(create: bool) -> Option<Aes256Gcm> {
+    let stored = read(COOKIE_KEY).and_then(|b64| BASE64.decode(b64).ok());
+    let bytes = match stored {
+        Some(bytes) if bytes.len() == 32 => bytes,
+        _ if create => {
+            let key = Key::<Aes256Gcm>::generate();
+            write(COOKIE_KEY, Some(&BASE64.encode(key.as_slice())));
+            key.to_vec()
+        }
+        _ => return None,
+    };
+    Aes256Gcm::new_from_slice(&bytes).ok()
+}
+
+fn save_cookies(json: &str) {
+    let (Some(path), Some(cipher)) = (cookie_file(), cookie_cipher(true)) else {
+        return;
+    };
+    let nonce = Nonce::generate();
+    let Ok(ciphertext) = cipher.encrypt(&nonce, json.as_bytes()) else {
+        return;
+    };
+    let mut data = nonce.to_vec();
+    data.extend_from_slice(&ciphertext);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &data).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+fn load_cookies() -> Option<String> {
+    let data = std::fs::read(cookie_file()?).ok()?;
+    if data.len() <= NONCE_LEN {
+        return None;
+    }
+    let (nonce, ciphertext) = data.split_at(NONCE_LEN);
+    let nonce = Nonce::try_from(nonce).ok()?;
+    let plain = cookie_cipher(false)?.decrypt(&nonce, ciphertext).ok()?;
+    String::from_utf8(plain).ok()
+}
+
+fn clear_cookies() {
+    if let Some(path) = cookie_file() {
+        let _ = std::fs::remove_file(path);
+    }
+    write(COOKIE_KEY, None);
 }

@@ -6,6 +6,7 @@
 
 mod asset;
 pub mod auth;
+mod cookies;
 pub mod photos;
 pub mod srp;
 
