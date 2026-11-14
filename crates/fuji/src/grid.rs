@@ -13,12 +13,13 @@ use std::time::Duration;
 
 use fuji_icloud::{Album, Asset, AssetId, AssetKind, PhotosClient, PhotosError, Resource};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, ElementId, Entity, EventEmitter, FontWeight,
-    ObjectFit, SharedString, Window, bounce, div, ease_in_out, ease_out_quint, img, prelude::*, px,
-    uniform_list,
+    Animation, AnimationExt as _, AnyElement, Context, ElementId, Entity, EventEmitter, Focusable,
+    FontWeight, ObjectFit, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
+    Window, bounce, div, ease_in_out, ease_out_quint, img, prelude::*, px, uniform_list,
 };
 
 use crate::image_cache::LruImageCache;
+use crate::viewer::{Viewer, ViewerEvent};
 use crate::{net, theme, thumbs};
 
 /// Items per CloudKit page request.
@@ -60,6 +61,11 @@ pub struct PhotoGrid {
     /// Shown above the grid when something failed; cleared by Retry.
     error: Option<SharedString>,
     image_cache: Entity<LruImageCache>,
+    preview_dir: Arc<PathBuf>,
+    viewer: Option<(Entity<Viewer>, Subscription)>,
+    scroll: UniformListScrollHandle,
+    /// Columns at the last render, for scrolling to an item.
+    columns: usize,
 }
 
 impl EventEmitter<GridEvent> for PhotoGrid {}
@@ -71,6 +77,10 @@ impl PhotoGrid {
         album: Album,
         cx: &mut Context<Self>,
     ) -> Self {
+        let preview_dir = Arc::new(thumbs::preview_dir(dsid));
+        let prune_dir = preview_dir.clone();
+        cx.background_spawn(async move { thumbs::prune(&prune_dir, thumbs::PREVIEWS_KEPT) })
+            .detach();
         let mut grid = Self {
             client,
             thumb_dir: Arc::new(thumbs::cache_dir(dsid)),
@@ -87,6 +97,10 @@ impl PhotoGrid {
             thumb_queue: Vec::new(),
             error: None,
             image_cache: cx.new(|cx| LruImageCache::new(IMAGE_CACHE_SIZE, cx)),
+            preview_dir,
+            viewer: None,
+            scroll: UniformListScrollHandle::new(),
+            columns: 1,
         };
         grid.load_count(cx);
         grid
@@ -99,7 +113,56 @@ impl PhotoGrid {
         }
     }
 
+    pub fn item_count(&self) -> usize {
+        match self.state {
+            LoadState::Ready { count } => count,
+            _ => 0,
+        }
+    }
+
+    pub fn asset(&self, index: usize) -> Option<&Asset> {
+        self.assets.get(&index)
+    }
+
+    pub fn thumbnail_path(&self, id: &AssetId) -> Option<Arc<Path>> {
+        self.thumbs_ready.get(id).cloned()
+    }
+
+    /// Load the page containing `index` soon, ahead of anything else queued.
+    pub fn ensure_loaded(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.item_count() || self.assets.contains_key(&index) {
+            return;
+        }
+        let page = index / PAGE;
+        if self.pages_requested.insert(page) {
+            self.page_queue.push(page);
+            self.pump(cx);
+        }
+    }
+
+    fn open_viewer(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let grid = cx.entity();
+        let client = self.client.clone();
+        let preview_dir = self.preview_dir.clone();
+        let viewer = cx.new(|cx| Viewer::new(&grid, client, preview_dir, index, cx));
+        let subscription = cx.subscribe(&viewer, |this, _, event, cx| match event {
+            ViewerEvent::Closed { index } => this.close_viewer(*index, cx),
+        });
+        viewer.focus_handle(cx).focus(window);
+        self.viewer = Some((viewer, subscription));
+        cx.notify();
+    }
+
+    fn close_viewer(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.viewer = None;
+        // Keep the photo you were looking at in view.
+        self.scroll
+            .scroll_to_item(index / self.columns.max(1), ScrollStrategy::Center);
+        cx.notify();
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.viewer = None;
         self.generation += 1;
         self.state = LoadState::Loading;
         self.assets.clear();
@@ -365,6 +428,7 @@ impl Render for PhotoGrid {
                     f32::from(window.viewport_size().width) - f32::from(theme::SIDEBAR_WIDTH);
                 let columns = columns_for(grid_width).max(1);
                 let tile_size = tile_size_for(grid_width, columns);
+                self.columns = columns;
                 let rows = count.div_ceil(columns);
                 div()
                     .flex_1()
@@ -390,11 +454,21 @@ impl Render for PhotoGrid {
                                                     this.thumbs_ready.get(&a.id).cloned()
                                                 });
                                                 tile(ix, tile_size, asset, thumb)
+                                                    .map(|tile| {
+                                                        tile.on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.open_viewer(ix, window, cx)
+                                                            },
+                                                        ))
+                                                        .into_any_element()
+                                                    })
+                                                    .unwrap_or_else(|| empty_tile(ix, tile_size))
                                             }))
                                     })
                                     .collect::<Vec<_>>()
                             }),
                         )
+                        .track_scroll(self.scroll.clone())
                         .size_full(),
                     )
                     .into_any_element()
@@ -403,26 +477,41 @@ impl Render for PhotoGrid {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .child(header)
             .child(body)
+            .when_some(self.viewer.as_ref(), |el, (viewer, _)| {
+                el.child(viewer.clone())
+            })
     }
 }
 
-fn tile(index: usize, size: f32, asset: Option<&Asset>, thumb: Option<Arc<Path>>) -> AnyElement {
-    let base = div()
+fn empty_tile(index: usize, size: f32) -> AnyElement {
+    tile_base(index, size).into_any_element()
+}
+
+fn tile_base(index: usize, size: f32) -> gpui::Stateful<gpui::Div> {
+    div()
         .id(ElementId::NamedInteger("tile".into(), index as u64))
         .size(px(size))
         .flex_none()
         .relative()
         .rounded_sm()
         .overflow_hidden()
-        .bg(theme::field());
+        .bg(theme::field())
+}
 
-    let Some(asset) = asset else {
-        return base.into_any_element();
-    };
+/// A loaded tile; `None` while the item itself hasn't loaded.
+fn tile(
+    index: usize,
+    size: f32,
+    asset: Option<&Asset>,
+    thumb: Option<Arc<Path>>,
+) -> Option<gpui::Stateful<gpui::Div>> {
+    let asset = asset?;
+    let base = tile_base(index, size);
 
     let badge = match asset.kind {
         AssetKind::Photo => None,
@@ -478,7 +567,7 @@ fn tile(index: usize, size: f32, asset: Option<&Asset>, thumb: Option<Arc<Path>>
                     .child("\u{2665}"),
             )
         })
-        .into_any_element()
+        .into()
 }
 
 fn centered(content: impl IntoElement) -> AnyElement {

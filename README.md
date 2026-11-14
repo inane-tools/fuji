@@ -18,7 +18,12 @@ Early. Working so far:
   thumbnails download for what's on screen, are cached on disk, and are held
   in a bounded GPU cache so memory stays flat on large libraries.
 
-Not yet: full-size viewer, video playback, albums, shared albums, editing.
+- Click a photo for the full-size viewer: arrow keys to move, Esc to close,
+  Copy (Ctrl+C) puts the image on the clipboard, Download (Ctrl+S) saves the
+  original file (HEIC, RAW, MOV, ...).
+
+Not yet: video playback, albums, shared albums, editing, HEIC decoding for
+originals that have no JPEG rendition.
 
 `cargo test -p fuji-icloud -- --ignored` runs a live check that Apple accepts
 fuji's sign-in request (it uses a made-up address, not your account).

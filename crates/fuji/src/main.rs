@@ -9,6 +9,7 @@ mod net;
 mod session_store;
 mod theme;
 mod thumbs;
+mod viewer;
 
 use gpui::{
     App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
@@ -18,6 +19,7 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         let saved = session_store::load();
         input::bind_keys(cx);
+        viewer::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(

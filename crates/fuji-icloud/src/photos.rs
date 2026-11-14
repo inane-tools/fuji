@@ -9,6 +9,7 @@
 //! Blocking I/O: call these from a background thread.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -210,7 +211,7 @@ impl PhotosClient {
         Ok(assets)
     }
 
-    /// Download a resource (thumbnail, preview or original).
+    /// Download a small resource (thumbnail or preview) into memory.
     pub fn download(&self, resource: &Resource) -> Result<Vec<u8>, PhotosError> {
         let mut resp = self.agent.get(&resource.url).call()?;
         let status = resp.status().as_u16();
@@ -220,8 +221,39 @@ impl PhotosClient {
         Ok(resp
             .body_mut()
             .with_config()
-            .limit(512 * 1024 * 1024)
+            .limit(64 * 1024 * 1024)
             .read_to_vec()?)
+    }
+
+    /// Stream a resource (for example an original video) to a file.
+    /// Writes to a temporary file next to `path` and renames it when complete.
+    pub fn download_to(&self, resource: &Resource, path: &Path) -> Result<u64, PhotosError> {
+        let mut resp = self.agent.get(&resource.url).call()?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(error_for(status, ""));
+        }
+        let io_error = |err: std::io::Error| PhotosError::Unexpected {
+            status: 0,
+            message: format!("couldn't save {}: {err}", path.display()),
+        };
+        let partial = path.with_extension(match path.extension() {
+            Some(ext) => format!("{}.part", ext.to_string_lossy()),
+            None => "part".into(),
+        });
+        let result = (|| {
+            let mut file = std::fs::File::create(&partial)?;
+            let mut body = resp.body_mut().with_config().limit(u64::MAX).reader();
+            let written = std::io::copy(&mut body, &mut file)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&partial, path)?;
+            Ok(written)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        result.map_err(io_error)
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value, PhotosError> {
@@ -390,6 +422,13 @@ fn is_movie(item_type: &str) -> bool {
     )
 }
 
+/// Originals small enough, and in a format, that the viewer can show directly.
+fn is_viewable_original(resource: &Resource) -> bool {
+    const MAX_BYTES: u64 = 40 * 1024 * 1024;
+    matches!(resource.file_type.as_str(), "public.jpeg" | "public.png")
+        && resource.size <= MAX_BYTES
+}
+
 fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
     let id = asset["recordName"].as_str()?.to_string();
     let item_type = field(master, "itemType")
@@ -420,9 +459,13 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
 
     let dim = |name: &str| field(master, name).and_then(Value::as_u64).unwrap_or(0) as u32;
     let thumbnail = resource_either(asset, master, "resJPEGThumb");
+    let original = resource(master, "resOriginal");
+    // Apple only makes JPEG renditions when the original can't be shown as
+    // is; for JPEG and PNG originals, the original is the preview.
     let preview = resource(asset, "resJPEGFull")
         .or_else(|| resource_either(asset, master, "resJPEGMed"))
-        .or_else(|| resource(master, "resJPEGFull"));
+        .or_else(|| resource(master, "resJPEGFull"))
+        .or_else(|| original.clone().filter(is_viewable_original));
 
     Some(Asset {
         id: AssetId(id),
@@ -436,7 +479,7 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
             .unwrap_or(0),
         thumbnail,
         preview,
-        original: resource(master, "resOriginal"),
+        original,
     })
 }
 
@@ -506,6 +549,27 @@ mod tests {
             "https://cvws.icloud-content.com/med"
         );
         assert_eq!(a.original.unwrap().file_type, "public.heic");
+    }
+
+    #[test]
+    fn jpeg_original_is_used_as_preview() {
+        let master = json!({ "fields": {
+            "itemType": { "value": "public.jpeg" },
+            "resOriginalRes": res("https://x/original.jpg"),
+            "resOriginalFileType": { "value": "public.jpeg" },
+            "resJPEGThumbRes": res("https://x/thumb.jpg"),
+        }});
+        let asset = json!({ "recordName": "J", "fields": {} });
+        let a = parse_asset(&asset, &master).unwrap();
+        assert_eq!(a.preview.unwrap().url, "https://x/original.jpg");
+
+        // A HEIC original isn't shown directly.
+        let heic = json!({ "fields": {
+            "itemType": { "value": "public.heic" },
+            "resOriginalRes": res("https://x/original.heic"),
+            "resOriginalFileType": { "value": "public.heic" },
+        }});
+        assert!(parse_asset(&asset, &heic).unwrap().preview.is_none());
     }
 
     #[test]

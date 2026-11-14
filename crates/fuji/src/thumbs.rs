@@ -1,7 +1,10 @@
-//! On-disk thumbnail cache, so the grid only downloads each thumbnail once.
+//! On-disk image cache, so each thumbnail and preview downloads only once.
 //!
-//! Windows: `%LOCALAPPDATA%\fuji\cache\<dsid>\thumbs`
-//! Linux:   `~/.cache/fuji/<dsid>/thumbs`
+//! Windows: `%LOCALAPPDATA%\fuji\cache\<dsid>\{thumbs,previews2}`
+//! Linux:   `~/.cache/fuji/<dsid>/{thumbs,previews2}`
+//!
+//! Thumbnails are small and kept. Previews are large (a few MB each), so
+//! that folder is trimmed to the most recently used [`PREVIEWS_KEPT`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,14 +12,51 @@ use std::path::{Path, PathBuf};
 use fuji_icloud::{AssetId, PhotosClient, PhotosError, Resource};
 use sha2::{Digest, Sha256};
 
-pub fn cache_dir(dsid: &str) -> PathBuf {
+pub const PREVIEWS_KEPT: usize = 300;
+
+fn account_dir(dsid: &str) -> PathBuf {
     let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
     let base = if cfg!(windows) {
         base.join("fuji").join("cache")
     } else {
         base.join("fuji")
     };
-    base.join(file_safe(dsid)).join("thumbs")
+    base.join(file_safe(dsid))
+}
+
+pub fn cache_dir(dsid: &str) -> PathBuf {
+    account_dir(dsid).join("thumbs")
+}
+
+pub fn preview_dir(dsid: &str) -> PathBuf {
+    // "previews" (v1) could hold thumbnails cached as previews; drop it.
+    let old = account_dir(dsid).join("previews");
+    if old.exists() {
+        let _ = fs::remove_dir_all(old);
+    }
+    account_dir(dsid).join("previews2")
+}
+
+/// Delete all but the `keep` most recently used files in `dir`.
+pub fn prune(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let meta = e.metadata().ok()?;
+            meta.is_file()
+                .then(|| (meta.modified().unwrap_or(std::time::UNIX_EPOCH), e.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 pub fn path_for(dir: &Path, id: &AssetId) -> PathBuf {
@@ -35,6 +75,10 @@ pub fn ensure(
 ) -> Result<PathBuf, PhotosError> {
     let path = path_for(dir, id);
     if path.exists() {
+        // Mark as recently used, for pruning.
+        if let Ok(file) = fs::File::options().append(true).open(&path) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
         return Ok(path);
     }
     let bytes = client.download(resource)?;
@@ -72,6 +116,28 @@ mod tests {
     fn dir_names_are_safe() {
         assert_eq!(file_safe("123456"), "123456");
         assert_eq!(file_safe("a/b+c="), "a%2Fb%2Bc%3D");
+    }
+
+    #[test]
+    fn prune_keeps_newest() {
+        let dir = std::env::temp_dir().join(format!("fuji-prune-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        for i in 0..5u64 {
+            let path = dir.join(format!("{i}.jpg"));
+            fs::write(&path, b"x").unwrap();
+            let file = fs::File::options().append(true).open(&path).unwrap();
+            file.set_modified(now - std::time::Duration::from_secs(100 - i))
+                .unwrap();
+        }
+        prune(&dir, 2);
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(left, ["3.jpg", "4.jpg"]);
     }
 
     #[test]
