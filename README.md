@@ -13,10 +13,15 @@ Early. Working so far:
 
 - Apple ID sign-in (SRP, two-factor by trusted device or SMS, trusted
   sessions), with the session kept in the OS keychain
-- The photo grid shows your real iCloud library, newest first: Library,
-  Favorites, Videos and Recently Deleted. Items load in pages as you scroll;
-  thumbnails download for what's on screen, are cached on disk, and are held
-  in a bounded GPU cache so memory stays flat on large libraries.
+- The gallery shows your iCloud library as a mosaic (justified rows that
+  keep each photo's shape) under year, month and day headers: Library,
+  Favorites, Videos and Recently Deleted. The album index is cached on disk,
+  so it opens instantly and refreshes from iCloud in the background.
+  Thumbnails already on disk show without any network request; memory stays
+  bounded however far you scroll.
+- Restarts continue the existing iCloud session instead of signing in again
+  (which would make Apple email you). Cookies are kept in an AES-256-GCM
+  encrypted file; the key and tokens live in the OS keychain.
 
 - Click a photo for the full-size viewer, letterboxed on black. Zoom with the
   mouse wheel (toward the cursor), a touchpad pinch, double-click (fit / actual
@@ -94,6 +99,11 @@ Notes:
 
 - Windows 10/11 (x64, arm64)
 - Linux (x64, arm64): Flatpak / AppImage
+
+## Credits
+
+- Icons: [Phosphor](https://phosphoricons.com) (MIT), in `crates/fuji/assets/icons`
+- Font: Gabarito (SIL Open Font License), in `crates/fuji/assets`
 
 ## Disclaimer
 

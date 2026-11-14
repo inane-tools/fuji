@@ -10,6 +10,7 @@ use gpui::{
     ease_out_quint, prelude::*, px,
 };
 
+use crate::assets::icon;
 use crate::input::{FocusNext, FocusPrev, Submitted, TextInput};
 use crate::session_store;
 use crate::theme;
@@ -323,7 +324,7 @@ impl LoginView {
             .gap_3()
             .child(heading(
                 "Sign in to iCloud",
-                "Use your Apple ID to see your photos.",
+                "Use your Apple Account to open your photo library.",
             ))
             .child(self.apple_id.clone())
             .child(self.password.clone())
@@ -339,8 +340,8 @@ impl LoginView {
             ))
             .child(
                 div()
-                    .text_xs()
-                    .text_color(theme::text_muted())
+                    .text_size(px(11.))
+                    .text_color(theme::text_meta())
                     .child("fuji talks only to Apple. Your password is never saved."),
             )
     }
@@ -380,8 +381,8 @@ impl LoginView {
                     .gap_1()
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme::text_muted())
+                            .text_size(px(11.))
+                            .text_color(theme::text_meta())
                             .child("Text a code to:"),
                     )
                     .children(list.iter().cloned().map(|phone| {
@@ -404,7 +405,7 @@ impl LoginView {
 
         col.child(link_button(
             "back",
-            "Use a different Apple ID",
+            "Use a different Apple Account",
             cx.listener(|this, _, window, cx| this.back_to_credentials(window, cx)),
         ))
     }
@@ -418,34 +419,46 @@ impl Render for LoginView {
             Stage::Code { sms, phones } => self.render_code(sms, phones, cx).into_any_element(),
         };
 
+        // Dialog recipe: popover surface, 16px rounding, one deep shadow.
         let card = div()
-            .w(px(360.))
-            .p_6()
+            .w(px(380.))
+            .p(px(24.))
             .flex()
             .flex_col()
-            .gap_3()
-            .rounded_xl()
-            .bg(theme::sidebar())
-            .border_1()
-            .border_color(theme::border())
-            .shadow_lg()
+            .gap(px(12.))
+            .rounded(theme::RADIUS_DIALOG)
+            .bg(theme::popover())
+            .shadow(vec![gpui::BoxShadow {
+                color: theme::scrim(0.72),
+                offset: gpui::point(px(0.), px(30.)),
+                blur_radius: px(80.),
+                spread_radius: px(0.),
+            }])
             .child(body)
             .when_some(self.notice.clone(), |el, notice| {
                 el.child(
                     div()
-                        .text_sm()
+                        .text_size(px(12.))
                         .text_color(theme::text_muted())
                         .child(notice),
                 )
             })
             .when_some(self.error.clone(), |el, error| {
-                el.child(div().text_sm().text_color(theme::danger()).child(error))
+                el.child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .text_size(px(12.))
+                        .text_color(theme::danger())
+                        .child(icon("warning", px(14.), theme::danger()))
+                        .child(error),
+                )
             })
-            // Each stage fades and rises in.
+            // Each stage fades in while rising 10px.
             .with_animation(
                 ElementId::Name(stage.key().into()),
-                Animation::new(Duration::from_millis(320)).with_easing(ease_out_quint()),
-                |el, t| el.opacity(t).mt(px((1. - t) * 16.)),
+                Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                |el, t| el.opacity(t).mt(px((1. - t) * 10.)),
             );
 
         div()
@@ -456,7 +469,7 @@ impl Render for LoginView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme::background())
+            .bg(theme::surface())
             .text_color(theme::text())
             .child(card)
     }
@@ -466,17 +479,19 @@ fn heading(title: &'static str, subtitle: &'static str) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .pb_2()
+        .gap(px(6.))
+        .pb(px(8.))
         .child(
             div()
-                .text_xl()
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(26.))
+                .line_height(px(30.))
+                .font_weight(FontWeight::EXTRA_BOLD)
+                .text_color(theme::text())
                 .child(title),
         )
         .child(
             div()
-                .text_sm()
+                .text_size(px(13.))
                 .text_color(theme::text_muted())
                 .child(subtitle),
         )
@@ -490,15 +505,16 @@ fn primary_button(
 ) -> impl IntoElement {
     let button = div()
         .id(id)
-        .h(px(38.))
+        .h(px(36.))
+        .mt(px(4.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
-        .bg(theme::button())
+        .rounded(theme::RADIUS_CONTROL)
+        .bg(theme::accent())
         .text_color(gpui::white())
-        .font_weight(FontWeight::MEDIUM)
-        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(13.))
         .child(label);
     if busy {
         // Gentle pulse while waiting on Apple.
@@ -514,8 +530,7 @@ fn primary_button(
     } else {
         button
             .cursor_pointer()
-            .hover(|el| el.opacity(0.9))
-            .active(|el| el.opacity(0.8))
+            .hover(|el| el.bg(theme::accent_hover()))
             .on_click(on_click)
             .into_any_element()
     }
@@ -528,10 +543,11 @@ fn link_button(
 ) -> impl IntoElement {
     div()
         .id(id.into())
-        .text_sm()
-        .text_color(theme::accent())
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::accent_text())
         .cursor_pointer()
-        .hover(|el| el.underline())
+        .hover(|el| el.text_color(theme::text()))
         .on_click(on_click)
         .child(label.into())
 }

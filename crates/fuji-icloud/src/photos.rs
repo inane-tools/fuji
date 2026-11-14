@@ -175,12 +175,34 @@ impl PhotosClient {
         start_rank: usize,
         limit: usize,
     ) -> Result<Vec<Asset>, PhotosError> {
+        self.fetch_with(album, start_rank, limit, DESIRED_KEYS)
+    }
+
+    /// Like [`Self::fetch`], but only the fields needed to lay out the
+    /// library (date, shape, type, favorite): much smaller responses, no
+    /// download URLs. Used to index the whole library quickly.
+    pub fn scan(
+        &self,
+        album: Album,
+        start_rank: usize,
+        limit: usize,
+    ) -> Result<Vec<Asset>, PhotosError> {
+        self.fetch_with(album, start_rank, limit, SCAN_KEYS)
+    }
+
+    fn fetch_with(
+        &self,
+        album: Album,
+        start_rank: usize,
+        limit: usize,
+        keys: &[&str],
+    ) -> Result<Vec<Asset>, PhotosError> {
         let mut assets = Vec::with_capacity(limit);
         let mut masters: HashMap<String, Value> = HashMap::new();
         while assets.len() < limit {
             let want = (limit - assets.len()).min(MAX_PAGE);
             let rank = start_rank + assets.len();
-            let data = self.post("records/query", &list_query(album, rank, want))?;
+            let data = self.post("records/query", &list_query(album, rank, want, keys))?;
             let records = data["records"].as_array().cloned().unwrap_or_default();
 
             let mut page_assets = Vec::new();
@@ -324,7 +346,7 @@ fn cloudkit_error(status: u16, code: &str, reason: &str) -> PhotosError {
     }
 }
 
-fn list_query(album: Album, start_rank: usize, limit: usize) -> Value {
+fn list_query(album: Album, start_rank: usize, limit: usize, keys: &[&str]) -> Value {
     let mut filters = vec![
         json!({
             "fieldName": "startRank",
@@ -347,10 +369,26 @@ fn list_query(album: Album, start_rank: usize, limit: usize) -> Value {
     json!({
         "query": { "filterBy": filters, "recordType": album.list_type() },
         "resultsLimit": limit * RECORDS_PER_ITEM,
-        "desiredKeys": DESIRED_KEYS,
+        "desiredKeys": keys,
         "zoneID": { "zoneName": "PrimarySync" },
     })
 }
+
+/// Just enough to index and lay out the library.
+const SCAN_KEYS: &[&str] = &[
+    "recordName",
+    "recordType",
+    "masterRef",
+    "assetDate",
+    "isFavorite",
+    "duration",
+    "itemType",
+    "resOriginalWidth",
+    "resOriginalHeight",
+    "resJPEGThumbWidth",
+    "resJPEGThumbHeight",
+    "resOriginalVidComplFileType",
+];
 
 const DESIRED_KEYS: &[&str] = &[
     "resJPEGFullWidth",
@@ -378,6 +416,7 @@ const DESIRED_KEYS: &[&str] = &[
     "resOriginalFileType",
     "resOriginalRes",
     "resOriginalVidComplRes",
+    "resOriginalVidComplFileType",
     "itemType",
     "filenameEnc",
     "recordName",
@@ -435,6 +474,20 @@ fn is_viewable_original(resource: &Resource) -> bool {
         && resource.size <= MAX_BYTES
 }
 
+/// Width / height as shown: the rendered thumbnail's proportions when known
+/// (edited asset first, then master), else the original's.
+fn display_aspect(asset: &Value, master: &Value) -> f32 {
+    let dims = |record: &Value, prefix: &str| {
+        let w = field(record, &format!("{prefix}Width"))?.as_f64()?;
+        let h = field(record, &format!("{prefix}Height"))?.as_f64()?;
+        (w > 0. && h > 0.).then_some((w / h) as f32)
+    };
+    dims(asset, "resJPEGThumb")
+        .or_else(|| dims(master, "resJPEGThumb"))
+        .or_else(|| dims(master, "resOriginal"))
+        .unwrap_or(1.)
+}
+
 fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
     let id = asset["recordName"].as_str()?.to_string();
     let item_type = field(master, "itemType")
@@ -442,13 +495,17 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
         .unwrap_or_default();
 
     let kind = if is_movie(item_type) {
+        // CloudKit stores the duration in milliseconds.
         let secs = field(asset, "duration")
             .and_then(|d| d.as_f64().or_else(|| d.as_i64().map(|n| n as f64)))
-            .unwrap_or(0.0);
+            .unwrap_or(0.0)
+            / 1000.;
         AssetKind::Video {
             duration_secs: secs.round().max(0.0) as u32,
         }
-    } else if field(master, "resOriginalVidComplRes").is_some() {
+    } else if field(master, "resOriginalVidComplRes").is_some()
+        || field(master, "resOriginalVidComplFileType").is_some()
+    {
         AssetKind::LivePhoto
     } else {
         AssetKind::Photo
@@ -478,6 +535,7 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
         kind,
         filename,
         width: dim("resOriginalWidth"),
+        aspect: display_aspect(asset, master),
         height: dim("resOriginalHeight"),
         favorite: field(asset, "isFavorite").and_then(Value::as_i64) == Some(1),
         created_at_ms: field(asset, "assetDate")
@@ -497,6 +555,7 @@ fn missing_asset(asset: &Value) -> Asset {
         filename: None,
         width: 0,
         height: 0,
+        aspect: 1.,
         favorite: false,
         created_at_ms: 0,
         thumbnail: None,
@@ -579,10 +638,40 @@ mod tests {
     }
 
     #[test]
+    fn aspect_prefers_rendered_thumbnail() {
+        // Original stored landscape with a rotation; the thumbnail is portrait.
+        let master = json!({ "fields": {
+            "itemType": { "value": "public.heic" },
+            "resOriginalWidth": { "value": 4032 },
+            "resOriginalHeight": { "value": 3024 },
+            "resJPEGThumbWidth": { "value": 360 },
+            "resJPEGThumbHeight": { "value": 480 },
+        }});
+        let asset = json!({ "recordName": "R", "fields": {} });
+        assert!((parse_asset(&asset, &master).unwrap().aspect - 0.75).abs() < 1e-6);
+
+        let bare = json!({ "fields": { "resOriginalWidth": { "value": 200 }, "resOriginalHeight": { "value": 100 } } });
+        assert!((parse_asset(&asset, &bare).unwrap().aspect - 2.).abs() < 1e-6);
+    }
+
+    #[test]
+    fn live_photo_detected_from_scan_fields() {
+        let master = json!({ "fields": {
+            "itemType": { "value": "public.heic" },
+            "resOriginalVidComplFileType": { "value": "com.apple.quicktime-movie" },
+        }});
+        let asset = json!({ "recordName": "L", "fields": {} });
+        assert_eq!(
+            parse_asset(&asset, &master).unwrap().kind,
+            AssetKind::LivePhoto
+        );
+    }
+
+    #[test]
     fn detects_videos_and_live_photos() {
         let video_master =
             json!({ "fields": { "itemType": { "value": "com.apple.quicktime-movie" } } });
-        let video = json!({ "recordName": "V", "fields": { "duration": { "value": 75 } } });
+        let video = json!({ "recordName": "V", "fields": { "duration": { "value": 75_400 } } });
         assert_eq!(
             parse_asset(&video, &video_master).unwrap().kind,
             AssetKind::Video { duration_secs: 75 }
@@ -601,7 +690,7 @@ mod tests {
 
     #[test]
     fn list_query_shape() {
-        let q = list_query(Album::Favorites, 40, 100);
+        let q = list_query(Album::Favorites, 40, 100, DESIRED_KEYS);
         assert_eq!(q["resultsLimit"], 200);
         assert_eq!(
             q["query"]["recordType"],
@@ -611,7 +700,7 @@ mod tests {
         assert_eq!(filters[0]["fieldValue"]["value"], 40);
         assert_eq!(filters[2]["fieldValue"]["value"], "FAVORITE");
         assert_eq!(
-            list_query(Album::All, 0, 10)["query"]["filterBy"]
+            list_query(Album::All, 0, 10, SCAN_KEYS)["query"]["filterBy"]
                 .as_array()
                 .unwrap()
                 .len(),

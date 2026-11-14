@@ -1,9 +1,12 @@
 //! fuji: an iCloud Photos client for Windows and Linux.
 
 mod app;
+mod assets;
 mod grid;
 mod image_cache;
+mod index;
 mod input;
+mod layout;
 mod login;
 mod net;
 mod session_store;
@@ -17,27 +20,32 @@ use gpui::{
 };
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let saved = session_store::load();
-        input::bind_keys(cx);
-        viewer::bind_keys(cx);
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(|cx: &mut App| {
+            cx.text_system()
+                .add_fonts(vec![std::borrow::Cow::Borrowed(assets::FONT_BYTES)])
+                .expect("load the UI font");
+            let saved = session_store::load();
+            input::bind_keys(cx);
+            viewer::bind_keys(cx);
 
-        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("fuji".into()),
+            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("fuji".into()),
+                        ..Default::default()
+                    }),
+                    window_min_size: Some(size(px(640.), px(420.))),
                     ..Default::default()
-                }),
-                window_min_size: Some(size(px(640.), px(420.))),
-                ..Default::default()
-            },
-            |window, cx| {
-                cx.activate(true);
-                cx.new(|cx| app::FujiApp::new(saved, window, cx))
-            },
-        )
-        .expect("failed to open the main window");
-    });
+                },
+                |window, cx| {
+                    cx.activate(true);
+                    cx.new(|cx| app::FujiApp::new(saved, window, cx))
+                },
+            )
+            .expect("failed to open the main window");
+        });
 }

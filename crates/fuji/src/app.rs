@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use fuji_icloud::{Account, Album, AuthClient, PhotosClient, SavedSession};
 use gpui::{
-    Animation, AnimationExt as _, Context, Entity, FontWeight, SharedString, Subscription, Task,
-    Window, bounce, div, ease_in_out, ease_out_quint, prelude::*,
+    Animation, AnimationExt as _, Context, Entity, FontWeight, ImageSource, Resource, SharedString,
+    Subscription, Task, Window, bounce, div, ease_in_out, ease_out_quint, img, prelude::*, px,
 };
 
+use crate::assets::icon;
 use crate::grid::{GridEvent, PhotoGrid};
 use crate::login::{LoginEvent, LoginView};
 use crate::session_store;
@@ -42,6 +43,18 @@ impl Section {
             Section::Albums => "Albums",
             Section::Shared => "Shared Albums",
             Section::RecentlyDeleted => "Recently Deleted",
+        }
+    }
+
+    /// Icon name; the `-active` (filled) variant marks the selection.
+    fn icon(self) -> &'static str {
+        match self {
+            Section::Library => "library",
+            Section::Favorites => "favorites",
+            Section::Videos => "videos",
+            Section::Albums => "albums",
+            Section::Shared => "shared",
+            Section::RecentlyDeleted => "deleted",
         }
     }
 
@@ -221,64 +234,125 @@ impl FujiApp {
         } else {
             account.full_name.clone()
         };
+        let nav = Section::ALL.into_iter().map(|section| {
+            let active = section == self.section;
+            let glyph = if active {
+                format!("{}-active", section.icon())
+            } else {
+                section.icon().to_string()
+            };
+            div()
+                .id(SharedString::from(section.label()))
+                .h(theme::CONTROL_HEIGHT)
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .rounded(theme::RADIUS_CONTROL)
+                .cursor_pointer()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .map(|el| {
+                    if active {
+                        // Selection uses the accent, not a stronger grey.
+                        el.bg(theme::accent_soft()).text_color(theme::text())
+                    } else {
+                        el.text_color(theme::text_muted())
+                            .hover(|el| el.bg(theme::hover()).text_color(theme::text()))
+                    }
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.select(section, cx)))
+                .child(icon(
+                    &glyph,
+                    px(18.),
+                    if active {
+                        theme::accent_text()
+                    } else {
+                        theme::text_meta()
+                    },
+                ))
+                .child(section.label())
+        });
+
         div()
             .flex()
             .flex_col()
             .flex_none()
             .w(theme::SIDEBAR_WIDTH)
             .h_full()
-            .p_3()
-            .gap_1()
+            .px(px(12.))
+            .pt(px(16.))
+            .pb(px(12.))
+            .gap(px(2.))
             .bg(theme::sidebar())
-            .border_r_1()
-            .border_color(theme::border())
             .child(
                 div()
-                    .px_2()
-                    .pb_3()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("fuji"),
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .pb(px(16.))
+                    .child(
+                        img(ImageSource::Resource(Resource::Embedded(
+                            "icon-96.png".into(),
+                        )))
+                        .size(px(24.))
+                        .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_color(theme::text())
+                            .child("fuji"),
+                    ),
             )
-            .children(Section::ALL.into_iter().map(|section| {
-                let active = section == self.section;
-                div()
-                    .id(SharedString::from(section.label()))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(if active {
-                        theme::text()
-                    } else {
-                        theme::text_muted()
-                    })
-                    .when(active, |el| el.bg(theme::selected()))
-                    .hover(|el| el.text_color(theme::text()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(section, cx)))
-                    .child(section.label())
-            }))
+            .children(nav)
             .child(div().flex_1())
             .child(
                 div()
-                    .px_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(theme::border())
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(div().text_sm().truncate().child(name))
+                    .items_center()
+                    .gap(px(8.))
+                    .pl(px(10.))
+                    .pt(px(12.))
+                    .border_t_1()
+                    .border_color(theme::line())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_title())
+                                    .truncate()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_meta())
+                                    .truncate()
+                                    .child(account.apple_id.clone()),
+                            ),
+                    )
                     .child(
                         div()
                             .id("sign-out")
-                            .text_xs()
-                            .text_color(theme::text_muted())
+                            .size(theme::CONTROL_HEIGHT)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme::RADIUS_CONTROL)
                             .cursor_pointer()
-                            .hover(|el| el.text_color(theme::text()))
+                            .hover(|el| el.bg(theme::hover()))
                             .on_click(cx.listener(|this, _, window, cx| this.sign_out(window, cx)))
-                            .child("Sign out"),
+                            .child(icon("sign-out", px(16.), theme::text_muted())),
                     ),
             )
     }
@@ -286,9 +360,15 @@ impl FujiApp {
 
 impl Render for FujiApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One font and base color for every screen.
+        let root = div()
+            .size_full()
+            .font_family(theme::FONT)
+            .bg(theme::surface())
+            .text_color(theme::text());
         let (account, grid) = match &self.screen {
-            Screen::Resuming => return resuming().into_any_element(),
-            Screen::Login(login) => return login.clone().into_any_element(),
+            Screen::Resuming => return root.child(resuming()),
+            Screen::Login(login) => return root.child(login.clone()),
             Screen::Main { account, grid, .. } => (account.clone(), grid.clone()),
         };
 
@@ -305,22 +385,24 @@ impl Render for FujiApp {
         let content = match (self.section.album(), grid) {
             (Some(_), Some(grid)) => div().size_full().child(grid),
             (Some(_), None) => message(fuji_icloud::PhotosError::NotAvailable.to_string()),
-            (None, _) => message(format!("{} is not built yet", self.section.label())),
+            (None, _) => message(format!(
+                "{} aren't available in fuji yet.",
+                self.section.label()
+            )),
         };
 
-        div()
-            .flex()
-            .size_full()
-            .bg(theme::background())
-            .text_color(theme::text())
-            .child(self.render_sidebar(&account, cx))
-            .child(div().flex_1().h_full().child(content))
-            .with_animation(
-                "main-fade-in",
-                Animation::new(Duration::from_millis(280)).with_easing(ease_out_quint()),
-                |el, t| el.opacity(t),
-            )
-            .into_any_element()
+        root.child(
+            div()
+                .flex()
+                .size_full()
+                .child(self.render_sidebar(&account, cx))
+                .child(div().flex_1().min_w_0().h_full().child(content))
+                .with_animation(
+                    "main-fade-in",
+                    Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                    |el, t| el.opacity(t),
+                ),
+        )
     }
 }
 
@@ -353,7 +435,6 @@ fn resuming() -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .bg(theme::background())
         .text_color(theme::text_muted())
         .text_sm()
         .child("Signing in\u{2026}")

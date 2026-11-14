@@ -25,6 +25,7 @@ use gpui::{
     ease_in_out, ease_out_quint, img, prelude::*, px,
 };
 
+use crate::assets::icon;
 use crate::grid::PhotoGrid;
 use crate::image_cache::LruImageCache;
 use crate::zoom::{Geometry, View};
@@ -621,7 +622,7 @@ impl Viewer {
             .text_sm()
             .child(icon_button(
                 "close",
-                "\u{2715}",
+                "close",
                 cx.listener(|this, _, window, cx| this.close(&Close, window, cx)),
             ))
             .child(
@@ -645,27 +646,41 @@ impl Viewer {
                 el.child(
                     div()
                         .id("zoom-level")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
+                        // Fixed width so the bar doesn't shift as digits change.
+                        .w(px(52.))
+                        .h(theme::CONTROL_HEIGHT)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(theme::RADIUS_CONTROL)
                         .cursor_pointer()
+                        .text_size(px(12.))
                         .text_color(theme::text_muted())
-                        .hover(|el| el.bg(gpui::white().opacity(0.08)).text_color(theme::text()))
+                        .hover(|el| el.bg(theme::hover()).text_color(theme::text()))
                         .on_click(cx.listener(|this, _, _, cx| this.set_target(View::FIT, cx)))
                         .child(format!("{percent}%")),
                 )
             })
             .child(text_button(
                 "copy",
+                "copy",
                 "Copy",
                 cx.listener(|this, _, _, cx| this.copy_current(cx)),
             ))
             .child(text_button(
                 "download",
+                "download",
                 "Download",
                 cx.listener(|this, _, _, cx| this.download_current(cx)),
             ))
-            .child(div().text_color(theme::text_muted()).child(position))
+            .child(
+                div()
+                    .min_w(px(96.))
+                    .text_right()
+                    .text_size(px(12.))
+                    .text_color(theme::text_meta())
+                    .child(position),
+            )
     }
 }
 
@@ -807,7 +822,7 @@ impl Render for Viewer {
             .when(has_previous, |el| {
                 el.child(edge_button(
                     "previous",
-                    "\u{2039}",
+                    "previous",
                     true,
                     cx.listener(|this, _, window, cx| this.previous(&Previous, window, cx)),
                 ))
@@ -815,7 +830,7 @@ impl Render for Viewer {
             .when(has_next, |el| {
                 el.child(edge_button(
                     "next",
-                    "\u{203A}",
+                    "next",
                     false,
                     cx.listener(|this, _, window, cx| this.next(&Next, window, cx)),
                 ))
@@ -930,6 +945,7 @@ fn pill(text: &'static str) -> gpui::Div {
 
 type ClickHandler = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>;
 
+/// Square icon button: color-only hover.
 fn icon_button(
     id: &'static str,
     glyph: &'static str,
@@ -937,33 +953,40 @@ fn icon_button(
 ) -> impl IntoElement {
     div()
         .id(id)
-        .size(px(32.))
+        .size(theme::CONTROL_HEIGHT)
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
+        .rounded(theme::RADIUS_CONTROL)
         .cursor_pointer()
-        .text_color(theme::text_muted())
-        .hover(|el| el.bg(gpui::white().opacity(0.08)).text_color(theme::text()))
+        .hover(|el| el.bg(theme::hover()))
         .on_click(on_click)
-        .child(glyph)
+        .child(icon(glyph, px(18.), theme::text_title()))
 }
 
+/// Secondary button recipe: subtle fill, brighter on hover.
 fn text_button(
     id: &'static str,
+    glyph: &'static str,
     label: &'static str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
         .id(id)
-        .px_3()
-        .py_1()
-        .rounded_md()
+        .h(theme::CONTROL_HEIGHT)
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .rounded(theme::RADIUS_CONTROL)
         .cursor_pointer()
-        .bg(gpui::white().opacity(0.06))
-        .hover(|el| el.bg(gpui::white().opacity(0.12)))
-        .active(|el| el.bg(gpui::white().opacity(0.18)))
+        .bg(theme::fill())
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::text_title())
+        .hover(|el| el.bg(theme::fill_hover()).text_color(theme::text()))
         .on_click(on_click)
+        .child(icon(glyph, px(15.), theme::text_title()))
         .child(label)
 }
 
@@ -974,9 +997,9 @@ fn link(
 ) -> impl IntoElement {
     div()
         .id(id)
-        .text_color(theme::accent())
+        .text_color(theme::accent_text())
         .cursor_pointer()
-        .hover(|el| el.underline())
+        .hover(|el| el.text_color(theme::text()))
         .on_click(on_click)
         .child(label)
 }
@@ -1005,17 +1028,15 @@ fn edge_button(
         .on_click(move |event, window, cx| on_click(event, window, cx))
         .child(
             div()
-                .size(px(44.))
+                .size(px(40.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .bg(gpui::black().opacity(0.5))
-                .text_color(gpui::white())
-                .text_2xl()
+                .bg(theme::scrim(0.55))
                 .opacity(0.)
                 .group_hover(id, |el| el.opacity(1.))
-                .child(glyph),
+                .child(icon(glyph, px(20.), gpui::white())),
         )
 }
 
@@ -1051,6 +1072,7 @@ mod tests {
             filename: None,
             width: 0,
             height: 0,
+            aspect: 1.,
             favorite: false,
             created_at_ms: 0,
             thumbnail: None,

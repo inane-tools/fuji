@@ -549,7 +549,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if input.content.is_empty() {
-            (input.placeholder.clone(), theme::text_muted())
+            (input.placeholder.clone(), theme::text_meta())
         } else {
             (input.display_text(), style.color)
         };
@@ -607,7 +607,7 @@ impl Element for TextElement {
                         point(bounds.left() + x, bounds.top()),
                         size(px(1.5), bounds.bottom() - bounds.top()),
                     ),
-                    theme::accent(),
+                    theme::accent_text(),
                 )),
             )
         } else {
@@ -623,7 +623,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    theme::selected(),
+                    theme::accent_soft(),
                 )),
                 None,
             )
@@ -699,20 +699,22 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            // Field recipe: quiet border and fill; focus turns the border to
+            // the accent.
             .w_full()
-            .h(px(38.))
-            .px_3()
-            .rounded_md()
+            .h(px(36.))
+            .px(px(12.))
+            .rounded(theme::RADIUS_CONTROL)
             .bg(theme::field())
             .border_1()
             .border_color(if focused {
-                theme::accent()
+                theme::focus_ring()
             } else {
-                theme::border()
+                theme::field_border()
             })
             .when(self.disabled, |el| el.opacity(0.5))
-            .text_size(px(14.))
-            .line_height(px(20.))
+            .text_size(px(13.))
+            .line_height(px(18.))
             .child(TextElement { input: cx.entity() })
     }
 }

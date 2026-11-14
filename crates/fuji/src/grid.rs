@@ -1,71 +1,102 @@
-//! The photo grid: a virtualized list of rows, filled from iCloud on demand.
+﻿//! The gallery: a mosaic of the album under year, month and day headers.
 //!
-//! Only the rows on screen are built. Items load in pages as they come into
-//! view, and thumbnails download (to a disk cache) for visible tiles first.
-//! Decoded thumbnails live in a bounded GPU cache, so memory stays flat no
-//! matter how far you scroll.
+//! - The album's index (date, shape, type of every item) comes from a disk
+//!   cache at once, and is refreshed from iCloud in the background.
+//! - The mosaic is laid out from the index ([`crate::layout`]); only rows on
+//!   screen are built.
+//! - Thumbnails already on disk show without any network request; others are
+//!   fetched for what's visible, using download URLs from full records loaded
+//!   by page.
+//! - Decoded thumbnails live in a bounded GPU cache, so memory stays flat.
 
-use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuji_icloud::{Album, Asset, AssetId, AssetKind, PhotosClient, PhotosError, Resource};
+use fuji_icloud::{Album, Asset, AssetId, PhotosClient, PhotosError, Resource};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, ElementId, Entity, EventEmitter, Focusable,
-    FontWeight, ObjectFit, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
-    Window, bounce, div, ease_in_out, ease_out_quint, img, prelude::*, px, uniform_list,
+    FontWeight, ObjectFit, ScrollHandle, SharedString, Subscription, Window, bounce, div,
+    ease_in_out, ease_out_quint, img, point, prelude::*, px,
 };
 
+use crate::assets::icon;
 use crate::image_cache::LruImageCache;
+use crate::index::{self, IndexItem, Kind};
+use crate::layout::{self, Layout, RowKind};
 use crate::viewer::{Viewer, ViewerEvent};
 use crate::{net, theme, thumbs};
 
-/// Items per CloudKit page request.
+/// Items per full-record page (with download URLs).
 const PAGE: usize = 100;
+/// Full-record pages kept in memory.
+const MAX_PAGES: usize = 40;
 const MAX_PAGE_REQUESTS: usize = 2;
+/// Items per index-scan request (small records, no URLs).
+const SCAN_PAGE: usize = 200;
+const MAX_SCAN_REQUESTS: usize = 6;
 const MAX_THUMB_REQUESTS: usize = 8;
-/// Rows beyond the visible ones to load ahead.
-const PREFETCH_ROWS: usize = 6;
-/// Decoded thumbnails kept on the GPU.
-const IMAGE_CACHE_SIZE: usize = 600;
+/// Extra content kept built above and below the viewport.
+const OVERSCAN: f32 = 600.;
+/// Decoded thumbnails kept in memory: a couple of screenfuls.
+const IMAGE_CACHE_SIZE: usize = 120;
+const TARGET_ROW_HEIGHT: f32 = 200.;
+const TILE_GAP: f32 = 4.;
 
 pub enum GridEvent {
     SessionExpired,
 }
 
 enum LoadState {
+    /// No index yet (no cache, first scan pages not back).
     Loading,
-    Ready { count: usize },
+    Ready,
     Failed(SharedString),
+}
+
+/// A full refresh of the album index from iCloud.
+struct Scan {
+    count: usize,
+    next_rank: usize,
+    in_flight: usize,
+    /// Pages received, by first rank.
+    pages: HashMap<usize, Vec<IndexItem>>,
+    /// Show results as they arrive (nothing cached to show meanwhile).
+    progressive: bool,
 }
 
 pub struct PhotoGrid {
     client: Arc<PhotosClient>,
+    account_dir: PathBuf,
     thumb_dir: Arc<PathBuf>,
+    preview_dir: Arc<PathBuf>,
     album: Album,
     /// Bumped on album change so results for the old album are ignored.
     generation: u64,
     state: LoadState,
-    /// Timeline index (0 = newest) to item.
-    assets: HashMap<usize, Asset>,
+    index: Vec<IndexItem>,
+    scan: Option<Scan>,
+    layout: Option<Layout>,
+    layout_dirty: bool,
+    // Full records (download URLs), by page of rank.
+    assets: HashMap<AssetId, Asset>,
+    page_ids: HashMap<usize, Vec<AssetId>>,
+    page_lru: VecDeque<usize>,
     pages_requested: HashSet<usize>,
     page_queue: Vec<usize>,
     pages_in_flight: usize,
+    // Thumbnails.
+    disk_thumbs: Option<Arc<HashSet<String>>>,
     thumbs_ready: HashMap<AssetId, Arc<Path>>,
     thumbs_failed: HashSet<AssetId>,
     thumbs_in_flight: HashSet<AssetId>,
     /// Thumbnails to fetch, highest priority last.
     thumb_queue: Vec<(AssetId, Resource)>,
-    /// Shown above the grid when something failed; cleared by Retry.
     error: Option<SharedString>,
     image_cache: Entity<LruImageCache>,
-    preview_dir: Arc<PathBuf>,
     viewer: Option<(Entity<Viewer>, Subscription)>,
-    scroll: UniformListScrollHandle,
-    /// Columns at the last render, for scrolling to an item.
-    columns: usize,
+    scroll: ScrollHandle,
 }
 
 impl EventEmitter<GridEvent> for PhotoGrid {}
@@ -77,95 +108,96 @@ impl PhotoGrid {
         album: Album,
         cx: &mut Context<Self>,
     ) -> Self {
+        let thumb_dir = Arc::new(thumbs::cache_dir(dsid));
         let preview_dir = Arc::new(thumbs::preview_dir(dsid));
+        let account_dir = thumb_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| thumb_dir.to_path_buf());
+
         let prune_dir = preview_dir.clone();
         cx.background_spawn(async move { thumbs::prune(&prune_dir, thumbs::PREVIEWS_KEPT) })
             .detach();
+
         let mut grid = Self {
             client,
-            thumb_dir: Arc::new(thumbs::cache_dir(dsid)),
+            account_dir,
+            thumb_dir,
+            preview_dir,
             album,
             generation: 0,
             state: LoadState::Loading,
+            index: Vec::new(),
+            scan: None,
+            layout: None,
+            layout_dirty: true,
             assets: HashMap::new(),
+            page_ids: HashMap::new(),
+            page_lru: VecDeque::new(),
             pages_requested: HashSet::new(),
             page_queue: Vec::new(),
             pages_in_flight: 0,
+            disk_thumbs: None,
             thumbs_ready: HashMap::new(),
             thumbs_failed: HashSet::new(),
             thumbs_in_flight: HashSet::new(),
             thumb_queue: Vec::new(),
             error: None,
             image_cache: cx.new(|cx| LruImageCache::new(IMAGE_CACHE_SIZE, cx)),
-            preview_dir,
             viewer: None,
-            scroll: UniformListScrollHandle::new(),
-            columns: 1,
+            scroll: ScrollHandle::new(),
         };
-        grid.load_count(cx);
+        grid.list_disk_thumbs(cx);
+        grid.load_album(cx);
         grid
     }
 
     pub fn set_album(&mut self, album: Album, cx: &mut Context<Self>) {
         if album != self.album {
             self.album = album;
-            self.reload(cx);
+            self.load_album(cx);
         }
     }
+
+    // ---- What the viewer reads -------------------------------------------
 
     pub fn item_count(&self) -> usize {
-        match self.state {
-            LoadState::Ready { count } => count,
-            _ => 0,
-        }
+        self.index.len()
     }
 
+    /// The full record (with download URLs) at `index`, if loaded.
     pub fn asset(&self, index: usize) -> Option<&Asset> {
-        self.assets.get(&index)
+        let item = self.index.get(index)?;
+        self.assets.get(&AssetId(item.id.clone()))
     }
 
     pub fn thumbnail_path(&self, id: &AssetId) -> Option<Arc<Path>> {
-        self.thumbs_ready.get(id).cloned()
+        self.thumbs_ready.get(id).cloned().or_else(|| {
+            let path = thumbs::path_for(&self.thumb_dir, id);
+            self.on_disk(&path).then(|| path.into())
+        })
     }
 
-    /// Load the page containing `index` soon, ahead of anything else queued.
+    /// Load the full record for `index` soon, ahead of anything else queued.
     pub fn ensure_loaded(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.item_count() || self.assets.contains_key(&index) {
-            return;
-        }
-        let page = index / PAGE;
-        if self.pages_requested.insert(page) {
-            self.page_queue.push(page);
+        if index < self.index.len() && self.asset(index).is_none() {
+            self.request_page(index / PAGE);
             self.pump(cx);
         }
     }
 
-    fn open_viewer(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let grid = cx.entity();
-        let client = self.client.clone();
-        let preview_dir = self.preview_dir.clone();
-        let viewer = cx.new(|cx| Viewer::new(&grid, client, preview_dir, index, cx));
-        let subscription = cx.subscribe(&viewer, |this, _, event, cx| match event {
-            ViewerEvent::Closed { index } => this.close_viewer(*index, cx),
-        });
-        viewer.focus_handle(cx).focus(window);
-        self.viewer = Some((viewer, subscription));
-        cx.notify();
-    }
+    // ---- Album index ------------------------------------------------------
 
-    fn close_viewer(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.viewer = None;
-        // Keep the photo you were looking at in view.
-        self.scroll
-            .scroll_to_item(index / self.columns.max(1), ScrollStrategy::Center);
-        cx.notify();
-    }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        self.viewer = None;
+    fn load_album(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.state = LoadState::Loading;
+        self.index.clear();
+        self.scan = None;
+        self.layout = None;
+        self.layout_dirty = true;
         self.assets.clear();
+        self.page_ids.clear();
+        self.page_lru.clear();
         self.pages_requested.clear();
         self.page_queue.clear();
         self.pages_in_flight = 0;
@@ -173,16 +205,32 @@ impl PhotoGrid {
         self.thumbs_in_flight.clear();
         self.thumb_queue.clear();
         self.error = None;
-        self.load_count(cx);
+        self.viewer = None;
+        self.scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
-    }
 
-    fn load_count(&mut self, cx: &mut Context<Self>) {
+        let generation = self.generation;
+        let path = index::cache_path(&self.account_dir, self.album);
         let client = self.client.clone();
         let album = self.album;
-        let generation = self.generation;
         cx.spawn(async move |this, cx| {
-            let result = net::run(move || {
+            // Cached index first, so the gallery shows right away.
+            let cached = cx.background_spawn(async move { index::load(&path) }).await;
+            let had_cache = cached.is_some();
+            this.update(cx, |this, cx| {
+                if this.generation == generation
+                    && let Some(items) = cached
+                {
+                    this.index = items;
+                    this.state = LoadState::Ready;
+                    this.layout_dirty = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+
+            // Then refresh from iCloud.
+            let count = net::run(move || {
                 client.check_ready()?;
                 client.count(album)
             })
@@ -191,15 +239,160 @@ impl PhotoGrid {
                 if this.generation != generation {
                     return;
                 }
-                this.state = match result {
-                    Some(Ok(count)) => LoadState::Ready { count },
+                match count {
+                    Some(Ok(count)) => this.start_scan(count, !had_cache, cx),
+                    Some(Err(PhotosError::SessionExpired)) => cx.emit(GridEvent::SessionExpired),
+                    Some(Err(err)) => this.fail(err.to_string(), cx),
+                    None => this.fail("Something went wrong loading the library.".into(), cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_scan(&mut self, count: usize, progressive: bool, cx: &mut Context<Self>) {
+        if count == 0 {
+            self.index.clear();
+            self.state = LoadState::Ready;
+            self.layout_dirty = true;
+            index::save(&index::cache_path(&self.account_dir, self.album), &[]);
+            cx.notify();
+            return;
+        }
+        self.scan = Some(Scan {
+            count,
+            next_rank: 0,
+            in_flight: 0,
+            pages: HashMap::new(),
+            progressive,
+        });
+        self.pump_scan(cx);
+        cx.notify();
+    }
+
+    fn pump_scan(&mut self, cx: &mut Context<Self>) {
+        let Some(scan) = self.scan.as_mut() else {
+            return;
+        };
+        while scan.in_flight < MAX_SCAN_REQUESTS && scan.next_rank < scan.count {
+            let start = scan.next_rank;
+            let limit = SCAN_PAGE.min(scan.count - start);
+            scan.next_rank += limit;
+            scan.in_flight += 1;
+
+            let client = self.client.clone();
+            let album = self.album;
+            let generation = self.generation;
+            cx.spawn(async move |this, cx| {
+                let result = net::run(move || client.scan(album, start, limit)).await;
+                this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    match result {
+                        Some(Ok(assets)) => {
+                            let items = assets.iter().map(IndexItem::from).collect();
+                            this.scan_page_done(start, items, cx);
+                        }
+                        Some(Err(PhotosError::SessionExpired)) => {
+                            cx.emit(GridEvent::SessionExpired)
+                        }
+                        Some(Err(err)) => {
+                            this.scan = None;
+                            this.fail(err.to_string(), cx);
+                        }
+                        None => {
+                            this.scan = None;
+                            this.fail("Updating the library failed.".into(), cx);
+                        }
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn scan_page_done(&mut self, start: usize, items: Vec<IndexItem>, cx: &mut Context<Self>) {
+        let Some(scan) = self.scan.as_mut() else {
+            return;
+        };
+        scan.in_flight -= 1;
+        scan.pages.insert(start, items);
+
+        // The contiguous prefix received so far.
+        let mut prefix = Vec::new();
+        let mut rank = 0;
+        while let Some(page) = scan.pages.get(&rank) {
+            prefix.extend_from_slice(page);
+            rank += SCAN_PAGE.min(scan.count - rank);
+            if page.is_empty() || rank >= scan.count {
+                break;
+            }
+        }
+        let done = rank >= scan.count && scan.in_flight == 0 && scan.next_rank >= scan.count;
+
+        if done {
+            self.scan = None;
+            index::save(&index::cache_path(&self.account_dir, self.album), &prefix);
+            self.index = prefix;
+            self.state = LoadState::Ready;
+            self.layout_dirty = true;
+        } else if scan.progressive && prefix.len() > self.index.len() {
+            self.index = prefix;
+            self.state = LoadState::Ready;
+            self.layout_dirty = true;
+        }
+        self.pump_scan(cx);
+        cx.notify();
+    }
+
+    // ---- Full records (download URLs) ------------------------------------
+
+    fn request_page(&mut self, page: usize) {
+        if self.pages_requested.insert(page) {
+            self.page_queue.push(page);
+        }
+    }
+
+    fn start_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let count = self.index.len();
+        let start = page * PAGE;
+        if start >= count {
+            self.pages_requested.remove(&page);
+            return;
+        }
+        let limit = PAGE.min(count - start);
+        let client = self.client.clone();
+        let album = self.album;
+        let generation = self.generation;
+        self.pages_in_flight += 1;
+
+        cx.spawn(async move |this, cx| {
+            let result = net::run(move || client.fetch(album, start, limit)).await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.pages_in_flight -= 1;
+                match result {
+                    Some(Ok(assets)) => this.store_page(page, assets),
                     Some(Err(PhotosError::SessionExpired)) => {
                         cx.emit(GridEvent::SessionExpired);
                         return;
                     }
-                    Some(Err(err)) => LoadState::Failed(err.to_string().into()),
-                    None => LoadState::Failed("Something went wrong loading the library.".into()),
-                };
+                    Some(Err(err)) => {
+                        this.pages_requested.remove(&page);
+                        this.page_queue.clear();
+                        this.fail(err.to_string(), cx);
+                    }
+                    None => {
+                        this.pages_requested.remove(&page);
+                        this.fail("Loading photos failed.".into(), cx);
+                    }
+                }
+                this.pump(cx);
                 cx.notify();
             })
             .ok();
@@ -207,45 +400,96 @@ impl PhotoGrid {
         .detach();
     }
 
-    /// Called while rendering: queue the pages and thumbnails for what's on screen.
-    fn request_visible(&mut self, rows: Range<usize>, columns: usize, cx: &mut Context<Self>) {
-        let LoadState::Ready { count } = self.state else {
-            return;
-        };
-        if count == 0 || self.error.is_some() {
-            return;
+    fn store_page(&mut self, page: usize, assets: Vec<Asset>) {
+        let ids = assets.iter().map(|a| a.id.clone()).collect();
+        for asset in assets {
+            // Fresh URLs: let failed thumbnails try again.
+            self.thumbs_failed.remove(&asset.id);
+            self.assets.insert(asset.id.clone(), asset);
         }
-
-        let ahead = rows.start.saturating_sub(PREFETCH_ROWS)..rows.end + PREFETCH_ROWS;
-        let first = (ahead.start * columns).min(count - 1);
-        let last = (ahead.end * columns).min(count) - 1;
-        // Pages furthest from the viewport go first in the queue, so the
-        // visible ones pop off first.
-        let visible_page = (rows.start * columns).min(count - 1) / PAGE;
-        let mut pages: Vec<usize> = (first / PAGE..=last / PAGE)
-            .filter(|page| !self.pages_requested.contains(page))
-            .collect();
-        pages.sort_by_key(|page| std::cmp::Reverse(page.abs_diff(visible_page)));
-        for page in pages {
-            self.pages_requested.insert(page);
-            self.page_queue.push(page);
+        self.page_ids.insert(page, ids);
+        self.page_lru.retain(|p| *p != page);
+        self.page_lru.push_back(page);
+        // Keep memory bounded: forget the least recently loaded pages.
+        while self.page_lru.len() > MAX_PAGES {
+            let Some(old) = self.page_lru.pop_front() else {
+                break;
+            };
+            for id in self.page_ids.remove(&old).unwrap_or_default() {
+                self.assets.remove(&id);
+            }
+            self.pages_requested.remove(&old);
         }
+    }
 
-        // Thumbnails: only for visible tiles, in reading order.
-        let visible = (rows.start * columns).min(count)..(rows.end * columns).min(count);
-        self.thumb_queue = visible
-            .rev()
-            .filter_map(|ix| {
-                let asset = self.assets.get(&ix)?;
-                let resource = asset.thumbnail.clone()?;
-                let id = &asset.id;
-                let needed = !self.thumbs_ready.contains_key(id)
-                    && !self.thumbs_failed.contains(id)
-                    && !self.thumbs_in_flight.contains(id);
-                needed.then(|| (id.clone(), resource))
+    // ---- Thumbnails ---------------------------------------------------------
+
+    /// List the thumbnail cache once, so cached thumbnails show without
+    /// touching the disk (or the network) per tile.
+    fn list_disk_thumbs(&mut self, cx: &mut Context<Self>) {
+        let dir = self.thumb_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let names = cx
+                .background_spawn(async move {
+                    std::fs::read_dir(&*dir)
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                                .collect::<HashSet<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.disk_thumbs = Some(Arc::new(names));
+                cx.notify();
             })
-            .collect();
+            .ok();
+        })
+        .detach();
+    }
 
+    fn on_disk(&self, path: &Path) -> bool {
+        let (Some(names), Some(name)) = (&self.disk_thumbs, path.file_name()) else {
+            return false;
+        };
+        name.to_str().is_some_and(|n| names.contains(n))
+    }
+
+    /// Called while rendering with the items on screen, top to bottom.
+    fn request_visible(&mut self, visible: &[usize], cx: &mut Context<Self>) {
+        if self.error.is_some() {
+            return;
+        }
+        let mut queue = Vec::new();
+        for &ix in visible {
+            let Some(item) = self.index.get(ix) else {
+                continue;
+            };
+            let id = item.asset_id();
+            if self.thumbs_ready.contains_key(&id)
+                || self.thumbs_failed.contains(&id)
+                || self.thumbs_in_flight.contains(&id)
+            {
+                continue;
+            }
+            let path = thumbs::path_for(&self.thumb_dir, &id);
+            if self.on_disk(&path) {
+                self.thumbs_ready.insert(id, path.into());
+                continue;
+            }
+            if self.disk_thumbs.is_none() {
+                // Wait for the cache listing before fetching anything.
+                continue;
+            }
+            match self.assets.get(&id).and_then(|a| a.thumbnail.clone()) {
+                Some(resource) => queue.push((id, resource)),
+                None => self.request_page(ix / PAGE),
+            }
+        }
+        // Visible order, first popped first.
+        queue.reverse();
+        self.thumb_queue = queue;
         self.pump(cx);
     }
 
@@ -263,57 +507,6 @@ impl PhotoGrid {
             };
             self.start_thumb(id, resource, cx);
         }
-    }
-
-    fn start_page(&mut self, page: usize, cx: &mut Context<Self>) {
-        let LoadState::Ready { count } = self.state else {
-            return;
-        };
-        let start = page * PAGE;
-        let end = (start + PAGE).min(count);
-        if start >= end {
-            return;
-        }
-        // CloudKit ranks run newest first, the same order as the grid.
-        let client = self.client.clone();
-        let album = self.album;
-        let generation = self.generation;
-        self.pages_in_flight += 1;
-
-        cx.spawn(async move |this, cx| {
-            let result = net::run(move || client.fetch(album, start, end - start)).await;
-            this.update(cx, |this, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                this.pages_in_flight -= 1;
-                match result {
-                    Some(Ok(assets)) => {
-                        for (offset, asset) in assets.into_iter().enumerate() {
-                            this.assets.insert(start + offset, asset);
-                        }
-                    }
-                    Some(Err(PhotosError::SessionExpired)) => {
-                        cx.emit(GridEvent::SessionExpired);
-                        return;
-                    }
-                    Some(Err(err)) => this.fail(page, err.to_string(), cx),
-                    None => this.fail(page, "Loading photos failed.".into(), cx),
-                }
-                this.pump(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn fail(&mut self, page: usize, message: String, cx: &mut Context<Self>) {
-        // Stop requesting until the user retries, rather than hammering iCloud.
-        self.pages_requested.remove(&page);
-        self.page_queue.clear();
-        self.error = Some(message.into());
-        cx.notify();
     }
 
     fn start_thumb(&mut self, id: AssetId, resource: Resource, cx: &mut Context<Self>) {
@@ -349,9 +542,53 @@ impl PhotoGrid {
         .detach();
     }
 
+    // ---- Viewer ---------------------------------------------------------------
+
+    fn open_viewer(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let grid = cx.entity();
+        let client = self.client.clone();
+        let preview_dir = self.preview_dir.clone();
+        let viewer = cx.new(|cx| Viewer::new(&grid, client, preview_dir, index, cx));
+        let subscription = cx.subscribe(&viewer, |this, _, event, cx| match event {
+            ViewerEvent::Closed { index } => this.close_viewer(*index, cx),
+        });
+        viewer.focus_handle(cx).focus(window);
+        self.viewer = Some((viewer, subscription));
+        cx.notify();
+    }
+
+    fn close_viewer(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.viewer = None;
+        // Keep the photo you were looking at in view.
+        if let Some(row) = self.layout.as_ref().and_then(|l| l.row_of_item(index)) {
+            let viewport = f32::from(self.scroll.bounds().size.height);
+            let offset = self.scroll.offset();
+            let top = -f32::from(offset.y);
+            if row.y < top || row.y + row.height > top + viewport {
+                let target = (row.y + row.height / 2. - viewport / 2.).max(0.);
+                self.scroll.set_offset(point(offset.x, px(-target)));
+            }
+        }
+        cx.notify();
+    }
+
+    // ---- Errors -------------------------------------------------------------
+
+    fn fail(&mut self, message: String, cx: &mut Context<Self>) {
+        if matches!(self.state, LoadState::Loading) {
+            self.state = LoadState::Failed(message.into());
+        } else {
+            // Keep showing what we have; stop requesting until Retry.
+            self.error = Some(message.into());
+        }
+        cx.notify();
+    }
+
     fn retry(&mut self, cx: &mut Context<Self>) {
-        if let LoadState::Failed(_) = self.state {
-            self.reload(cx);
+        if matches!(self.state, LoadState::Failed(_))
+            || (self.scan.is_none() && self.error.is_some())
+        {
+            self.load_album(cx);
             return;
         }
         self.error = None;
@@ -359,37 +596,74 @@ impl PhotoGrid {
         cx.notify();
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let subtitle = match &self.state {
-            LoadState::Ready { count } => format_count(*count),
-            _ => String::new(),
+    // ---- Rendering --------------------------------------------------------------
+
+    fn ensure_layout(&mut self, width: f32) {
+        let stale = self
+            .layout
+            .as_ref()
+            .is_none_or(|l| (l.width - width).abs() > 0.5);
+        if !(self.layout_dirty || stale) || width <= 0. {
+            return;
+        }
+        let tz = jiff::tz::TimeZone::system();
+        let today = jiff::Zoned::now().with_time_zone(tz.clone()).date();
+        let params = layout::Params {
+            width,
+            padding_x: theme::CONTENT_PADDING,
+            target_height: TARGET_ROW_HEIGHT,
+            gap: TILE_GAP,
         };
+        self.layout = Some(layout::build(&self.index, params, today, &tz));
+        self.layout_dirty = false;
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let status: Option<SharedString> = match (&self.scan, &self.state) {
+            (Some(scan), LoadState::Ready) if scan.progressive => Some(
+                format!(
+                    "Loading {} of {}\u{2026}",
+                    group_digits(self.index.len()),
+                    group_digits(scan.count)
+                )
+                .into(),
+            ),
+            (Some(_), _) => Some("Updating\u{2026}".into()),
+            _ => None,
+        };
+        let count = matches!(self.state, LoadState::Ready)
+            .then(|| format_count(self.scan.as_ref().map_or(self.index.len(), |s| s.count)));
+
         div()
-            .px(px(theme::GRID_PADDING))
-            .pt_4()
-            .pb_2()
+            .flex_none()
             .flex()
             .items_baseline()
-            .gap_2()
+            .gap_3()
+            .px(px(theme::CONTENT_PADDING))
+            .pt(px(20.))
+            .pb(px(8.))
             .child(
                 div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(26.))
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_color(theme::text())
                     .child(album_title(self.album)),
             )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme::text_muted())
-                    .child(subtitle),
-            )
+            .when_some(count, |el, count| {
+                el.child(div().text_sm().text_color(theme::text_meta()).child(count))
+            })
             .child(div().flex_1())
+            .when_some(status, |el, status| {
+                el.child(div().text_xs().text_color(theme::text_meta()).child(status))
+            })
             .when_some(self.error.clone(), |el, error| {
                 el.child(
                     div()
                         .flex()
+                        .items_center()
                         .gap_2()
-                        .text_sm()
+                        .text_xs()
+                        .child(icon("warning", px(14.), theme::danger()))
                         .child(div().text_color(theme::danger()).child(error))
                         .child(retry_link(cx)),
                 )
@@ -400,11 +674,12 @@ impl PhotoGrid {
 impl Render for PhotoGrid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(cx);
+
         let body: AnyElement = match &self.state {
             LoadState::Loading => centered(
                 div().child("Loading your library\u{2026}").with_animation(
                     "library-loading",
-                    Animation::new(Duration::from_millis(1100))
+                    Animation::new(Duration::from_millis(1800))
                         .repeat()
                         .with_easing(bounce(ease_in_out)),
                     |el, t| el.opacity(0.4 + 0.6 * t),
@@ -421,58 +696,10 @@ impl Render for PhotoGrid {
                     .child(div().text_color(theme::danger()).child(message.clone()))
                     .child(retry_link(cx)),
             ),
-            LoadState::Ready { count: 0 } => centered(div().child(empty_message(self.album))),
-            LoadState::Ready { count } => {
-                let count = *count;
-                let grid_width =
-                    f32::from(window.viewport_size().width) - f32::from(theme::SIDEBAR_WIDTH);
-                let columns = columns_for(grid_width).max(1);
-                let tile_size = tile_size_for(grid_width, columns);
-                self.columns = columns;
-                let rows = count.div_ceil(columns);
-                div()
-                    .flex_1()
-                    .image_cache(self.image_cache.clone())
-                    .child(
-                        uniform_list(
-                            ElementId::NamedInteger("photo-grid".into(), self.generation),
-                            rows,
-                            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                                this.request_visible(range.clone(), columns, cx);
-                                range
-                                    .map(|row| {
-                                        let start = row * columns;
-                                        let end = (start + columns).min(count);
-                                        div()
-                                            .flex()
-                                            .gap(px(theme::TILE_GAP))
-                                            .px(px(theme::GRID_PADDING))
-                                            .pb(px(theme::TILE_GAP))
-                                            .children((start..end).map(|ix| {
-                                                let asset = this.assets.get(&ix);
-                                                let thumb = asset.and_then(|a| {
-                                                    this.thumbs_ready.get(&a.id).cloned()
-                                                });
-                                                tile(ix, tile_size, asset, thumb)
-                                                    .map(|tile| {
-                                                        tile.on_click(cx.listener(
-                                                            move |this, _, window, cx| {
-                                                                this.open_viewer(ix, window, cx)
-                                                            },
-                                                        ))
-                                                        .into_any_element()
-                                                    })
-                                                    .unwrap_or_else(|| empty_tile(ix, tile_size))
-                                            }))
-                                    })
-                                    .collect::<Vec<_>>()
-                            }),
-                        )
-                        .track_scroll(self.scroll.clone())
-                        .size_full(),
-                    )
-                    .into_any_element()
+            LoadState::Ready if self.index.is_empty() && self.scan.is_none() => {
+                centered(div().child(empty_message(self.album)))
             }
+            LoadState::Ready => self.render_mosaic(window, cx),
         };
 
         div()
@@ -480,6 +707,7 @@ impl Render for PhotoGrid {
             .relative()
             .flex()
             .flex_col()
+            .bg(theme::surface())
             .child(header)
             .child(body)
             .when_some(self.viewer.as_ref(), |el, (viewer, _)| {
@@ -488,40 +716,136 @@ impl Render for PhotoGrid {
     }
 }
 
-fn empty_tile(index: usize, size: f32) -> AnyElement {
-    tile_base(index, size).into_any_element()
+impl PhotoGrid {
+    fn render_mosaic(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // The scroll area's size from the last frame; before the first
+        // frame, estimate from the window.
+        let bounds = self.scroll.bounds();
+        let width = if bounds.size.width > px(0.) {
+            f32::from(bounds.size.width)
+        } else {
+            f32::from(window.viewport_size().width) - f32::from(theme::SIDEBAR_WIDTH)
+        };
+        let viewport_h = if bounds.size.height > px(0.) {
+            f32::from(bounds.size.height)
+        } else {
+            f32::from(window.viewport_size().height)
+        };
+        self.ensure_layout(width);
+        let Some(layout) = self.layout.take() else {
+            return div().flex_1().into_any_element();
+        };
+
+        let top = -f32::from(self.scroll.offset().y);
+        let rows = layout.rows_in(top - OVERSCAN, top + viewport_h + OVERSCAN);
+        let on_screen = layout.rows_in(top, top + viewport_h);
+
+        // Thumbnails for what's on screen, top to bottom.
+        let visible: Vec<usize> = layout.rows[on_screen]
+            .iter()
+            .filter_map(|row| match &row.kind {
+                RowKind::Tiles(tiles) => Some(tiles.iter().map(|t| t.index)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        self.request_visible(&visible, cx);
+
+        let mut children: Vec<AnyElement> = Vec::with_capacity(rows.len() * 4);
+        for row in &layout.rows[rows] {
+            match &row.kind {
+                RowKind::Year(label) => children.push(
+                    header_row(row.y, row.height)
+                        .items_end()
+                        .pb(px(8.))
+                        .text_size(px(32.))
+                        .font_weight(FontWeight::EXTRA_BOLD)
+                        .text_color(theme::text())
+                        .child(label.clone())
+                        .into_any_element(),
+                ),
+                RowKind::Month(label) => children.push(
+                    header_row(row.y, row.height)
+                        .items_end()
+                        .pb(px(6.))
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::EXTRA_BOLD)
+                        .text_color(theme::text())
+                        .child(label.clone())
+                        .into_any_element(),
+                ),
+                RowKind::Day(label) => children.push(
+                    header_row(row.y, row.height)
+                        .items_center()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_title())
+                        .child(label.clone())
+                        .into_any_element(),
+                ),
+                RowKind::Tiles(tiles) => {
+                    for t in tiles {
+                        let Some(item) = self.index.get(t.index) else {
+                            continue;
+                        };
+                        let thumb = self.thumbs_ready.get(&item.asset_id()).cloned();
+                        let ix = t.index;
+                        children.push(
+                            tile(ix, item, thumb)
+                                .absolute()
+                                .left(px(t.x))
+                                .top(px(row.y))
+                                .w(px(t.width))
+                                .h(px(row.height))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_viewer(ix, window, cx)
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+        }
+        let height = layout.height;
+        self.layout = Some(layout);
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .image_cache(self.image_cache.clone())
+            .child(
+                div()
+                    .id("gallery")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(div().relative().w_full().h(px(height)).children(children)),
+            )
+            .into_any_element()
+    }
 }
 
-fn tile_base(index: usize, size: f32) -> gpui::Stateful<gpui::Div> {
+fn header_row(y: f32, height: f32) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(theme::CONTENT_PADDING))
+        .right(px(theme::CONTENT_PADDING))
+        .top(px(y))
+        .h(px(height))
+        .flex()
+}
+
+fn tile(index: usize, item: &IndexItem, thumb: Option<Arc<Path>>) -> gpui::Stateful<gpui::Div> {
+    let duration = match item.kind {
+        Kind::Video(secs) => Some(format!("{}:{:02}", secs / 60, secs % 60)),
+        _ => None,
+    };
     div()
         .id(ElementId::NamedInteger("tile".into(), index as u64))
-        .size(px(size))
-        .flex_none()
-        .relative()
-        .rounded_sm()
         .overflow_hidden()
-        .bg(theme::field())
-}
-
-/// A loaded tile; `None` while the item itself hasn't loaded.
-fn tile(
-    index: usize,
-    size: f32,
-    asset: Option<&Asset>,
-    thumb: Option<Arc<Path>>,
-) -> Option<gpui::Stateful<gpui::Div>> {
-    let asset = asset?;
-    let base = tile_base(index, size);
-
-    let badge = match asset.kind {
-        AssetKind::Photo => None,
-        AssetKind::LivePhoto => Some("LIVE".to_string()),
-        AssetKind::Video { duration_secs } => {
-            Some(format!("{}:{:02}", duration_secs / 60, duration_secs % 60))
-        }
-    };
-
-    base.cursor_pointer()
+        .rounded(theme::RADIUS_TILE)
+        .bg(theme::placeholder())
+        .cursor_pointer()
         .when_some(thumb, |el, path| {
             el.child(
                 img(path)
@@ -530,44 +854,57 @@ fn tile(
                     // Fade in when the thumbnail arrives.
                     .with_animation(
                         ElementId::NamedInteger("thumb-fade".into(), index as u64),
-                        Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+                        Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
                         |el, t| el.opacity(t),
                     ),
             )
         })
+        // Hover: one flat scrim step, no lift or glow.
         .child(
-            // Hover highlight.
             div()
                 .absolute()
                 .inset_0()
-                .hover(|el| el.bg(gpui::white().opacity(0.08))),
+                .hover(|el| el.bg(gpui::white().opacity(0.07))),
         )
-        .when_some(badge, |el, badge| {
+        .when_some(duration, |el, duration| {
             el.child(
-                div()
-                    .absolute()
-                    .bottom_1()
-                    .right_1()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(gpui::black().opacity(0.45))
-                    .text_color(gpui::white())
-                    .text_xs()
-                    .child(badge),
+                badge()
+                    .right(px(6.))
+                    .child(icon("play-fill", px(10.), gpui::white()))
+                    .child(duration),
             )
         })
-        .when(asset.favorite, |el| {
+        .when(item.kind == Kind::Live, |el| {
             el.child(
-                div()
-                    .absolute()
-                    .bottom_1()
-                    .left_1()
-                    .text_xs()
-                    .text_color(theme::favorite())
-                    .child("\u{2665}"),
+                badge()
+                    .right(px(6.))
+                    .child(icon("live", px(12.), gpui::white())),
             )
         })
-        .into()
+        .when(item.favorite, |el| {
+            el.child(
+                badge()
+                    .left(px(6.))
+                    .child(icon("heart-fill", px(11.), gpui::white())),
+            )
+        })
+}
+
+/// A small label on a tile, readable on any photo.
+fn badge() -> gpui::Div {
+    div()
+        .absolute()
+        .bottom(px(6.))
+        .h(px(18.))
+        .px(px(5.))
+        .flex()
+        .items_center()
+        .gap(px(3.))
+        .rounded(px(5.))
+        .bg(theme::scrim(0.5))
+        .text_color(gpui::white())
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
 }
 
 fn centered(content: impl IntoElement) -> AnyElement {
@@ -585,10 +922,9 @@ fn centered(content: impl IntoElement) -> AnyElement {
 fn retry_link(cx: &mut Context<PhotoGrid>) -> impl IntoElement + use<> {
     div()
         .id("retry")
-        .text_sm()
-        .text_color(theme::accent())
+        .text_color(theme::accent_text())
         .cursor_pointer()
-        .hover(|el| el.underline())
+        .hover(|el| el.text_color(theme::text()))
         .on_click(cx.listener(|this, _, _, cx| this.retry(cx)))
         .child("Retry")
 }
@@ -605,14 +941,14 @@ pub fn album_title(album: Album) -> &'static str {
 fn empty_message(album: Album) -> &'static str {
     match album {
         Album::All => "Your library is empty.",
-        Album::Favorites => "No favorites yet.",
+        Album::Favorites => "No favorites yet. Favorite a photo on your iPhone to see it here.",
         Album::Videos => "No videos.",
         Album::RecentlyDeleted => "Nothing recently deleted.",
     }
 }
 
-fn format_count(count: usize) -> String {
-    let digits = count.to_string();
+pub fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
@@ -620,50 +956,20 @@ fn format_count(count: usize) -> String {
         }
         out.push(ch);
     }
-    format!("{out} {}", if count == 1 { "item" } else { "items" })
+    out
 }
 
-/// Tile edge length that fills `width` exactly with `columns` tiles.
-fn tile_size_for(width: f32, columns: usize) -> f32 {
-    let usable = width - theme::GRID_PADDING * 2. - theme::TILE_GAP * (columns as f32 - 1.);
-    (usable / columns as f32).floor().max(1.)
-}
-
-/// How many tiles of about `TILE_SIZE` fit across `width` pixels.
-fn columns_for(width: f32) -> usize {
-    let usable = (width - theme::GRID_PADDING * 2.).max(theme::TILE_SIZE);
-    ((usable + theme::TILE_GAP) / (theme::TILE_SIZE + theme::TILE_GAP)).floor() as usize
+fn format_count(count: usize) -> String {
+    format!(
+        "{} {}",
+        group_digits(count),
+        if count == 1 { "item" } else { "items" }
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn at_least_one_column() {
-        assert_eq!(columns_for(10.), 1);
-    }
-
-    #[test]
-    fn columns_grow_with_width() {
-        assert!(columns_for(1400.) > columns_for(700.));
-    }
-
-    #[test]
-    fn tiles_fill_the_width() {
-        for width in [700., 980., 1333., 2400.] {
-            let columns = columns_for(width);
-            let size = tile_size_for(width, columns);
-            let used = size * columns as f32
-                + theme::TILE_GAP * (columns as f32 - 1.)
-                + theme::GRID_PADDING * 2.;
-            assert!(width - used < columns as f32, "width {width}: {used} used");
-            assert!(
-                size >= theme::TILE_SIZE * 0.95,
-                "tiles shouldn't shrink much"
-            );
-        }
-    }
 
     #[test]
     fn counts_are_readable() {

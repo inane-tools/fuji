@@ -31,6 +31,9 @@ pub struct Asset {
     pub filename: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// Width / height as displayed (rotation applied). From the rendered
+    /// thumbnail when known, since originals may be stored sideways.
+    pub aspect: f32,
     pub favorite: bool,
     /// Capture time, milliseconds since the Unix epoch.
     pub created_at_ms: i64,
