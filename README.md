@@ -18,7 +18,9 @@ Early. Working so far:
   thumbnails download for what's on screen, are cached on disk, and are held
   in a bounded GPU cache so memory stays flat on large libraries.
 
-- Click a photo for the full-size viewer: arrow keys to move, Esc to close,
+- Click a photo for the full-size viewer, letterboxed on black. Zoom with the
+  mouse wheel (toward the cursor), a touchpad pinch, double-click (fit / actual
+  size), or `+` `-` `0`; drag to pan. Arrow keys to move, Esc to close,
   Copy (Ctrl+C) puts the image on the clipboard, Download (Ctrl+S) saves the
   original file (HEIC, RAW, MOV, ...).
 

@@ -10,6 +10,7 @@ mod session_store;
 mod theme;
 mod thumbs;
 mod viewer;
+mod zoom;
 
 use gpui::{
     App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,

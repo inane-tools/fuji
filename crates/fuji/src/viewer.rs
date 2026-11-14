@@ -4,31 +4,53 @@
 //! JPEG preview when it arrives. Neighbouring previews are fetched ahead so
 //! arrowing through photos feels instant. Copy puts the preview on the
 //! clipboard; Download saves the original file (HEIC, RAW, MOV, ...).
+//!
+//! The image is letterboxed on black and can be zoomed (wheel, Ctrl+wheel or
+//! pinch, double-click, +/-/0) and dragged when zoomed. Zoom changes ease in
+//! over a few frames; the math lives in [`crate::zoom`].
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fuji_icloud::{Asset, AssetId, AssetKind, PhotosClient, PhotosError, Resource};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, FontWeight, Image, ImageFormat, KeyBinding, ObjectFit,
-    SharedString, Subscription, WeakEntity, Window, actions, bounce, div, ease_in_out,
-    ease_out_quint, img, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Image, ImageFormat,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, SharedString, Subscription, WeakEntity, Window, actions, bounce, canvas, div,
+    ease_in_out, ease_out_quint, img, prelude::*, px,
 };
 
 use crate::grid::PhotoGrid;
 use crate::image_cache::LruImageCache;
+use crate::zoom::{Geometry, View};
 use crate::{net, theme, thumbs};
 
-actions!(viewer, [Close, Previous, Next, CopyImage, Download]);
+actions!(
+    viewer,
+    [
+        Close, Previous, Next, CopyImage, Download, ZoomIn, ZoomOut, ZoomFit
+    ]
+);
 
 const CONTEXT: &str = "Viewer";
 const MAX_PREVIEW_REQUESTS: usize = 3;
 /// How far ahead and behind to fetch previews.
 const PREFETCH: usize = 2;
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+/// Space around the image when it fits.
+const MARGIN: f32 = 16.;
+/// Zoom step for one wheel notch or key press.
+const ZOOM_STEP: f32 = 1.25;
+/// How quickly zoom eases to its target (higher is snappier).
+const ZOOM_EASE: f32 = 18.;
+/// GPUI reports a wheel notch as 3 "lines" on Windows (the default setting)
+/// and on Linux.
+const LINES_PER_NOTCH: f32 = 3.;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -37,6 +59,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", Next, Some(CONTEXT)),
         KeyBinding::new("ctrl-c", CopyImage, Some(CONTEXT)),
         KeyBinding::new("ctrl-s", Download, Some(CONTEXT)),
+        KeyBinding::new("=", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new("+", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new("ctrl-=", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new("-", ZoomOut, Some(CONTEXT)),
+        KeyBinding::new("ctrl--", ZoomOut, Some(CONTEXT)),
+        KeyBinding::new("0", ZoomFit, Some(CONTEXT)),
+        KeyBinding::new("ctrl-0", ZoomFit, Some(CONTEXT)),
     ]);
 }
 
@@ -72,6 +101,18 @@ pub struct Viewer {
     status_generation: u64,
     image_cache: Entity<LruImageCache>,
     _grid_observer: Subscription,
+    /// What's on screen now, and where it's easing to.
+    view: View,
+    target: View,
+    last_frame: Option<Instant>,
+    /// The image area's bounds from the last paint.
+    stage_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    drag: Option<Drag>,
+}
+
+struct Drag {
+    start: Point<Pixels>,
+    start_view: View,
 }
 
 impl EventEmitter<ViewerEvent> for Viewer {}
@@ -109,6 +150,11 @@ impl Viewer {
             status_generation: 0,
             image_cache: cx.new(|cx| LruImageCache::new(PREFETCH * 2 + 4, cx)),
             _grid_observer: observer,
+            view: View::FIT,
+            target: View::FIT,
+            last_frame: None,
+            stage_bounds: Rc::new(Cell::new(None)),
+            drag: None,
         };
         // The grid is mid-update while it creates us; read it once it's done.
         let this = cx.weak_entity();
@@ -210,8 +256,180 @@ impl Viewer {
         }
         self.index = index;
         self.copy_pending = None;
+        self.view = View::FIT;
+        self.target = View::FIT;
+        self.drag = None;
         self.load_around(cx);
         cx.notify();
+    }
+
+    /// Layout of the current image in the stage, once the stage has been laid out.
+    fn geometry(&self, window: &Window, cx: &App) -> Option<Geometry> {
+        let bounds = self.stage_bounds.get()?;
+        let (image_w, image_h) = natural_size(&self.asset(self.index, cx)?)?;
+        Some(Geometry {
+            viewport_w: f32::from(bounds.size.width),
+            viewport_h: f32::from(bounds.size.height),
+            image_w,
+            image_h,
+            margin: MARGIN,
+            scale_factor: window.scale_factor(),
+        })
+    }
+
+    /// `position` relative to the stage centre.
+    fn offset_from_centre(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let bounds = self.stage_bounds.get()?;
+        let centre = bounds.center();
+        Some((
+            f32::from(position.x - centre.x),
+            f32::from(position.y - centre.y),
+        ))
+    }
+
+    fn set_target(&mut self, target: View, cx: &mut Context<Self>) {
+        self.target = target;
+        cx.notify();
+    }
+
+    fn zoom_by(
+        &mut self,
+        factor: f32,
+        at: Option<(f32, f32)>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(g) = self.geometry(window, cx) else {
+            return;
+        };
+        let (x, y) = at.unwrap_or((0., 0.));
+        let target = g.zoom_at(self.target, self.target.zoom * factor, x, y);
+        self.set_target(target, cx);
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(ZOOM_STEP, None, window, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(1. / ZOOM_STEP, None, window, cx);
+    }
+
+    fn zoom_fit(&mut self, _: &ZoomFit, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_target(View::FIT, cx);
+    }
+
+    fn on_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(g) = self.geometry(window, cx) else {
+            return;
+        };
+        let at = self.offset_from_centre(event.position);
+        match event.delta {
+            // Mouse wheel: zoom toward the cursor.
+            ScrollDelta::Lines(lines) => {
+                self.zoom_by(ZOOM_STEP.powf(lines.y / LINES_PER_NOTCH), at, window, cx);
+            }
+            // Touchpad: pinch (sent as Ctrl+scroll) zooms; two-finger
+            // scrolling pans once zoomed in, and zooms when it fits.
+            ScrollDelta::Pixels(delta) => {
+                let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+                if event.modifiers.control || self.target.is_fit() {
+                    self.zoom_by((dy * 0.005).exp(), at, window, cx);
+                } else {
+                    let panned = g.clamp(View {
+                        pan_x: self.target.pan_x + dx,
+                        pan_y: self.target.pan_y + dy,
+                        ..self.target
+                    });
+                    // Follow the fingers directly; easing here feels laggy.
+                    self.view = panned;
+                    self.set_target(panned, cx);
+                }
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        if event.click_count == 2 {
+            if let (Some(g), Some((x, y))) = (
+                self.geometry(window, cx),
+                self.offset_from_centre(event.position),
+            ) {
+                self.drag = None;
+                self.set_target(g.toggle_at(self.target, x, y), cx);
+            }
+            return;
+        }
+        if !self.target.is_fit() {
+            self.drag = Some(Drag {
+                start: event.position,
+                start_view: self.target,
+            });
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = &self.drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drag = None;
+            cx.notify();
+            return;
+        }
+        let Some(g) = self.geometry(window, cx) else {
+            return;
+        };
+        let moved = event.position - drag.start;
+        let panned = g.clamp(View {
+            pan_x: drag.start_view.pan_x + f32::from(moved.x),
+            pan_y: drag.start_view.pan_y + f32::from(moved.y),
+            ..drag.start_view
+        });
+        self.view = panned;
+        self.set_target(panned, cx);
+    }
+
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if self.drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Ease the visible view toward the target; keep frames coming until there.
+    fn advance_animation(&mut self, window: &mut Window, cx: &App) {
+        let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map_or(1. / 60., |t| (now - t).as_secs_f32())
+            .clamp(0.001, 0.05);
+        self.last_frame = Some(now);
+
+        // Keep both in bounds if the window was resized.
+        if let Some(g) = self.geometry(window, cx) {
+            self.target = g.clamp(self.target);
+        }
+        if self.view.close_to(self.target) {
+            self.view = self.target;
+            return;
+        }
+        self.view = self
+            .view
+            .approach(self.target, 1. - (-dt * ZOOM_EASE).exp());
+        window.request_animation_frame();
     }
 
     fn previous(&mut self, _: &Previous, _: &mut Window, cx: &mut Context<Self>) {
@@ -352,6 +570,7 @@ impl Viewer {
         &self,
         asset: Option<&Asset>,
         count: usize,
+        zoom_percent: Option<u32>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let title = asset
@@ -421,6 +640,21 @@ impl Viewer {
             )
             .child(div().flex_1())
             .children(status)
+            .when_some(zoom_percent, |el, percent| {
+                // Click to go back to fit.
+                el.child(
+                    div()
+                        .id("zoom-level")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(theme::text_muted())
+                        .hover(|el| el.bg(gpui::white().opacity(0.08)).text_color(theme::text()))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_target(View::FIT, cx)))
+                        .child(format!("{percent}%")),
+                )
+            })
             .child(text_button(
                 "copy",
                 "Copy",
@@ -436,7 +670,8 @@ impl Viewer {
 }
 
 impl Render for Viewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.advance_animation(window, cx);
         let count = self.count(cx);
         let asset = self.asset(self.index, cx);
         let thumb = asset.as_ref().and_then(|a| {
@@ -457,10 +692,30 @@ impl Render for Viewer {
             _ => None,
         });
 
-        let top_bar = self.render_top_bar(asset.as_ref(), count, cx);
+        let geometry = self.geometry(window, cx);
+        let rect = geometry.map(|g| g.rect(self.view));
+        let zoom_percent = geometry
+            .filter(|_| !self.target.is_fit())
+            .map(|g| (self.target.zoom / g.actual_size_zoom() * 100.).round() as u32);
+        let zoomed = !self.target.is_fit();
+
+        let top_bar = self.render_top_bar(asset.as_ref(), count, zoom_percent, cx);
         let index = self.index;
-        let has_previous = index > 0;
-        let has_next = index + 1 < count;
+        let has_previous = index > 0 && !zoomed;
+        let has_next = index + 1 < count && !zoomed;
+
+        // Both layers are drawn into the same letterboxed rectangle, so the
+        // sharp preview lands exactly on top of the thumbnail.
+        let place = |el: gpui::Div| match rect {
+            Some(r) => el
+                .absolute()
+                .left(px(r.x))
+                .top(px(r.y))
+                .w(px(r.w))
+                .h(px(r.h)),
+            None => el.absolute().size_0(),
+        };
+        let bounds_cell = self.stage_bounds.clone();
 
         let stage = div()
             .image_cache(self.image_cache.clone())
@@ -468,20 +723,46 @@ impl Render for Viewer {
             .flex_1()
             .relative()
             .overflow_hidden()
+            .bg(gpui::black())
+            .when(zoomed, |el| {
+                el.cursor(if self.drag.is_some() {
+                    CursorStyle::ClosedHand
+                } else {
+                    CursorStyle::OpenHand
+                })
+            })
+            .on_scroll_wheel(cx.listener(Self::on_wheel))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_drag(cx)),
+            )
+            // Measure the stage; redraw if it changed (first frame, resize).
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        if bounds_cell.get() != Some(bounds) {
+                            bounds_cell.set(Some(bounds));
+                            window.refresh();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             // Upscaled thumbnail first, so there's never a blank screen.
             .when_some(thumb, |el, path| {
-                el.child(
-                    div()
-                        .absolute()
-                        .inset_4()
-                        .child(img(path).size_full().object_fit(ObjectFit::Contain)),
-                )
+                el.child(place(div()).child(img(path).size_full().object_fit(ObjectFit::Contain)))
             })
             .when_some(preview, |el, path| {
                 el.child(
-                    div()
-                        .absolute()
-                        .inset_4()
+                    place(div())
                         .child(img(path).size_full().object_fit(ObjectFit::Contain))
                         .with_animation(
                             ElementId::NamedInteger("preview-fade".into(), index as u64),
@@ -549,12 +830,15 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::next))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::download))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_fit))
             .occlude()
             .absolute()
             .inset_0()
             .flex()
             .flex_col()
-            .bg(gpui::black().opacity(0.96))
+            .bg(gpui::black())
             .text_color(theme::text())
             .child(top_bar)
             .child(stage)
@@ -564,6 +848,35 @@ impl Render for Viewer {
                 |el, t| el.opacity(t),
             )
     }
+}
+
+/// The image's shape and size in pixels. The thumbnail is a rendered,
+/// correctly rotated copy, so its proportions are trusted over the original's
+/// (which may be stored sideways with an EXIF rotation); the preview, or else
+/// the original, gives the size.
+fn natural_size(asset: &Asset) -> Option<(f32, f32)> {
+    let dims =
+        |r: &Resource| (r.width > 0 && r.height > 0).then_some((r.width as f32, r.height as f32));
+    let original =
+        (asset.width > 0 && asset.height > 0).then_some((asset.width as f32, asset.height as f32));
+    let shape = asset
+        .thumbnail
+        .as_ref()
+        .and_then(dims)
+        .or_else(|| asset.preview.as_ref().and_then(dims))
+        .or(original)?;
+    let long_edge = asset
+        .preview
+        .as_ref()
+        .and_then(dims)
+        .or(original)
+        .map_or(shape.0.max(shape.1), |(w, h)| w.max(h));
+    let ratio = shape.0 / shape.1;
+    Some(if ratio >= 1. {
+        (long_edge, long_edge / ratio)
+    } else {
+        (long_edge * ratio, long_edge)
+    })
 }
 
 fn suggested_name(asset: &Asset, original: &Resource) -> String {
