@@ -50,9 +50,3 @@ pub fn danger() -> Hsla {
 pub fn selected() -> Hsla {
     hsla(0.58, 0.6, 0.5, 0.22)
 }
-
-/// Stand-in color for a thumbnail that hasn't loaded.
-pub fn placeholder(index: usize) -> Hsla {
-    let hue = (index as f32 * 0.137) % 1.;
-    hsla(hue, 0.35, 0.32, 1.)
-}

@@ -3,13 +3,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuji_icloud::{Account, AuthClient, Library, SavedSession};
+use fuji_icloud::{Account, Album, AuthClient, PhotosClient, SavedSession};
 use gpui::{
     Animation, AnimationExt as _, Context, Entity, FontWeight, SharedString, Subscription, Window,
     bounce, div, ease_in_out, ease_out_quint, prelude::*,
 };
 
-use crate::grid::PhotoGrid;
+use crate::grid::{GridEvent, PhotoGrid};
 use crate::login::{LoginEvent, LoginView};
 use crate::session_store;
 use crate::theme;
@@ -44,33 +44,42 @@ impl Section {
             Section::RecentlyDeleted => "Recently Deleted",
         }
     }
+
+    /// The library view this section shows, if it's one of the built-in ones.
+    fn album(self) -> Option<Album> {
+        match self {
+            Section::Library => Some(Album::All),
+            Section::Favorites => Some(Album::Favorites),
+            Section::Videos => Some(Album::Videos),
+            Section::RecentlyDeleted => Some(Album::RecentlyDeleted),
+            Section::Albums | Section::Shared => None,
+        }
+    }
 }
 
 enum Screen {
     /// Trying the saved session before showing anything else.
     Resuming,
     Login(Entity<LoginView>),
-    Main(Account),
+    Main {
+        account: Account,
+        /// `None` if iCloud Photos isn't available for the account.
+        grid: Option<Entity<PhotoGrid>>,
+        _grid_subscription: Option<Subscription>,
+    },
 }
 
 pub struct FujiApp {
     screen: Screen,
     section: Section,
-    grid: Entity<PhotoGrid>,
     _login_subscription: Option<Subscription>,
 }
 
 impl FujiApp {
-    pub fn new(
-        library: Arc<dyn Library>,
-        saved: Option<SavedSession>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(saved: Option<SavedSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             screen: Screen::Resuming,
             section: Section::Library,
-            grid: cx.new(|_| PhotoGrid::new(library)),
             _login_subscription: None,
         };
         match saved {
@@ -100,7 +109,7 @@ impl FujiApp {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| match result {
-                Ok(account) => this.show_main(account, cx),
+                Ok(account) => this.show_main(account, auth, window, cx),
                 Err(err) => {
                     let notice = SharedString::from(err.to_string());
                     this.show_login(Some(apple_id), auth, Some(notice), window, cx);
@@ -119,22 +128,75 @@ impl FujiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let login = cx.new(|cx| LoginView::new(apple_id, auth, notice, window, cx));
-        self._login_subscription = Some(cx.subscribe(&login, |this, _, event, cx| match event {
-            LoginEvent::SignedIn(account) => this.show_main(account.clone(), cx),
-        }));
+        let login = cx.new(|cx| LoginView::new(apple_id, auth.clone(), notice, window, cx));
+        let login_auth = auth.clone();
+        self._login_subscription = Some(cx.subscribe_in(
+            &login,
+            window,
+            move |this, _, event, window, cx| match event {
+                LoginEvent::SignedIn(account) => {
+                    this.show_main(account.clone(), login_auth.clone(), window, cx)
+                }
+            },
+        ));
         self.screen = Screen::Login(login);
         cx.notify();
     }
 
-    fn show_main(&mut self, account: Account, cx: &mut Context<Self>) {
+    fn show_main(
+        &mut self,
+        account: Account,
+        auth: Arc<AuthClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self._login_subscription = None;
-        self.screen = Screen::Main(account);
+        let album = self.section.album().unwrap_or(Album::All);
+        let grid = PhotosClient::new(&auth, &account)
+            .ok()
+            .map(|client| cx.new(|cx| PhotoGrid::new(Arc::new(client), &account.dsid, album, cx)));
+        let subscription = grid.as_ref().map(|grid| {
+            let apple_id = account.apple_id.clone();
+            cx.subscribe_in(
+                grid,
+                window,
+                move |this, _, event, window, cx| match event {
+                    GridEvent::SessionExpired => {
+                        let saved = session_store::load().unwrap_or_default();
+                        let auth = Arc::new(AuthClient::from_saved(&SavedSession {
+                            session_token: None,
+                            ..saved
+                        }));
+                        let notice = "Your iCloud session has expired. Sign in again.".into();
+                        this.show_login(Some(apple_id.clone()), auth, Some(notice), window, cx);
+                    }
+                },
+            )
+        });
+        self.screen = Screen::Main {
+            account,
+            grid,
+            _grid_subscription: subscription,
+        };
+        cx.notify();
+    }
+
+    fn select(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        if let (
+            Some(album),
+            Screen::Main {
+                grid: Some(grid), ..
+            },
+        ) = (section.album(), &self.screen)
+        {
+            grid.update(cx, |grid, cx| grid.set_album(album, cx));
+        }
         cx.notify();
     }
 
     fn sign_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Screen::Main(account) = &self.screen else {
+        let Screen::Main { account, .. } = &self.screen else {
             return;
         };
         let apple_id = account.apple_id.clone();
@@ -190,10 +252,7 @@ impl FujiApp {
                     })
                     .when(active, |el| el.bg(theme::selected()))
                     .hover(|el| el.text_color(theme::text()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.section = section;
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(section, cx)))
                     .child(section.label())
             }))
             .child(div().flex_1())
@@ -223,21 +282,26 @@ impl FujiApp {
 
 impl Render for FujiApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let account = match &self.screen {
+        let (account, grid) = match &self.screen {
             Screen::Resuming => return resuming().into_any_element(),
             Screen::Login(login) => return login.clone().into_any_element(),
-            Screen::Main(account) => account.clone(),
+            Screen::Main { account, grid, .. } => (account.clone(), grid.clone()),
         };
 
-        let content = match self.section {
-            Section::Library => div().size_full().child(self.grid.clone()),
-            other => div()
+        let message = |text: String| {
+            div()
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
+                .text_sm()
                 .text_color(theme::text_muted())
-                .child(format!("{} is not built yet", other.label())),
+                .child(text)
+        };
+        let content = match (self.section.album(), grid) {
+            (Some(_), Some(grid)) => div().size_full().child(grid),
+            (Some(_), None) => message(fuji_icloud::PhotosError::NotAvailable.to_string()),
+            (None, _) => message(format!("{} is not built yet", self.section.label())),
         };
 
         div()

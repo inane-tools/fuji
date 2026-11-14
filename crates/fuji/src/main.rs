@@ -2,22 +2,20 @@
 
 mod app;
 mod grid;
+mod image_cache;
 mod input;
 mod login;
+mod net;
 mod session_store;
 mod theme;
+mod thumbs;
 
-use std::sync::Arc;
-
-use fuji_icloud::MockLibrary;
 use gpui::{
     App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
 };
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        // Placeholder data until the iCloud client exists.
-        let library = Arc::new(MockLibrary::new(5_000));
         let saved = session_store::load();
         input::bind_keys(cx);
 
@@ -34,7 +32,7 @@ fn main() {
             },
             |window, cx| {
                 cx.activate(true);
-                cx.new(|cx| app::FujiApp::new(library, saved, window, cx))
+                cx.new(|cx| app::FujiApp::new(saved, window, cx))
             },
         )
         .expect("failed to open the main window");

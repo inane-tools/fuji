@@ -9,9 +9,16 @@ your iCloud library without a Mac.
 
 ## Status
 
-Early. Apple ID sign-in works end to end in code (SRP, two-factor by trusted
-device or SMS, session trust, iCloud account login) and the session is kept in
-the OS keychain. The photo grid still shows fake data.
+Early. Working so far:
+
+- Apple ID sign-in (SRP, two-factor by trusted device or SMS, trusted
+  sessions), with the session kept in the OS keychain
+- The photo grid shows your real iCloud library, newest first: Library,
+  Favorites, Videos and Recently Deleted. Items load in pages as you scroll;
+  thumbnails download for what's on screen, are cached on disk, and are held
+  in a bounded GPU cache so memory stays flat on large libraries.
+
+Not yet: full-size viewer, video playback, albums, shared albums, editing.
 
 `cargo test -p fuji-icloud -- --ignored` runs a live check that Apple accepts
 fuji's sign-in request (it uses a made-up address, not your account).

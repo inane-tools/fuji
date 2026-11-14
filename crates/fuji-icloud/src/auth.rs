@@ -154,6 +154,16 @@ impl AuthClient {
         client
     }
 
+    /// The HTTP agent, which holds the iCloud cookies after sign-in.
+    /// Other iCloud services must use it (clones share the cookie jar).
+    pub fn agent(&self) -> Agent {
+        self.agent.clone()
+    }
+
+    pub fn client_id(&self) -> String {
+        self.state.lock().unwrap().client_id.clone()
+    }
+
     /// The tokens to persist after a successful sign-in.
     pub fn saved_session(&self) -> SavedSession {
         let st = self.state.lock().unwrap();

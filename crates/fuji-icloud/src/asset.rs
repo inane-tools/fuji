@@ -1,4 +1,4 @@
-/// Stable identifier for an asset (iCloud's record name).
+/// Stable identifier for an asset (iCloud's `CPLAsset` record name).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AssetId(pub String);
 
@@ -12,16 +12,34 @@ pub enum AssetKind {
     },
 }
 
+/// One downloadable rendition of an asset (thumbnail, original, ...).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resource {
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+    pub size: u64,
+    /// Uniform type identifier, for example `public.jpeg` or `public.heic`.
+    pub file_type: String,
+}
+
 /// One photo or video in the library.
 #[derive(Clone, Debug)]
 pub struct Asset {
     pub id: AssetId,
     pub kind: AssetKind,
+    pub filename: Option<String>,
     pub width: u32,
     pub height: u32,
     pub favorite: bool,
-    /// Capture time, seconds since the Unix epoch.
-    pub created_at: i64,
+    /// Capture time, milliseconds since the Unix epoch.
+    pub created_at_ms: i64,
+    /// Small JPEG for the grid.
+    pub thumbnail: Option<Resource>,
+    /// Larger JPEG, good for full-screen viewing.
+    pub preview: Option<Resource>,
+    /// The original file (HEIC, JPEG, RAW, MOV, ...).
+    pub original: Option<Resource>,
 }
 
 impl Asset {
