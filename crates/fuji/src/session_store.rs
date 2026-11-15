@@ -24,8 +24,8 @@ const ACCOUNT: &str = "account";
 const SESSION_TOKEN: &str = "session-token";
 const TRUST_TOKEN: &str = "trust-token";
 const COOKIE_KEY: &str = "cookie-key";
-/// The Skybridge pairing key a passkey sign-in handed over (see
-/// `docs/skybridge.md`). Apple's web client keeps it 90 days.
+/// The Skybridge pairing key a passkey or two-factor sign-in handed over.
+/// Apple's web client keeps it 90 days.
 const PAIRING_KEY: &str = "pairing-key";
 const PAIRING_DAYS: u64 = 90;
 const NONCE_LEN: usize = 12;

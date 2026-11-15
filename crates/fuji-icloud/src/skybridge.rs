@@ -1,6 +1,5 @@
 //! Skybridge: requests to the user's device (an iPhone) over IDS, end-to-end
-//! encrypted, the way icloud.com asks the iPhone to search Photos. See
-//! `docs/skybridge.md`.
+//! encrypted, the way icloud.com asks the iPhone to search Photos.
 //!
 //! A request is JSON `{ msgID, body, token? }`, encrypted per device (NGM),
 //! wrapped in IDS's "nice" envelope (a binary plist, `E: "pair-ec"`) and

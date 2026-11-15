@@ -49,7 +49,6 @@ The screenshots show a made-up library; its photos are public domain or CC0
 
 Not yet: Live Photo motion, editing (favorite, hide, delete, add to album),
 People and Trips (not available on the web), and the iCloud Shared Library.
-[STATUS.md](STATUS.md) has the details.
 
 ## Getting started
 
@@ -128,10 +127,6 @@ cargo test -p fuji live_collections -- --ignored --nocapture
 GPUI is pre-1.0, so it's pinned to an exact version in the workspace
 `Cargo.toml`; upgrade it on purpose. Run with `FUJI_DEBUG=1` to log the sign-in
 and session flow.
-
-[STATUS.md](STATUS.md) is the working log: what's done and verified, what's
-next, and things learned about Apple's services along the way.
-[docs/skybridge.md](docs/skybridge.md) describes how searching by iPhone works.
 
 ## Credits
 

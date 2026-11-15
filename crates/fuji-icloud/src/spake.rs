@@ -3,8 +3,8 @@
 //! and the password is the code the device shows.
 //!
 //! Transcribed from the widget's `proverWorker-*.js` (suite
-//! "P256-SHA256-HKDF-HMAC-SCRYPT", context "SPAKE2Web"); see
-//! `docs/skybridge.md`. Everything on the wire is base64 of raw bytes.
+//! "P256-SHA256-HKDF-HMAC-SCRYPT", context "SPAKE2Web"). Everything on the
+//! wire is base64 of raw bytes.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};

@@ -1,7 +1,6 @@
 //! Photos search provided by the user's iPhone (Skybridge), on a thread of
 //! its own: it connects when first asked (push, IDS, finding the paired
 //! device, key verification), then answers searches over that connection.
-//! See `docs/skybridge.md`.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};

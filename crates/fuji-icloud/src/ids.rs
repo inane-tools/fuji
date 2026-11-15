@@ -1,7 +1,7 @@
 //! Apple's Identity Service (IDS), the way icloud.com uses it for Skybridge:
 //! fuji registers as a "browser" device of the account, so it can find the
 //! user's devices and exchange end-to-end encrypted messages with them.
-//! Transcribed from icloud.com's system bundle; see `docs/skybridge.md`.
+//! Transcribed from icloud.com's system bundle.
 //!
 //! Requests are binary property lists sent to `gatewayws.icloud.com` with the
 //! iCloud session cookies. Blocking: use from a background thread.

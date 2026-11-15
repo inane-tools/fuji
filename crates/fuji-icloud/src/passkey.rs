@@ -3,7 +3,7 @@
 //!
 //! Besides signing in, an Apple passkey can hand over a *pairing key* in its
 //! WebAuthn large blob: a secret the web client shares with that device, used
-//! later to send it Photos searches ("Skybridge", see `docs/skybridge.md`).
+//! later to send it Photos searches ("Skybridge").
 //!
 //! The WebAuthn call itself belongs to the platform (on Windows,
 //! `webauthn.dll`), so this module only talks to Apple: it gets a challenge,

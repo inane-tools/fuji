@@ -3,7 +3,7 @@
 //! keys, and Windows Hello). Apple's side is in `fuji_icloud::passkey`.
 //!
 //! The large blob is read too: an Apple passkey keeps the Skybridge pairing
-//! key there (see `docs/skybridge.md`).
+//! key there.
 
 use fuji_icloud::{PasskeyAssertion, PasskeyChallenge};
 

@@ -2,7 +2,7 @@
 //! over which Apple delivers messages for the topics a client asks for. The
 //! sign-in widget uses it to hear from the trusted device during approval;
 //! icloud.com uses it for Skybridge. Transcribed from the widget's
-//! `bridge-*.js`; see `docs/skybridge.md`.
+//! `bridge-*.js`.
 //!
 //! Blocking: use from a background thread.
 

@@ -2,7 +2,7 @@
 //! device approves the sign-in, the user types the code it shows, and the
 //! two sides run SPAKE2+ over Apple's push service with that code. Besides
 //! signing in, this leaves a key shared with the device: icloud.com keeps it
-//! as the Skybridge pairing key (see `docs/skybridge.md`).
+//! as the Skybridge pairing key.
 //!
 //! Flow (the sign-in widget's `bridge/*` thunks):
 //! 1. Connect to push (topic from the two-factor page) and post step 0 with

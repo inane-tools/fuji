@@ -24,3 +24,7 @@ __pycache__/
 *.session
 *.cookies
 /cache/
+
+# Kept local: the working log, and research notes (kept elsewhere)
+STATUS.md
+docs/skybridge.md

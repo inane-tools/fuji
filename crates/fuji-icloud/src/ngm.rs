@@ -1,5 +1,5 @@
 //! "Next generation messaging" (NGM): how IDS endpoints encrypt messages
-//! to each other, as icloud.com does it (`pair-ec`). See `docs/skybridge.md`.
+//! to each other, as icloud.com does it (`pair-ec`).
 //!
 //! To send: ECDH between a fresh ephemeral key and the recipient's pre-key,
 //! HKDF-SHA256 (salt "LastPawn-MessageKeys") into an AES-256 key and a CTR

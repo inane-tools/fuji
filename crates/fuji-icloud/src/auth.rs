@@ -266,7 +266,7 @@ impl AuthClient {
         let key = srp::derive_password_key(password, &salt, init.iteration, protocol);
         let proof = srp.process_challenge(&apple_id, &key, &salt, &server_public)?;
         // FUJI_NO_TRUST=1 signs in as if on a new machine, so Apple asks for
-        // two-factor (for studying that page; see docs/skybridge.md).
+        // two-factor (for studying that page).
         let trust_tokens: Vec<String> = if std::env::var_os("FUJI_NO_TRUST").is_some() {
             debug("sign-in: FUJI_NO_TRUST set, not sending the trust token");
             Vec::new()
@@ -775,7 +775,6 @@ fn parse_trusted_phones(html: &str) -> Vec<TrustedPhone> {
 
 /// What the two-factor page says about Apple's newer approval ("bridge"):
 /// the scripts the widget loads for it and the push channel it listens on.
-/// See `docs/skybridge.md`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BridgeConfig {
     /// The push client script (`AppleID.service.bridge.APNS`).
