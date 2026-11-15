@@ -1,111 +1,149 @@
 # Fuji
 
-A native desktop client for **iCloud Photos** (Apple Photos) on Windows and Linux.
+A fast, native **iCloud Photos** client for Windows and Linux, written in Rust
+with [GPUI](https://gpui.rs).
 
-Apple ships Photos only for Apple platforms. On Windows the official option is
-"iCloud for Windows", which only syncs to a folder, and Linux has nothing. Fuji
-aims to be a real photo-library app: browse, search, view, download, and upload
-your iCloud library without a Mac.
+Apple makes Photos only for its own platforms. On Windows the official option,
+iCloud for Windows, syncs a folder; Linux has nothing. Fuji is a real photo
+library app instead: browse, search, view, play, download and upload your
+iCloud library, without a Mac.
 
-## Status
+**Version 1.0, “Kanagawa-oki”.** Each release is named after one of Hokusai's
+*Thirty-six Views of Mount Fuji*.
 
-Early. Working so far:
+> Fuji is unofficial and isn't affiliated with or endorsed by Apple. It uses
+> the same private web services as icloud.com, which Apple can change at any
+> time. See the [disclaimer](#disclaimer).
 
-- Apple ID sign-in (SRP, two-factor by trusted device or SMS, trusted
-  sessions), with the session kept in the OS keychain
-- The gallery shows your iCloud library as a mosaic (justified rows that
-  keep each photo's shape) under year, month and day headers: Library,
-  Favorites, Videos and Recently Deleted. The album index is cached on disk,
-  so it opens instantly and refreshes from iCloud in the background.
-  Thumbnails already on disk show without any network request; memory stays
-  bounded however far you scroll.
-- Restarts continue the existing iCloud session instead of signing in again
-  (which would make Apple email you). Cookies are kept in an AES-256-GCM
-  encrypted file; the key and tokens live in the OS keychain.
+## Features
 
-- Click a photo for the full-size viewer, letterboxed on black. Zoom with the
-  mouse wheel (toward the cursor), a touchpad pinch, double-click (fit / actual
-  size), or `+` `-` `0`; drag to pan. Arrow keys to move, Esc to close,
-  Copy (Ctrl+C) puts the image on the clipboard, Download (Ctrl+S) saves the
-  original file (HEIC, RAW, MOV, ...).
+- **Library:** your whole library as a justified mosaic under month and day
+  headers, with smooth scrolling, a zoom slider (or Ctrl+scroll), and a
+  timeline scrubber for jumping through the years. The index is cached, so it
+  opens instantly and refreshes in the background.
+- **Collections:** Memories, your albums, shared albums, media types (Videos,
+  Live Photos, Portrait, Panoramas, Slo-mo, Screenshots and more), Hidden and
+  Recently Deleted.
+- **Viewer:** full-size photos with zoom and pan, video playback with sound,
+  a filmstrip of nearby photos, and an info panel: camera, lens, exposure,
+  location and the app that saved it.
+- **Search:** by date (“march 2021”), type (“videos”), favorites or file
+  name, as you type. Paired with your iPhone, Fuji also asks it, just as
+  icloud.com does, so searches like “dog” or “beach” find what the phone's
+  on-device index knows.
+- **Getting photos out and in:** copy (images and files), download originals,
+  drag photos out to other apps, and paste to upload.
+- **Looks like it belongs:** light and dark mode, Windows' accent color or
+  Apple's blue, and a custom title bar that still snaps and drags like any
+  window.
 
-Not yet: video playback, albums, shared albums, editing, HEIC decoding for
-originals that have no JPEG rendition.
+Not yet: Live Photo motion, editing (favorite, hide, delete, add to album),
+People and Trips (not available on the web), and the iCloud Shared Library.
+[STATUS.md](STATUS.md) has the details.
 
-`cargo test -p fuji-icloud -- --ignored` runs a live check that Apple accepts
-Fuji's sign-in request (it uses a made-up address, not your account).
+## Getting started
 
-## Stack
+Fuji is built from source for now.
 
-Pure Rust, with [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework)
-for a fast, smooth, low-memory app. GPUI is pre-1.0, so it is pinned to an
-exact version in the workspace `Cargo.toml`; upgrade it on purpose.
+1. Install [Rust](https://rustup.rs) (stable; see `rust-toolchain.toml`).
+2. Clone this repository and run:
 
-| Crate | What it is |
-| --- | --- |
-| `crates/fuji` | The desktop app (GPUI) |
-| `crates/fuji-icloud` | Library model and the iCloud Photos client (currently a `MockLibrary`) |
+   ```sh
+   cargo run --release -p fuji
+   ```
 
-## Building
+3. Sign in with your Apple Account. Fuji asks your devices to approve the
+   sign-in, the same way a new browser does; enter the code shown on your
+   iPhone. Approving this way also pairs Fuji with the iPhone for search.
 
-Requires stable Rust (see `rust-toolchain.toml`).
+**Windows** needs the MSVC build tools. Keep the checkout at a short path:
+build files nest deeply and fail to link past Windows' 260-character path
+limit. If that happens, set `CARGO_TARGET_DIR` to a short folder such as
+`C:\t\fuji`.
 
-```sh
-cargo run -p fuji
-```
-
-**Linux** needs Vulkan drivers plus the Wayland/X11 development headers, for
-example on Debian/Ubuntu:
+**Linux** needs Vulkan drivers and the Wayland/X11 development headers, for
+example on Debian or Ubuntu:
 
 ```sh
 sudo apt install libvulkan1 libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev
 ```
 
-**Windows** needs the MSVC build tools. Keep the checkout at a short path: build
-artifacts nest deeply and fail to link past Windows' 260-character path limit.
-If that happens, set `CARGO_TARGET_DIR` to a short folder such as `C:\t\fuji`.
+Linux builds aren't tested regularly yet, and video playback is Windows-only
+for now.
 
-## Goals
+**Advanced Data Protection:** with it turned on, web access works only if
+“Access iCloud Data on the Web” is enabled on one of your devices.
 
-- Sign in with an Apple ID, including two-factor authentication
-- Browse the library: timeline, albums, shared albums, favorites, hidden, recently deleted
-- Fast thumbnail grid with local caching
-- View full-resolution photos and videos, including Live Photos and HEIC
-- Download originals, or sync the library to a local folder
-- Upload new photos and videos
-- Basic edits that iCloud supports: favorite, hide, delete, add to album
+## Keyboard shortcuts
 
-## Non-goals (for now)
+| Where | Keys |
+| --- | --- |
+| Anywhere | Ctrl+F search, Esc to clear it |
+| Gallery | Ctrl+A select all, Ctrl+C copy, Ctrl+S download, Ctrl+V paste to upload, Esc clear the selection |
+| Gallery zoom | Ctrl+scroll, Ctrl+= and Ctrl+-, Ctrl+0 to reset |
+| Viewer | ← → previous and next, Esc close, + − 0 zoom (or double-click), Ctrl+C copy, Ctrl+S download, Space play or pause |
 
-- Editing pixels (crop, filters, adjustments)
-- Reading a local macOS `Photos.photoslibrary` package
+## Privacy
 
-## How it talks to iCloud
+- Fuji talks only to Apple's iCloud services. There's no telemetry and no
+  server of its own. The one exception is “Show on map” in a photo's info,
+  which opens OpenStreetMap in your browser when you click it.
+- Your session tokens, the key that encrypts your saved cookies, and the
+  iPhone pairing key are kept in the system's credential store (Windows
+  Credential Manager, or the Secret Service on Linux), never in plain files.
+- Thumbnails, previews and the library index are cached in your local
+  app-data folder, and Settings shows how much space they use and can clear it.
 
-Apple has no public API for iCloud Photos. Fuji will use the same private web
-endpoints that icloud.com uses (CloudKit-backed, reached after Apple ID SRP
-sign-in and 2FA). Open-source projects such as `pyicloud` and `icloudpd` have
-documented much of this. Because the API is private, Apple can change it at any
-time and things may break.
+## Development
 
-Notes:
+| Crate | What it is |
+| --- | --- |
+| `crates/fuji` | The desktop app (GPUI) |
+| `crates/fuji-icloud` | The iCloud side, with no UI: sign-in, Photos queries, shared albums, memories, device search |
 
-- Accounts with **Advanced Data Protection** turned on cannot use web access
-  unless "Access iCloud Data on the Web" is enabled on a trusted device.
-- Session tokens must be stored in the OS keychain (Windows Credential Manager,
-  Secret Service / libsecret on Linux), never in plain files.
+```sh
+cargo test                    # unit tests
+cargo clippy --all-targets    # lints
+cargo fmt                     # formatting
+```
 
-## Platforms
+A few tests are marked `#[ignore]` because they talk to Apple. Some use a
+made-up address; others read (never change) the library of the account you
+signed in to Fuji with, and print only counts:
 
-- Windows 10/11 (x64, arm64)
-- Linux (x64, arm64): Flatpak / AppImage
+```sh
+cargo test -p fuji live_collections -- --ignored --nocapture
+```
+
+GPUI is pre-1.0, so it's pinned to an exact version in the workspace
+`Cargo.toml`; upgrade it on purpose. Run with `FUJI_DEBUG=1` to log the sign-in
+and session flow.
+
+[STATUS.md](STATUS.md) is the working log: what's done and verified, what's
+next, and things learned about Apple's services along the way.
+[docs/skybridge.md](docs/skybridge.md) describes how searching by iPhone works.
 
 ## Credits
 
-- Icons: [Framework7 Icons](https://framework7.io/icons/) (MIT), in `crates/fuji/assets/icons`
-- Font: [Gabarito](https://github.com/naipefoundry/gabarito) (SIL Open Font License), letter spacing tightened by `scripts/track_font.py`, in `crates/fuji/assets`
+- [GPUI](https://github.com/zed-industries/zed) (Apache-2.0), the UI framework.
+- [Framework7 Icons](https://framework7.io/icons/) (MIT), in
+  `crates/fuji/assets/icons`; the GitHub mark is
+  [Boxicons](https://github.com/box-icons/boxicons)' and the Bluesky mark is
+  Bluesky's own (both MIT).
+- [Gabarito](https://github.com/naipefoundry/gabarito) (SIL Open Font License),
+  with its letter spacing tightened by `scripts/track_font.py`, in
+  `crates/fuji/assets`.
+- Settings lists everything else Fuji is built on, with licenses.
+
+## License
+
+[MIT](LICENSE), © 2026 inane.tools.
 
 ## Disclaimer
 
-Fuji is not affiliated with or endorsed by Apple. "Apple", "iCloud", and
-"Apple Photos" are trademarks of Apple Inc.
+Fuji is an unofficial client and is not affiliated with, endorsed by, or
+associated with Apple Inc. Apple, iCloud, iCloud Photos and iPhone are
+trademarks of Apple Inc. Fuji signs in with your own Apple Account and talks
+to Apple's services the way icloud.com does. You are responsible for how you
+use Fuji and for any consequences, including any effect on your account or
+your photos. The software is provided as is, without warranty of any kind.
