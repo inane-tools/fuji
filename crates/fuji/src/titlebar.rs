@@ -10,8 +10,8 @@
 //! Elsewhere the system draws the title bar and none of this is shown.
 
 use gpui::{
-    Div, FontWeight, Hsla, ImageSource, Pixels, Resource, Stateful, Window, WindowControlArea, div,
-    img, prelude::*, px, rgb,
+    Div, Hsla, ImageSource, Pixels, Resource, Stateful, Window, WindowControlArea, div, img,
+    prelude::*, px, rgb,
 };
 
 use crate::theme;
@@ -34,28 +34,15 @@ pub fn drag_area() -> Div {
         .window_control_area(WindowControlArea::Drag)
 }
 
-/// The app's mark and, with `name`, its name, for the left end of the bar.
-pub fn brand(name: bool) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .child(
-            img(ImageSource::Resource(Resource::Embedded(
-                "icon-96.png".into(),
-            )))
-            .size(px(18.))
-            .flex_none(),
-        )
-        .when(name, |el| {
-            el.child(
-                div()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::EXTRA_BOLD)
-                    .text_color(theme::text())
-                    .child("fuji"),
-            )
-        })
+/// The app's mark, for the left end of the bar.
+pub fn brand() -> Div {
+    div().flex().items_center().child(
+        img(ImageSource::Resource(Resource::Embedded(
+            "icon-96.png".into(),
+        )))
+        .size(px(18.))
+        .flex_none(),
+    )
 }
 
 /// Minimize, maximize or restore, and close.

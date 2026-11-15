@@ -500,6 +500,8 @@ const SCAN_KEYS: &[&str] = &[
     "resJPEGThumbWidth",
     "resJPEGThumbHeight",
     "resOriginalVidComplFileType",
+    // For searching by name.
+    "filenameEnc",
 ];
 
 const DESIRED_KEYS: &[&str] = &[

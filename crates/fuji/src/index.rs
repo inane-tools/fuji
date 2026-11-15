@@ -21,6 +21,9 @@ pub struct IndexItem {
     pub kind: Kind,
     #[serde(default)]
     pub favorite: bool,
+    /// The original's file name, for search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,12 +52,14 @@ impl From<&Asset> for IndexItem {
                 AssetKind::Video { duration_secs } => Kind::Video(duration_secs),
             },
             favorite: asset.favorite,
+            name: asset.filename.clone(),
         }
     }
 }
 
-/// Bump when the format changes. v1 stored video durations in milliseconds.
-const VERSION: u32 = 2;
+/// Bump when the format changes. v1 stored video durations in milliseconds;
+/// v2 had no file names (the next scan adds them).
+const VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -129,7 +134,7 @@ pub fn load(path: &Path) -> Option<Vec<IndexItem>> {
     let bytes = std::fs::read(path).ok()?;
     let mut file: CacheFile = serde_json::from_slice(&bytes).ok()?;
     match file.version {
-        VERSION => Some(file.items),
+        VERSION | 2 => Some(file.items),
         1 => {
             for item in &mut file.items {
                 if let Kind::Video(ms) = &mut item.kind {
@@ -174,6 +179,7 @@ mod tests {
                 aspect: 0.75,
                 kind: Kind::Video(12),
                 favorite: true,
+                name: Some("IMG_0001.MOV".into()),
             },
             IndexItem {
                 id: "B".into(),
@@ -181,6 +187,7 @@ mod tests {
                 aspect: 1.5,
                 kind: Kind::Live,
                 favorite: false,
+                name: None,
             },
         ];
         save(&path, &items);

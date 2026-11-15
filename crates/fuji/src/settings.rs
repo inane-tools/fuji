@@ -25,8 +25,6 @@ const REPOSITORY: &str = "https://github.com/inane-tools/fuji";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Show the sidebar as a narrow strip of icons.
-    pub compact_sidebar: bool,
     /// Skip animations and smooth scrolling.
     pub reduce_motion: bool,
     /// Height of the gallery's rows: the grid zoom.
@@ -36,7 +34,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            compact_sidebar: false,
             reduce_motion: false,
             row_height: DEFAULT_ROW_HEIGHT,
         }
@@ -213,24 +210,9 @@ impl Render for SettingsView {
 
         let appearance = group("Appearance")
             .child(row(
-                "Compact sidebar",
-                "Show the sidebar as a narrow strip of icons.",
-                false,
-                ui::switch(
-                    "compact-sidebar",
-                    settings.compact_sidebar,
-                    flipped == Some("compact-sidebar"),
-                    cx.listener(|this, _, _, cx| {
-                        this.flip("compact-sidebar", cx, |s| {
-                            s.compact_sidebar = !s.compact_sidebar
-                        })
-                    }),
-                ),
-            ))
-            .child(row(
                 "Thumbnail size",
                 "Ctrl + scroll in the gallery zooms too.",
-                true,
+                false,
                 div()
                     .flex()
                     .items_center()
@@ -351,7 +333,7 @@ impl Render for SettingsView {
                                         .text_size(px(18.))
                                         .font_weight(FontWeight::EXTRA_BOLD)
                                         .text_color(theme::text())
-                                        .child("fuji"),
+                                        .child("Fuji"),
                                 )
                                 .child(
                                     div()
@@ -376,7 +358,7 @@ impl Render for SettingsView {
                         .text_color(theme::text_meta())
                         .child(
                             "Set in Gabarito (SIL Open Font License), with Phosphor icons \
-                             (MIT). fuji is an independent project and is not affiliated \
+                             (MIT). Fuji is an independent project and is not affiliated \
                              with Apple. iCloud is a trademark of Apple Inc.",
                         ),
                 )
@@ -429,7 +411,7 @@ fn group(title: &'static str) -> Group {
             .flex()
             .flex_col()
             .rounded(px(12.))
-            .bg(theme::sidebar())
+            .bg(theme::panel())
             .border_1()
             .border_color(theme::line()),
     }
@@ -532,8 +514,8 @@ mod tests {
 
     #[test]
     fn missing_fields_take_defaults() {
+        // Includes a setting that no longer exists.
         let settings = parse(br#"{ "compact_sidebar": true }"#);
-        assert!(settings.compact_sidebar);
         assert!(!settings.reduce_motion);
         assert_eq!(settings.row_height, DEFAULT_ROW_HEIGHT);
     }

@@ -1,19 +1,21 @@
-//! The Apple ID sign-in screen: credentials, then a verification code.
+//! The Apple ID sign-in screen: credentials, then a verification code; or
+//! a passkey (the iPhone, by QR code), which also pairs fuji with that
+//! device for Photos search.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuji_icloud::{Account, AuthClient, AuthError, SignInStep, TrustedPhone};
+use std::sync::Mutex;
+
+use fuji_icloud::{Account, AuthClient, AuthError, BridgeApproval, SignInStep, TrustedPhone};
 use gpui::{
     Animation, AnimationExt as _, App, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, SharedString, Subscription, Window, bounce, div, ease_in_out,
-    ease_out_quint, prelude::*, px,
+    Focusable, FontWeight, SharedString, Subscription, Window, div, ease_out_quint, prelude::*, px,
 };
 
 use crate::assets::icon;
 use crate::input::{FocusNext, FocusPrev, Submitted, TextInput};
-use crate::session_store;
-use crate::theme;
+use crate::{passkey, platform, session_store, theme};
 
 const CODE_LENGTH: usize = 6;
 
@@ -47,9 +49,14 @@ pub struct LoginView {
     password: Entity<TextInput>,
     code: Entity<TextInput>,
     busy: bool,
+    /// The busy wait is the passkey dialog.
+    passkey_busy: bool,
     error: Option<SharedString>,
     notice: Option<SharedString>,
     focus_handle: FocusHandle,
+    /// Approval on a device in progress ("bridge"); the typed code finishes
+    /// it and pairs fuji with that device.
+    bridge: Arc<Mutex<Option<BridgeApproval>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -123,9 +130,11 @@ impl LoginView {
             password,
             code,
             busy: false,
+            passkey_busy: false,
             error: None,
             notice,
             focus_handle: cx.focus_handle(),
+            bridge: Arc::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -152,12 +161,102 @@ impl LoginView {
                     if let Ok(SignInStep::Done(_)) = &step {
                         session_store::persist(&auth);
                     }
-                    step
+                    let mut approval = None;
+                    if let Ok(SignInStep::NeedsCode) = &step {
+                        // Ask the devices to approve; this also pairs fuji with
+                        // the one that does. Otherwise, a plain code.
+                        match auth.start_bridge() {
+                            Ok(Some(a)) => approval = Some(a),
+                            Ok(None) => {
+                                let _ = auth.request_device_code();
+                            }
+                            Err(err) => {
+                                if std::env::var_os("FUJI_DEBUG").is_some() {
+                                    eprintln!("bridge: couldn't start: {err}");
+                                }
+                                let _ = auth.request_device_code();
+                            }
+                        }
+                    }
+                    (step, approval)
                 })
                 .await;
+            let (result, approval) = result;
             this.update_in(cx, |this, window, cx| {
                 this.set_busy(false, cx);
                 this.password.update(cx, |p, cx| p.clear(cx));
+                match result {
+                    Ok(SignInStep::Done(account)) => cx.emit(LoginEvent::SignedIn(account)),
+                    Ok(SignInStep::NeedsCode) => {
+                        this.stage = Stage::Code {
+                            sms: None,
+                            phones: None,
+                        };
+                        this.notice = approval.is_some().then(|| {
+                            "Allow the sign-in on your device, then enter the code it shows.".into()
+                        });
+                        *this.bridge.lock().unwrap() = approval;
+                        this.code.focus_handle(cx).focus(window);
+                        cx.notify();
+                    }
+                    Err(err) => this.fail(err, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Sign in with a passkey through the system's dialog. Uses the Apple
+    /// ID if one is typed in; without one, any of the user's passkeys can
+    /// answer.
+    fn sign_in_with_passkey(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(handle) = platform::native_handle(window) else {
+            return;
+        };
+        let apple_id = self.apple_id.read(cx).text().trim().to_string();
+        self.set_busy(true, cx);
+        self.passkey_busy = true;
+        let auth = self.auth.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result: Result<SignInStep, SharedString> = cx
+                .background_spawn(async move {
+                    let apple_id = (!apple_id.is_empty()).then_some(apple_id.as_str());
+                    let challenge = auth
+                        .passkey_challenge(apple_id)
+                        .map_err(|e| SharedString::from(e.to_string()))?;
+                    let assertion = passkey::get(handle, &challenge).map_err(SharedString::from)?;
+                    let (step, pairing) = auth
+                        .passkey_sign_in(&challenge, &assertion)
+                        .map_err(|e| SharedString::from(e.to_string()))?;
+                    if let SignInStep::NeedsCode = &step {
+                        let _ = auth.request_device_code();
+                    }
+                    if let SignInStep::Done(_) = &step {
+                        session_store::persist(&auth);
+                        match &pairing {
+                            Some(pairing) => {
+                                session_store::save_pairing(pairing);
+                                if std::env::var_os("FUJI_DEBUG").is_some() {
+                                    eprintln!("passkey: signed in, pairing key saved");
+                                }
+                            }
+                            None => {
+                                if std::env::var_os("FUJI_DEBUG").is_some() {
+                                    eprintln!("passkey: signed in, no pairing key in the blob");
+                                }
+                            }
+                        }
+                    }
+                    Ok(step)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.passkey_busy = false;
+                this.set_busy(false, cx);
                 match result {
                     Ok(SignInStep::Done(account)) => cx.emit(LoginEvent::SignedIn(account)),
                     Ok(SignInStep::NeedsCode) => {
@@ -169,7 +268,10 @@ impl LoginView {
                         this.code.focus_handle(cx).focus(window);
                         cx.notify();
                     }
-                    Err(err) => this.fail(err, cx),
+                    Err(message) => {
+                        this.error = Some(message);
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -200,12 +302,34 @@ impl LoginView {
 
         self.set_busy(true, cx);
         let auth = self.auth.clone();
+        let bridge = self.bridge.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let account = match phone_id {
-                        Some(id) => auth.submit_sms_code(id, &code),
-                        None => auth.submit_device_code(&code),
+                    let approval = bridge.lock().unwrap().take();
+                    let account = match (phone_id, approval) {
+                        (Some(id), _) => auth.submit_sms_code(id, &code),
+                        (None, Some(approval)) => match auth.finish_bridge(approval, &code) {
+                            Ok((account, pairing)) => {
+                                session_store::save_pairing(&pairing);
+                                if std::env::var_os("FUJI_DEBUG").is_some() {
+                                    eprintln!("bridge: signed in, pairing key saved");
+                                }
+                                Ok(account)
+                            }
+                            Err(err) => {
+                                // The exchange is spent: fall back to a plain
+                                // code so the user can still sign in.
+                                if std::env::var_os("FUJI_DEBUG").is_some() {
+                                    eprintln!("bridge: didn't finish: {err}");
+                                }
+                                let _ = auth.request_device_code();
+                                Err(AuthError::Bridge(format!(
+                                    "{err} Enter the new code from your device."
+                                )))
+                            }
+                        },
+                        (None, None) => auth.submit_device_code(&code),
                     };
                     if account.is_ok() {
                         session_store::persist(&auth);
@@ -293,6 +417,7 @@ impl LoginView {
     }
 
     fn back_to_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.bridge.lock().unwrap().take();
         self.stage = Stage::Credentials;
         self.error = None;
         self.notice = None;
@@ -338,11 +463,31 @@ impl LoginView {
                 self.busy,
                 cx.listener(|this, _, window, cx| this.sign_in(window, cx)),
             ))
+            .when(passkey::SUPPORTED, |el| {
+                el.child(secondary_button(
+                    "sign-in-passkey",
+                    if self.passkey_busy {
+                        "Waiting for your passkey\u{2026}"
+                    } else {
+                        "Sign in with a passkey"
+                    },
+                    self.busy,
+                    cx.listener(|this, _, window, cx| this.sign_in_with_passkey(window, cx)),
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_meta())
+                        .child(
+                            "With your iPhone's passkey, Fuji can also ask the iPhone to search your photos.",
+                        ),
+                )
+            })
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(theme::text_meta())
-                    .child("fuji talks only to Apple. Your password is never saved."),
+                    .child("Fuji talks only to Apple. Your password is never saved."),
             )
     }
 
@@ -514,26 +659,55 @@ fn primary_button(
         .bg(theme::accent())
         .text_color(gpui::white())
         .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(13.))
-        .child(label);
+        .text_size(px(13.));
     if busy {
-        // Gentle pulse while waiting on Apple.
+        // A spinner while waiting on Apple.
         button
-            .with_animation(
-                "busy-pulse",
-                Animation::new(Duration::from_millis(1100))
-                    .repeat()
-                    .with_easing(bounce(ease_in_out)),
-                |el, t| el.opacity(0.55 + 0.35 * t),
-            )
+            .opacity(0.85)
+            .child(crate::ui::loading_status(
+                "busy-spinner",
+                label,
+                gpui::white(),
+            ))
             .into_any_element()
     } else {
+        let button = button.child(label);
         button
             .cursor_pointer()
             .hover(|el| el.bg(theme::accent_hover()))
             .on_click(on_click)
             .into_any_element()
     }
+}
+
+fn secondary_button(
+    id: &'static str,
+    label: &'static str,
+    busy: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .h(px(36.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(theme::RADIUS_CONTROL)
+        .border_1()
+        .border_color(theme::field_border())
+        .text_color(theme::text())
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(13.))
+        .child(label)
+        .map(|el| {
+            if busy {
+                el.opacity(0.6)
+            } else {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(theme::hover()))
+                    .on_click(on_click)
+            }
+        })
 }
 
 fn link_button(

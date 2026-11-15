@@ -20,11 +20,10 @@ use std::time::{Duration, Instant};
 
 use fuji_icloud::{Album, Asset, AssetId, PhotosClient, PhotosError, Resource};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    SharedString, Subscription, Window, actions, bounce, div, ease_in_out, img, point, prelude::*,
-    px,
+    AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Subscription, Window, actions, div, img, point, prelude::*, px,
 };
 use jiff::civil::Date;
 
@@ -34,6 +33,7 @@ use crate::image_cache::LruImageCache;
 use crate::index::{self, IndexItem, Kind};
 use crate::layout::{self, Layout, RowKind, Span};
 use crate::scrubber::{self, Track};
+use crate::search::Query;
 use crate::settings::{self, Settings};
 use crate::transfer::PendingUpload;
 use crate::ui::{self, MenuItem, Status};
@@ -172,6 +172,51 @@ struct OpenMenu {
     kind: MenuKind,
 }
 
+/// An album being searched. `PhotoGrid::index` holds the matches, so
+/// layout, selection and the viewer work on them as on any album; pages of
+/// full records are fetched by album rank.
+/// What decides a match.
+enum Matcher {
+    /// fuji's own search: dates, types, favorites, file names.
+    Local(Query),
+    /// What a device found (Skybridge): asset IDs, and the device's name.
+    Device {
+        ids: HashSet<String>,
+        provider: SharedString,
+        /// The device returned as many as asked for: there may be more.
+        capped: bool,
+    },
+}
+
+impl Matcher {
+    fn matches(&self, item: &IndexItem, day: Option<Date>) -> bool {
+        match self {
+            Matcher::Local(query) => query.matches(item, day),
+            Matcher::Device { ids, .. } => ids.contains(&item.id),
+        }
+    }
+
+    fn filter(&self, items: &[IndexItem], days: &[Option<Date>]) -> Vec<usize> {
+        match self {
+            Matcher::Local(query) => query.filter(items, days),
+            Matcher::Device { ids, .. } => items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| ids.contains(&item.id))
+                .map(|(i, _)| i)
+                .collect(),
+        }
+    }
+}
+
+struct Search {
+    query: Matcher,
+    all: Vec<IndexItem>,
+    all_days: Vec<Option<Date>>,
+    /// Album rank of each match.
+    ranks: Vec<usize>,
+}
+
 pub struct PhotoGrid {
     pub(crate) client: Arc<PhotosClient>,
     account_dir: PathBuf,
@@ -186,6 +231,13 @@ pub struct PhotoGrid {
     index: Vec<IndexItem>,
     /// The calendar day of each index item.
     days: Vec<Option<Date>>,
+    /// While searching: the whole album, and the album rank of each item
+    /// in `index` (which then holds only the matches).
+    search: Option<Search>,
+    /// What's typed in the search field, kept across album changes.
+    search_text: String,
+    /// A device is searching for `search_text`; its name if known.
+    device_pending: Option<SharedString>,
     scan: Option<Scan>,
     layout: Option<Layout>,
     layout_dirty: bool,
@@ -287,6 +339,9 @@ impl PhotoGrid {
             state: LoadState::Loading,
             index: Vec::new(),
             days: Vec::new(),
+            search: None,
+            search_text: String::new(),
+            device_pending: None,
             scan: None,
             layout: None,
             layout_dirty: true,
@@ -342,6 +397,141 @@ impl PhotoGrid {
         }
     }
 
+    /// Show only the items matching `text` (all of them when it's empty).
+    pub fn set_search(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text == self.search_text {
+            return;
+        }
+        self.search_text = text.to_string();
+        let matcher = Query::parse(text, jiff::Zoned::now().date()).map(Matcher::Local);
+        self.apply_matcher(matcher, cx);
+    }
+
+    /// Show what a device found for `text` (if that's still the search).
+    pub fn set_device_results(
+        &mut self,
+        text: &str,
+        ids: Vec<String>,
+        provider: SharedString,
+        capped: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if text != self.search_text {
+            return;
+        }
+        self.device_pending = None;
+        let matcher = Matcher::Device {
+            ids: ids.into_iter().collect(),
+            provider,
+            capped,
+        };
+        self.apply_matcher(Some(matcher), cx);
+    }
+
+    /// Show (or stop showing) that a device is searching.
+    pub fn set_device_pending(&mut self, pending: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.device_pending != pending {
+            self.device_pending = pending;
+            cx.notify();
+        }
+    }
+
+    fn apply_matcher(&mut self, matcher: Option<Matcher>, cx: &mut Context<Self>) {
+        let (all, all_days) = match self.search.take() {
+            Some(search) => (search.all, search.all_days),
+            None => (
+                std::mem::take(&mut self.index),
+                std::mem::take(&mut self.days),
+            ),
+        };
+        // Leave the viewer, menu and zoom anchor: positions change.
+        self.viewer = None;
+        self.menu = None;
+        self.zoom_anchor = None;
+        self.select_anchor = None;
+        self.search = matcher.map(|query| Search {
+            query,
+            all: Vec::new(),
+            all_days: Vec::new(),
+            ranks: Vec::new(),
+        });
+        self.show_album_items(all, all_days);
+        self.scroller.jump(0.);
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// The number of items in the whole album, searched or not.
+    fn album_len(&self) -> usize {
+        self.search
+            .as_ref()
+            .map_or(self.index.len(), |s| s.all.len())
+    }
+
+    /// The album rank of the item shown at `index`.
+    fn rank(&self, index: usize) -> usize {
+        self.search
+            .as_ref()
+            .and_then(|s| s.ranks.get(index).copied())
+            .unwrap_or(index)
+    }
+
+    /// Take `items` (with their `days`) as the whole album, showing the
+    /// ones the search matches, and keep the selection on the same photos.
+    fn show_album_items(&mut self, items: Vec<IndexItem>, days: Vec<Option<Date>>) {
+        let chosen: HashSet<String> = self
+            .selected
+            .iter()
+            .filter_map(|&ix| self.index.get(ix).map(|item| item.id.clone()))
+            .collect();
+        let (shown, shown_days) = match self.search.as_mut() {
+            Some(search) => {
+                search.ranks = search.query.filter(&items, &days);
+                let shown = search.ranks.iter().map(|&r| items[r].clone()).collect();
+                let shown_days = search.ranks.iter().map(|&r| days[r]).collect();
+                search.all = items;
+                search.all_days = days;
+                (shown, shown_days)
+            }
+            None => (items, days),
+        };
+        if !chosen.is_empty() {
+            self.selected = shown
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| chosen.contains(&item.id))
+                .map(|(ix, _)| ix)
+                .collect();
+            self.select_anchor = None;
+        }
+        self.index = shown;
+        self.days = shown_days;
+        self.layout_dirty = true;
+    }
+
+    /// Add items that arrived at the end of the album.
+    fn append_album_items(&mut self, items: Vec<IndexItem>, days: Vec<Option<Date>>) {
+        match self.search.as_mut() {
+            Some(search) => {
+                let base = search.all.len();
+                for (i, (item, day)) in items.iter().zip(&days).enumerate() {
+                    if search.query.matches(item, *day) {
+                        search.ranks.push(base + i);
+                        self.index.push(item.clone());
+                        self.days.push(*day);
+                    }
+                }
+                search.all.extend(items);
+                search.all_days.extend(days);
+            }
+            None => {
+                self.index.extend(items);
+                self.days.extend(days);
+            }
+        }
+        self.layout_dirty = true;
+    }
+
     /// The thumbnail and preview caches were deleted: forget what was in them.
     pub fn cache_cleared(&mut self, cx: &mut Context<Self>) {
         self.disk_thumbs = Some(Arc::new(HashSet::new()));
@@ -372,7 +562,7 @@ impl PhotoGrid {
     /// Load the full record for `index` soon, ahead of anything else queued.
     pub fn ensure_loaded(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.index.len() && self.asset(index).is_none() {
-            self.request_page(index / PAGE);
+            self.request_page(self.rank(index) / PAGE);
             self.pump(cx);
         }
     }
@@ -384,6 +574,11 @@ impl PhotoGrid {
         self.state = LoadState::Loading;
         self.index.clear();
         self.days.clear();
+        if let Some(search) = self.search.as_mut() {
+            search.all.clear();
+            search.all_days.clear();
+            search.ranks.clear();
+        }
         self.scan = None;
         self.layout = None;
         self.layout_dirty = true;
@@ -422,10 +617,8 @@ impl PhotoGrid {
                 if this.generation == generation
                     && let Some((items, days)) = cached
                 {
-                    this.index = items;
-                    this.days = days;
+                    this.show_album_items(items, days);
                     this.state = LoadState::Ready;
-                    this.layout_dirty = true;
                     cx.notify();
                 }
                 // Then refresh from iCloud.
@@ -480,7 +673,7 @@ impl PhotoGrid {
             return;
         }
         // Showing pages as they arrive only works from an empty gallery.
-        let progressive = progressive && self.index.is_empty();
+        let progressive = progressive && self.album_len() == 0;
         self.scan = Some(Scan {
             count,
             next_rank: 0,
@@ -559,10 +752,9 @@ impl PhotoGrid {
         if progressive {
             if !arrived.is_empty() {
                 let tz = jiff::tz::TimeZone::system();
-                self.days.extend(layout::days(&arrived, &tz));
-                self.index.extend(arrived);
+                let days = layout::days(&arrived, &tz);
+                self.append_album_items(arrived, days);
                 self.state = LoadState::Ready;
-                self.layout_dirty = true;
             }
         } else {
             scan.fresh.extend(arrived);
@@ -579,30 +771,18 @@ impl PhotoGrid {
         cx.notify();
     }
 
-    /// Replace the index, keeping the selection on the same photos.
+    /// Replace the album's items, keeping the selection on the same photos.
     fn set_index(&mut self, items: Vec<IndexItem>) {
-        if !self.selected.is_empty() {
-            let chosen: HashSet<&str> = self
-                .selected
-                .iter()
-                .filter_map(|&ix| self.index.get(ix).map(|item| item.id.as_str()))
-                .collect();
-            self.selected = items
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| chosen.contains(item.id.as_str()))
-                .map(|(ix, _)| ix)
-                .collect();
-            self.select_anchor = None;
-        }
-        self.days = layout::days(&items, &jiff::tz::TimeZone::system());
-        self.index = items;
-        self.layout_dirty = true;
+        let days = layout::days(&items, &jiff::tz::TimeZone::system());
+        self.show_album_items(items, days);
     }
 
     fn save_index(&self, cx: &mut Context<Self>) {
         let path = index::cache_path(&self.account_dir, &self.album);
-        let items = self.index.clone();
+        let items = match &self.search {
+            Some(search) => search.all.clone(),
+            None => self.index.clone(),
+        };
         cx.background_spawn(async move { index::save(&path, &items) })
             .detach();
     }
@@ -621,7 +801,7 @@ impl PhotoGrid {
     }
 
     fn start_page(&mut self, page: usize, cx: &mut Context<Self>) {
-        let count = self.index.len();
+        let count = self.album_len();
         let start = page * PAGE;
         if start >= count {
             self.pages_requested.remove(&page);
@@ -750,7 +930,7 @@ impl PhotoGrid {
             }
             match self.assets.get(&id).and_then(|a| a.thumbnail.clone()) {
                 Some(resource) => queue.push((id, resource)),
-                None => self.request_page(ix / PAGE),
+                None => self.request_page(self.rank(ix) / PAGE),
             }
         }
         // Visible order, first popped first.
@@ -1237,8 +1417,44 @@ impl PhotoGrid {
             (Some(_), _) => Some("Updating\u{2026}".into()),
             _ => None,
         };
-        let count = matches!(self.state, LoadState::Ready)
-            .then(|| format_count(self.scan.as_ref().map_or(self.index.len(), |s| s.count)));
+        // A device's search in progress says so first.
+        let status = self
+            .device_pending
+            .as_ref()
+            .map(|name| SharedString::from(format!("Asking {name}\u{2026}")))
+            .or(status);
+        // While a device searches and ours found nothing, no count yet.
+        let waiting = self.device_pending.is_some() && self.index.is_empty();
+        let count = (matches!(self.state, LoadState::Ready) && !waiting).then(|| {
+            if let Some(search) = &self.search {
+                let n = self.index.len();
+                let count = format!(
+                    "{} {}",
+                    group_digits(n),
+                    if n == 1 { "result" } else { "results" }
+                );
+                match &search.query {
+                    Matcher::Device {
+                        provider, capped, ..
+                    } => {
+                        let plus = if *capped { "+" } else { "" };
+                        let count = format!(
+                            "{}{plus} {}",
+                            group_digits(n),
+                            if n == 1 && plus.is_empty() {
+                                "result"
+                            } else {
+                                "results"
+                            }
+                        );
+                        format!("{count} \u{00b7} Provided by {provider}")
+                    }
+                    Matcher::Local(_) => count,
+                }
+            } else {
+                format_count(self.scan.as_ref().map_or(self.index.len(), |s| s.count))
+            }
+        });
         let chosen = self.selected.len();
 
         let tools = if chosen > 0 {
@@ -1321,7 +1537,16 @@ impl PhotoGrid {
             )
             .child(div().flex_1())
             .when_some(status, |el, status| {
-                el.child(div().text_xs().text_color(theme::text_meta()).child(status))
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_meta())
+                        .child(ui::loading_status(
+                            "header-status",
+                            status,
+                            theme::text_meta(),
+                        )),
+                )
             })
             .when_some(self.error.clone(), |el, error| {
                 el.child(
@@ -1587,13 +1812,13 @@ impl Render for PhotoGrid {
 
         let body: AnyElement = match &self.state {
             LoadState::Loading => centered(
-                div().child("Loading your library\u{2026}").with_animation(
-                    "library-loading",
-                    Animation::new(Duration::from_millis(1800))
-                        .repeat()
-                        .with_easing(bounce(ease_in_out)),
-                    |el, t| el.opacity(0.4 + 0.6 * t),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(ui::spinner("library-loading", px(22.), theme::text_muted()))
+                    .child("Loading your library\u{2026}"),
             ),
             LoadState::Failed(message) => centered(
                 div()
@@ -1605,6 +1830,38 @@ impl Render for PhotoGrid {
                     .text_center()
                     .child(div().text_color(theme::danger()).child(message.clone()))
                     .child(retry_link(cx)),
+            ),
+            LoadState::Ready if self.index.is_empty() && self.device_pending.is_some() => {
+                let name = self.device_pending.clone().unwrap_or_default();
+                centered(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(ui::spinner("device-searching", px(22.), theme::text_muted()))
+                        .child(format!("{name} is searching\u{2026}")),
+                )
+            }
+            LoadState::Ready if self.index.is_empty() && self.search.is_some() => centered(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(theme::text())
+                            .child(format!("No results for \u{201c}{}\u{201d}", self.search_text.trim())),
+                    )
+                    .child(div().text_xs().text_color(theme::text_meta()).child(
+                        "Search by date, type, favorite or file name: \u{201c}march 2021\u{201d}, \u{201c}videos\u{201d}, \u{201c}IMG_12\u{201d}.",
+                    ))
+                    .when(self.scan.is_some(), |el| {
+                        el.child(div().text_xs().text_color(theme::text_meta()).child(
+                            "Still loading the album; more may match.",
+                        ))
+                    }),
             ),
             LoadState::Ready if self.index.is_empty() && self.scan.is_none() => {
                 centered(div().child(empty_message(&self.album)))
@@ -1668,7 +1925,7 @@ impl PhotoGrid {
         let width = if bounds.size.width > px(0.) {
             f32::from(bounds.size.width)
         } else {
-            f32::from(window.viewport_size().width) - f32::from(theme::SIDEBAR_WIDTH)
+            f32::from(window.viewport_size().width)
         };
         let viewport_h = if bounds.size.height > px(0.) {
             f32::from(bounds.size.height)

@@ -1,27 +1,47 @@
-//! The main window: title bar, sign-in, then sidebar plus content area.
+//! The main window: the title bar, which is also the navigation (sections
+//! as tabs, albums in a menu, search, settings, account), then the page.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fuji_icloud::{Account, Album, AuthClient, PhotosClient, PhotosError, SavedSession, UserAlbum};
 use gpui::{
-    Animation, AnimationExt as _, Context, ElementId, Entity, Focusable, FontWeight, ImageSource,
-    Resource, SharedString, Subscription, Task, Window, bounce, div, ease_in_out, img, prelude::*,
-    px,
+    AnimationExt as _, Bounds, ClickEvent, Context, ElementId, Entity, Focusable, FontWeight,
+    KeyBinding, Pixels, Point, SharedString, Subscription, Task, Window, actions, canvas, div,
+    point, prelude::*, px,
 };
 
 use crate::anim::{self, Eased};
 use crate::assets::icon;
+use crate::device_search::DeviceSearch;
 use crate::grid::{GridEvent, PhotoGrid};
+use crate::input::TextInput;
 use crate::login::{LoginEvent, LoginView};
-use crate::settings::{Settings, SettingsEvent, SettingsView};
+use crate::settings::{SettingsEvent, SettingsView};
 use crate::{index, net, session_store, theme, thumbs, titlebar, ui};
 
-/// Height of a sidebar row plus the gap below it.
-const NAV_PITCH: f32 = 34.;
-/// How quickly the sidebar and its selection ease (per second).
-const SIDEBAR_RATE: f32 = 16.;
+/// How quickly the tab highlight follows the selection (per second).
+const PILL_RATE: f32 = 18.;
+/// Below this window width the tabs show icons only.
+const TAB_LABELS_MIN_WIDTH: f32 = 1040.;
+/// Tab keys of the bar's entries that aren't a single section.
+const ALBUMS_TAB: u64 = 50;
+/// The bar itself, measured so tab positions can be made relative to it.
+const BAR_KEY: u64 = 999;
+const SEARCH_CONTEXT: &str = "SearchField";
+
+actions!(fuji, [FocusSearch, CloseSearch]);
+
+pub fn bind_keys(cx: &mut gpui::App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-f", FocusSearch, None),
+        KeyBinding::new("escape", CloseSearch, Some(SEARCH_CONTEXT)),
+    ]);
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -36,17 +56,8 @@ pub enum Section {
 }
 
 impl Section {
-    /// The fixed sections at the top of the sidebar. The user's albums
-    /// follow, under an "Albums" heading one row tall.
-    const NAV: [Section; 5] = [
-        Section::Library,
-        Section::Favorites,
-        Section::Videos,
-        Section::Shared,
-        Section::RecentlyDeleted,
-    ];
-
-    /// Label for the fixed sections; albums are named by `FujiApp::label`.
+    /// Gallery title for the fixed sections; albums are named by
+    /// `FujiApp::label`.
     fn fixed_label(self) -> &'static str {
         match self {
             Section::Library => "Library",
@@ -56,6 +67,15 @@ impl Section {
             Section::RecentlyDeleted => "Recently Deleted",
             Section::Album(_) => "Album",
             Section::Settings => "Settings",
+        }
+    }
+
+    /// The shorter name on its tab.
+    fn tab_label(self) -> &'static str {
+        match self {
+            Section::Shared => "Shared",
+            Section::RecentlyDeleted => "Deleted",
+            _ => self.fixed_label(),
         }
     }
 
@@ -72,19 +92,24 @@ impl Section {
         }
     }
 
-    /// Row of the sidebar's list this section is on, counting the heading.
-    fn nav_position(self) -> Option<usize> {
-        match self {
-            Section::Album(i) => Some(Self::NAV.len() + 1 + i),
-            _ => Self::NAV.iter().position(|s| *s == self),
-        }
-    }
-
     /// Distinct per section, for element ids and animations.
     fn key(self) -> u64 {
         match self {
+            Section::Library => 0,
+            Section::Favorites => 1,
+            Section::Videos => 2,
+            Section::Shared => 3,
+            Section::RecentlyDeleted => 4,
+            Section::Settings => 5,
             Section::Album(i) => 100 + i as u64,
-            _ => self.nav_position().unwrap_or(99) as u64,
+        }
+    }
+
+    /// The bar entry that shows this section as selected.
+    fn tab_key(self) -> u64 {
+        match self {
+            Section::Album(_) => ALBUMS_TAB,
+            _ => self.key(),
         }
     }
 }
@@ -109,40 +134,55 @@ enum Screen {
 pub struct FujiApp {
     screen: Screen,
     section: Section,
-    /// The user's albums, listed under the fixed sections.
+    /// The user's albums, listed in the Albums menu.
     albums: Vec<UserAlbum>,
     /// The account picture, once it's been found or fetched.
     avatar: Option<Arc<Path>>,
-    /// The sidebar's width, easing between full and compact.
-    sidebar_width: Eased,
-    /// Where the selection highlight is, in rows from the top.
-    highlight: Eased,
+    /// The highlight behind the selected tab: its left edge and width,
+    /// easing from tab to tab.
+    pill_x: Eased,
+    pill_width: Eased,
+    pill_placed: bool,
+    /// Where each bar entry was drawn last frame, by tab key.
+    tab_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
+    /// The open Albums menu: its opening's serial and where it hangs.
+    albums_menu: Option<(u64, Point<Pixels>)>,
+    menu_serial: u64,
+    search: Entity<TextInput>,
+    /// The query the gallery was last given.
+    search_text: SharedString,
     _login_subscription: Option<Subscription>,
-    _settings: Subscription,
-}
-
-fn sidebar_target(cx: &gpui::App) -> f32 {
-    f32::from(if Settings::get(cx).compact_sidebar {
-        theme::SIDEBAR_COMPACT_WIDTH
-    } else {
-        theme::SIDEBAR_WIDTH
-    })
+    _search: Subscription,
+    /// Search by the paired iPhone, when fuji is paired with one.
+    device_search: Option<Arc<DeviceSearch>>,
+    /// The device search in flight; replaced (cancelled) by the next.
+    _device_query: Option<Task<()>>,
 }
 
 impl FujiApp {
     pub fn new(saved: Option<SavedSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| TextInput::new("Search", cx).compact("search"));
+        let _search = cx.observe(&search, |this, input, cx| {
+            let text = SharedString::from(input.read(cx).text().to_string());
+            this.search_changed(text, cx);
+        });
         let mut this = Self {
             screen: Screen::Resuming,
             section: Section::Library,
             albums: Vec::new(),
             avatar: None,
-            sidebar_width: Eased::new(sidebar_target(cx)),
-            highlight: Eased::new(0.),
+            pill_x: Eased::new(0.),
+            pill_width: Eased::new(0.),
+            pill_placed: false,
+            tab_bounds: Rc::default(),
+            albums_menu: None,
+            menu_serial: 0,
+            search,
+            search_text: SharedString::default(),
             _login_subscription: None,
-            _settings: cx.observe_global::<Settings>(|this, cx| {
-                this.sidebar_width.set(sidebar_target(cx));
-                cx.notify();
-            }),
+            _search,
+            device_search: None,
+            _device_query: None,
         };
         match saved {
             Some(saved) if saved.session_token.is_some() => this.resume(saved, window, cx),
@@ -280,8 +320,9 @@ impl FujiApp {
         );
 
         self.load_avatar(&account, auth.clone(), cx);
-        self.highlight
-            .jump(self.section.nav_position().unwrap_or(0) as f32);
+        self.start_device_search(&account, auth.clone(), cx);
+        self.search_text = SharedString::default();
+        self.search.update(cx, |search, cx| search.clear(cx));
         self.screen = Screen::Main {
             account,
             grid,
@@ -430,9 +471,6 @@ impl FujiApp {
                 None => Section::Library,
             };
             self.section = section;
-            if let Some(position) = section.nav_position() {
-                self.highlight.set(position as f32);
-            }
             self.show_section_in_grid(section, cx);
         }
         cx.notify();
@@ -455,9 +493,7 @@ impl FujiApp {
 
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
-        if let Some(position) = section.nav_position() {
-            self.highlight.set(position as f32);
-        }
+        self.albums_menu = None;
         if self.show_section_in_grid(section, cx)
             && let Screen::Main {
                 grid: Some(grid), ..
@@ -489,333 +525,437 @@ impl FujiApp {
         self.show_login(Some(apple_id), auth, None, window, cx);
     }
 
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        Settings::update(cx, |settings| {
-            settings.compact_sidebar = !settings.compact_sidebar
-        });
+    // ---- Search ---------------------------------------------------------------
+
+    fn search_changed(&mut self, text: SharedString, cx: &mut Context<Self>) {
+        if text == self.search_text {
+            return;
+        }
+        self.search_text = text.clone();
+        // Searching from a page that isn't the gallery searches the library.
+        if self.section_album(self.section).is_none() {
+            self.section = Section::Library;
+            self.show_section_in_grid(Section::Library, cx);
+        }
+        if let Screen::Main {
+            grid: Some(grid), ..
+        } = &self.screen
+        {
+            grid.update(cx, |grid, cx| grid.set_search(&text, cx));
+        }
+        self.ask_device(text, cx);
+        cx.notify();
     }
 
-    /// One sidebar row. `open` is how far the sidebar is open (0 compact, 1
-    /// full): labels fade with it.
-    fn nav_row(
+    fn with_grid(
         &self,
-        section: Section,
-        filled: bool,
-        open: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let active = section == self.section;
-        let glyph = if active {
-            format!("{}-active", section.icon())
-        } else {
-            section.icon().to_string()
+        f: impl FnOnce(&mut PhotoGrid, &mut Context<PhotoGrid>),
+    ) {
+        if let Screen::Main {
+            grid: Some(grid), ..
+        } = &self.screen
+        {
+            grid.update(cx, f);
+        }
+    }
+
+    /// If fuji is paired with a device, let it search too (Skybridge).
+    fn start_device_search(
+        &mut self,
+        account: &Account,
+        auth: Arc<AuthClient>,
+        cx: &mut Context<Self>,
+    ) {
+        self.device_search = None;
+        let (dsid, apple_id) = (account.dsid.clone(), account.apple_id.clone());
+        cx.spawn(async move |this, cx| {
+            let search = cx
+                .background_spawn(async move {
+                    let pairing = session_store::load_pairing()?;
+                    DeviceSearch::start(auth, dsid, apple_id, pairing.key)
+                })
+                .await;
+            this.update(cx, |this, _| this.device_search = search.map(Arc::new))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Ask the paired device to search for `text`, once typing pauses; its
+    /// results replace fuji's own when they come.
+    fn ask_device(&mut self, text: SharedString, cx: &mut Context<Self>) {
+        let Some(search) = self.device_search.clone() else {
+            return;
         };
-        let label = self.label(section);
+        if text.trim().is_empty() {
+            self._device_query = None;
+            self.with_grid(cx, |grid, cx| grid.set_device_pending(None, cx));
+            return;
+        }
+        self._device_query = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(350))
+                .await;
+            // Say a device is on it, by name once known.
+            let asking = SharedString::from(
+                search
+                    .device_name()
+                    .unwrap_or_else(|| "your iPhone".to_string()),
+            );
+            this.update(cx, |this, cx| {
+                this.with_grid(cx, |grid, cx| grid.set_device_pending(Some(asking), cx))
+            })
+            .ok();
+            let result = search.search(text.trim().to_string()).await;
+            this.update(cx, |this, cx| {
+                if this.search_text != text {
+                    return;
+                }
+                match result {
+                    Ok(found) => {
+                        let provider = SharedString::from(found.provider);
+                        this.with_grid(cx, |grid, cx| {
+                            grid.set_device_results(&text, found.ids, provider, found.capped, cx)
+                        });
+                    }
+                    Err(err) => {
+                        if std::env::var_os("FUJI_DEBUG").is_some() {
+                            eprintln!("device search: {err}");
+                        }
+                        this.with_grid(cx, |grid, cx| grid.set_device_pending(None, cx));
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.screen, Screen::Main { .. }) {
+            self.search.focus_handle(cx).focus(window);
+        }
+    }
+
+    /// Escape in the field: clear it, then give the gallery the keyboard.
+    fn close_search(&mut self, _: &CloseSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |search, cx| search.clear(cx));
+        if let Screen::Main {
+            grid: Some(grid), ..
+        } = &self.screen
+        {
+            grid.focus_handle(cx).focus(window);
+        }
+    }
+
+    // ---- The bar ----------------------------------------------------------------
+
+    fn open_albums_menu(&mut self, cx: &mut Context<Self>) {
+        if self.albums_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let at = self
+            .tab_bounds
+            .borrow()
+            .get(&ALBUMS_TAB)
+            .map(|b| point(b.origin.x, b.origin.y + b.size.height + px(4.)))
+            .unwrap_or_else(|| point(px(200.), titlebar::HEIGHT));
+        self.menu_serial += 1;
+        self.albums_menu = Some((self.menu_serial, at));
+        cx.notify();
+    }
+
+    fn render_albums_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (serial, at) = self.albums_menu?;
+        let this = cx.entity().downgrade();
+        let items = if self.albums.is_empty() {
+            vec![ui::MenuItem::new("albums", "No albums yet", |_, _| {})]
+        } else {
+            self.albums
+                .iter()
+                .enumerate()
+                .map(|(i, album)| {
+                    let this = this.clone();
+                    let chosen = self.section == Section::Album(i);
+                    ui::MenuItem::new(
+                        if chosen { "check" } else { "albums" },
+                        album.name.clone(),
+                        move |window, cx| {
+                            this.update(cx, |this, cx| this.select(Section::Album(i), window, cx))
+                                .ok();
+                        },
+                    )
+                })
+                .collect()
+        };
+        Some(ui::context_menu(serial, at, items, move |_, cx| {
+            this.update(cx, |this, cx| {
+                this.albums_menu = None;
+                cx.notify();
+            })
+            .ok();
+        }))
+    }
+
+    /// Something in the bar that remembers where it was drawn, so the
+    /// highlight can find it.
+    fn measured(&self, key: u64) -> impl IntoElement + use<> {
+        let store = self.tab_bounds.clone();
+        canvas(
+            move |bounds, window, _| {
+                let changed = store.borrow_mut().insert(key, bounds) != Some(bounds);
+                if changed {
+                    window.refresh();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        // Pinned to the corner: without an inset, an absolute child starts
+        // after the padding, which shifted every tab by its padding.
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// A tab: icon, label (when there's room), and for the Albums menu a caret.
+    fn tab(
+        &self,
+        key: u64,
+        icon_name: &'static str,
+        label: Option<SharedString>,
+        active: bool,
+        caret: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let glyph = if active {
+            format!("{icon_name}-active")
+        } else {
+            icon_name.to_string()
+        };
         div()
-            .id(ElementId::NamedInteger("nav".into(), section.key()))
-            .h(theme::CONTROL_HEIGHT)
+            .id(ElementId::NamedInteger("tab".into(), key))
+            .relative()
+            .occlude()
+            .h(px(28.))
             .flex_none()
-            .px(px(9.))
+            .px(px(if label.is_some() { 10. } else { 7. }))
             .flex()
             .items_center()
-            .gap(px(10.))
+            .gap(px(7.))
             .rounded(theme::RADIUS_CONTROL)
             .cursor_pointer()
-            .overflow_hidden()
             .text_size(px(13.))
             .font_weight(FontWeight::MEDIUM)
             .map(|el| {
                 if active {
-                    // Selection uses the accent, not a stronger grey.
                     el.text_color(theme::text())
-                        .when(filled, |el| el.bg(theme::accent_soft()))
                 } else {
                     el.text_color(theme::text_muted())
                         .hover(|el| el.bg(theme::hover()).text_color(theme::text()))
                 }
             })
-            .on_click(cx.listener(move |this, _, window, cx| this.select(section, window, cx)))
+            .child(self.measured(key))
             .child(icon(
                 &glyph,
-                px(18.),
+                px(16.),
                 if active {
                     theme::accent_text()
                 } else {
                     theme::text_meta()
                 },
             ))
-            .when(open > 0.05, |el| {
-                el.child(div().min_w_0().truncate().opacity(open).child(label))
+            .when_some(label, |el, label| {
+                el.child(div().max_w(px(160.)).truncate().child(label))
+            })
+            .when(caret, |el| {
+                el.child(icon("caret-down", px(11.), theme::text_meta()))
             })
     }
 
-    /// The "Albums" heading: one row tall so rows keep a steady pitch for
-    /// the sliding highlight. A short rule in the compact sidebar.
-    fn albums_heading(open: f32) -> impl IntoElement {
-        div()
-            .h(theme::CONTROL_HEIGHT)
-            .flex_none()
-            .flex()
-            .items_end()
-            .px(px(9.))
-            .pb(px(4.))
-            .map(|el| {
-                if open > 0.05 {
-                    el.child(
-                        div()
-                            .opacity(open)
-                            .whitespace_nowrap()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_meta())
-                            .child("Albums"),
-                    )
-                } else {
-                    el.items_center()
-                        .pb_0()
-                        .child(div().w(px(18.)).h(px(1.)).bg(theme::line()))
-                }
-            })
-    }
-
-    fn render_sidebar(
-        &self,
-        account: &Account,
-        width: f32,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let compact = f32::from(theme::SIDEBAR_COMPACT_WIDTH);
-        let open = ((width - compact) / (f32::from(theme::SIDEBAR_WIDTH) - compact)).clamp(0., 1.);
-        let name = display_name(account);
-
-        // The highlight slides between rows rather than jumping.
-        let highlight = self.section.nav_position().map(|_| {
-            div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .top(px(self.highlight.get() * NAV_PITCH))
-                .h(theme::CONTROL_HEIGHT)
-                .rounded(theme::RADIUS_CONTROL)
-                .bg(theme::accent_soft())
-        });
-        let albums = (0..self.albums.len())
-            .map(Section::Album)
-            .collect::<Vec<_>>();
-        let nav = div()
-            .relative()
-            .flex()
-            .flex_col()
-            .gap(px(NAV_PITCH) - theme::CONTROL_HEIGHT)
-            .children(highlight)
-            .children(
-                Section::NAV
-                    .into_iter()
-                    .map(|section| self.nav_row(section, false, open, cx)),
-            )
-            .when(!albums.is_empty(), |el| {
-                el.child(Self::albums_heading(open)).children(
-                    albums
-                        .into_iter()
-                        .map(|section| self.nav_row(section, false, open, cx)),
-                )
-            });
-        // Many albums scroll; the settings row and account stay put.
-        let nav = div()
-            .id("nav")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .child(nav);
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(width))
-            .h_full()
-            .overflow_hidden()
-            .px(px(12.))
-            .pt(px(if titlebar::CUSTOM { 8. } else { 16. }))
-            .pb(px(12.))
-            .bg(theme::sidebar())
-            // Without the custom title bar, the brand lives here.
-            .when(!titlebar::CUSTOM, |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .px(px(6.))
-                        .pb(px(16.))
-                        .child(
-                            img(ImageSource::Resource(Resource::Embedded(
-                                "icon-96.png".into(),
-                            )))
-                            .size(px(24.))
-                            .flex_none(),
-                        )
-                        .when(open > 0.05, |el| {
-                            el.child(
-                                div()
-                                    .opacity(open)
-                                    .text_size(px(18.))
-                                    .font_weight(FontWeight::EXTRA_BOLD)
-                                    .text_color(theme::text())
-                                    .child("fuji"),
-                            )
-                        }),
-                )
-            })
-            .child(nav)
-            .child(
-                div()
-                    .pt(px(8.))
-                    .child(self.nav_row(Section::Settings, true, open, cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .mt(px(10.))
-                    .pl(px(4.))
-                    .pt(px(12.))
-                    .border_t_1()
-                    .border_color(theme::line())
-                    .child(ui::avatar(self.avatar.clone(), &name, px(28.)))
-                    .when(open > 0.05, |el| {
-                        el.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .opacity(open)
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme::text_title())
-                                        .truncate()
-                                        .child(name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(theme::text_meta())
-                                        .truncate()
-                                        .child(account.apple_id.clone()),
-                                ),
-                        )
-                    })
-                    .when(open > 0.6, |el| {
-                        el.child(
-                            div()
-                                .id("sign-out")
-                                .size(theme::CONTROL_HEIGHT)
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(theme::RADIUS_CONTROL)
-                                .cursor_pointer()
-                                .opacity(open)
-                                .hover(|el| el.bg(theme::hover()))
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.sign_out(window, cx)),
-                                )
-                                .child(icon("sign-out", px(16.), theme::text_muted())),
-                        )
-                    }),
-            )
-    }
-
-    /// The title bar. Over the main screen its left end continues the
-    /// sidebar and holds the sidebar's toggle.
-    fn render_titlebar(
-        &self,
-        sidebar: Option<f32>,
+    /// The title bar: the mark, a tab per section (albums in a menu),
+    /// search, settings and the account, then the window buttons. Before
+    /// sign-in only the mark and the buttons.
+    fn render_bar(
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        // The toggle sits at the end of the sidebar's stretch of the bar, or
-        // just past it when the sidebar is too narrow to hold it.
-        let toggle = |cx: &mut Context<Self>| {
-            ui::icon_button(
-                "toggle-sidebar",
-                "sidebar",
-                cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
-            )
-            // A button, not part of the caption.
-            .occlude()
-            .size(px(28.))
+        let main = matches!(self.screen, Screen::Main { .. });
+        let wide = f32::from(window.viewport_size().width) >= TAB_LABELS_MIN_WIDTH;
+
+        // The highlight eases to wherever the selected entry was drawn.
+        let selected = self
+            .tab_bounds
+            .borrow()
+            .get(&self.section.tab_key())
+            .copied();
+        let bar = self.tab_bounds.borrow().get(&BAR_KEY).copied();
+        let pill = match (main, selected, bar) {
+            (true, Some(bounds), Some(bar)) => {
+                // Relative to the bar, which is where the highlight is drawn.
+                let x = f32::from(bounds.origin.x - bar.origin.x);
+                let w = f32::from(bounds.size.width);
+                if self.pill_placed {
+                    self.pill_x.set(x);
+                    self.pill_width.set(w);
+                } else {
+                    self.pill_x.jump(x);
+                    self.pill_width.jump(w);
+                    self.pill_placed = true;
+                }
+                if self.pill_x.tick(PILL_RATE, 0.3) | self.pill_width.tick(PILL_RATE, 0.3) {
+                    window.request_animation_frame();
+                }
+                Some(
+                    div()
+                        .absolute()
+                        .left(px(self.pill_x.get()))
+                        .top(bounds.origin.y - bar.origin.y)
+                        .w(px(self.pill_width.get()))
+                        .h(bounds.size.height)
+                        .rounded(theme::RADIUS_CONTROL)
+                        .bg(theme::accent_soft()),
+                )
+            }
+            _ => None,
         };
-        let compact = sidebar.is_some_and(|width| width < 150.);
-        let left = match sidebar {
-            Some(width) => titlebar::drag_area()
-                .flex_none()
-                .w(px(width))
-                .overflow_hidden()
-                // The mark lines up with the sidebar's icons below it.
-                .pl(px(21.))
-                .pr(px(10.))
-                .bg(theme::sidebar())
-                .child(titlebar::brand(!compact))
-                .child(div().flex_1())
-                .when(!compact, |el| el.child(toggle(cx))),
-            None => titlebar::drag_area()
-                .flex_none()
-                .pl(px(14.))
-                .child(titlebar::brand(true)),
-        };
+
+        let brand = titlebar::drag_area()
+            .flex_none()
+            .pl(px(14.))
+            .pr(px(10.))
+            .child(titlebar::brand());
+
+        let tabs = main.then(|| {
+            let mut tabs = titlebar::drag_area().flex_none().gap(px(2.));
+            let section_tab = |this: &Self, section: Section, cx: &mut Context<Self>| {
+                this.tab(
+                    section.key(),
+                    section.icon(),
+                    wide.then(|| section.tab_label().into()),
+                    this.section == section,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| this.select(section, window, cx)))
+            };
+            for section in [Section::Library, Section::Favorites, Section::Videos] {
+                tabs = tabs.child(section_tab(self, section, cx));
+            }
+            let album_label = match self.section {
+                Section::Album(i) => self.albums.get(i).map(|a| a.name.clone()),
+                _ => None,
+            }
+            .unwrap_or_else(|| "Albums".into());
+            tabs = tabs.child(
+                self.tab(
+                    ALBUMS_TAB,
+                    "albums",
+                    wide.then(|| album_label.into()),
+                    matches!(self.section, Section::Album(_)),
+                    true,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_albums_menu(cx))),
+            );
+            for section in [Section::Shared, Section::RecentlyDeleted] {
+                tabs = tabs.child(section_tab(self, section, cx));
+            }
+            tabs
+        });
+
+        let right =
+            main.then(|| {
+                let (name, avatar) = match &self.screen {
+                    Screen::Main { account, .. } => (display_name(account), self.avatar.clone()),
+                    _ => (String::new(), None),
+                };
+                titlebar::drag_area()
+                    .flex_none()
+                    .gap(px(4.))
+                    .pr(px(8.))
+                    .child(
+                        div()
+                            .occlude()
+                            .key_context(SEARCH_CONTEXT)
+                            .on_action(cx.listener(Self::close_search))
+                            .w(px(if wide { 240. } else { 170. }))
+                            .mr(px(4.))
+                            .child(self.search.clone()),
+                    )
+                    .child(
+                        self.tab(
+                            Section::Settings.key(),
+                            "settings",
+                            None,
+                            self.section == Section::Settings,
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.select(Section::Settings, window, cx)
+                        })),
+                    )
+                    .child(
+                        div()
+                            .id("account")
+                            .occlude()
+                            .size(px(28.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(theme::hover()))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.select(Section::Settings, window, cx)
+                            }))
+                            .child(ui::avatar(avatar, &name, px(22.))),
+                    )
+            });
+
         div()
+            .relative()
             .flex()
             .flex_none()
+            .items_center()
             .h(titlebar::HEIGHT)
             .w_full()
             .bg(theme::surface())
-            .child(left)
-            .child(
-                titlebar::drag_area()
-                    .flex_1()
-                    .pl(px(8.))
-                    .when(compact, |el| el.child(toggle(cx))),
-            )
-            .child(titlebar::controls(window))
+            .child(self.measured(BAR_KEY))
+            .children(pill)
+            .child(brand)
+            .children(tabs)
+            .child(titlebar::drag_area().flex_1())
+            .children(right)
+            .when(titlebar::CUSTOM, |el| el.child(titlebar::controls(window)))
     }
 }
 
 impl Render for FujiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.sidebar_width.tick(SIDEBAR_RATE, 0.5) | self.highlight.tick(SIDEBAR_RATE, 0.01) {
-            window.request_animation_frame();
-        }
-        let width = self.sidebar_width.get();
-
-        // One font and base color for every screen.
+        // One font and base color for every screen. The bar is drawn on
+        // every system: where the system draws the title bar, it's a
+        // toolbar under it.
         let root = div()
             .size_full()
             .flex()
             .flex_col()
             .font_family(theme::FONT)
             .bg(theme::surface())
-            .text_color(theme::text());
-        let is_main = matches!(self.screen, Screen::Main { .. });
-        let root = root.when(titlebar::CUSTOM, |el| {
-            el.child(self.render_titlebar(is_main.then_some(width), window, cx))
-        });
+            .text_color(theme::text())
+            .on_action(cx.listener(Self::focus_search));
+        let main = matches!(self.screen, Screen::Main { .. });
+        let root = root
+            .when(titlebar::CUSTOM || main, |el| {
+                el.child(self.render_bar(window, cx))
+            })
+            .children(self.render_albums_menu(cx));
         let body = div().flex_1().min_h_0();
 
-        let (account, grid, settings) = match &self.screen {
+        let (grid, settings) = match &self.screen {
             Screen::Resuming => return root.child(body.child(resuming())),
             Screen::Login(login) => return root.child(body.child(login.clone())),
-            Screen::Main {
-                account,
-                grid,
-                settings,
-                ..
-            } => (account.clone(), grid.clone(), settings.clone()),
+            Screen::Main { grid, settings, .. } => (grid.clone(), settings.clone()),
         };
 
         let message = |text: String| {
@@ -834,7 +974,7 @@ impl Render for FujiApp {
             (_, true, Some(grid)) => div().size_full().child(grid),
             (_, true, None) => message(PhotosError::NotAvailable.to_string()),
             (_, false, _) => message(format!(
-                "{} aren't available in fuji yet.",
+                "{} aren't available in Fuji yet.",
                 self.label(self.section)
             )),
         };
@@ -852,18 +992,11 @@ impl Render for FujiApp {
                 .into_any_element()
         };
 
-        root.child(
-            body.child(
-                div()
-                    .flex()
-                    .size_full()
-                    .child(self.render_sidebar(&account, width, cx))
-                    .child(div().flex_1().min_w_0().h_full().child(content))
-                    .with_animation("main-fade-in", anim::ease(anim::NORMAL), |el, t| {
-                        el.opacity(t)
-                    }),
-            ),
-        )
+        root.child(body.child(div().size_full().child(content).with_animation(
+            "main-fade-in",
+            anim::ease(anim::NORMAL),
+            |el, t| el.opacity(t),
+        )))
     }
 }
 
@@ -906,12 +1039,13 @@ fn resuming() -> impl IntoElement {
         .justify_center()
         .text_color(theme::text_muted())
         .text_sm()
-        .child("Signing in\u{2026}")
-        .with_animation(
-            "resuming-pulse",
-            Animation::new(Duration::from_millis(1100))
-                .repeat()
-                .with_easing(bounce(ease_in_out)),
-            |el, t| el.opacity(0.4 + 0.6 * t),
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(12.))
+                .child(ui::spinner("resuming", px(22.), theme::text_muted()))
+                .child("Signing in\u{2026}"),
         )
 }

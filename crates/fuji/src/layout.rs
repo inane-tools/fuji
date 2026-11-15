@@ -365,6 +365,7 @@ mod tests {
             aspect,
             kind: Kind::Photo,
             favorite: false,
+            name: None,
         }
     }
 

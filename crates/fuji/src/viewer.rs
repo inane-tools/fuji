@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 
 use fuji_icloud::{Asset, AssetId, AssetKind, PhotosClient, Resource};
 use gpui::{
-    Animation, AnimationExt as _, App, Bounds, Context, CursorStyle, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollWheelEvent, Subscription,
-    WeakEntity, Window, actions, bounce, canvas, div, ease_in_out, img, prelude::*, px,
+    AnimationExt as _, App, Bounds, Context, CursorStyle, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ObjectFit, Pixels, Point, ScrollDelta, ScrollWheelEvent, Subscription, WeakEntity, Window,
+    actions, canvas, div, img, prelude::*, px,
 };
 
 use crate::anim::{self, Eased};
@@ -730,13 +730,18 @@ impl Render for Viewer {
                         .flex()
                         .justify_center()
                         .child(
-                            pill("Loading\u{2026}").with_animation(
-                                "preview-loading",
-                                Animation::new(Duration::from_millis(1100))
-                                    .repeat()
-                                    .with_easing(bounce(ease_in_out)),
-                                |el, t| el.opacity(0.4 + 0.6 * t),
-                            ),
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .bg(gpui::black().opacity(0.6))
+                                .text_xs()
+                                .text_color(gpui::white())
+                                .child(ui::loading_status(
+                                    "preview-loading",
+                                    "Loading\u{2026}",
+                                    gpui::white(),
+                                )),
                         ),
                 )
             })

@@ -3,6 +3,7 @@
 mod anim;
 mod app;
 mod assets;
+mod device_search;
 mod export;
 mod grid;
 mod image_cache;
@@ -11,8 +12,10 @@ mod input;
 mod layout;
 mod login;
 mod net;
+mod passkey;
 mod platform;
 mod scrubber;
+mod search;
 mod session_store;
 mod settings;
 mod theme;
@@ -39,13 +42,14 @@ fn main() {
             input::bind_keys(cx);
             grid::bind_keys(cx);
             viewer::bind_keys(cx);
+            app::bind_keys(cx);
 
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("fuji".into()),
+                        title: Some("Fuji".into()),
                         // fuji draws its own title bar where it can.
                         appears_transparent: titlebar::CUSTOM,
                         ..Default::default()

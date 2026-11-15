@@ -10,7 +10,7 @@ pub const FONT: &str = "Gabarito";
 pub fn surface() -> Hsla {
     rgb(0x050505).into()
 }
-pub fn sidebar() -> Hsla {
+pub fn panel() -> Hsla {
     rgb(0x0c0c0c).into()
 }
 pub fn popover() -> Hsla {
@@ -90,8 +90,5 @@ pub const RADIUS_TILE: Pixels = px(6.);
 pub const RADIUS_DIALOG: Pixels = px(16.);
 
 // Layout
-pub const SIDEBAR_WIDTH: Pixels = px(232.);
-/// The sidebar as a strip of icons.
-pub const SIDEBAR_COMPACT_WIDTH: Pixels = px(60.);
 pub const CONTENT_PADDING: f32 = 24.;
 pub const CONTROL_HEIGHT: Pixels = px(32.);

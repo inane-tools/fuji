@@ -4,11 +4,11 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, ClickEvent, ElementId, FontWeight, ObjectFit, Pixels, Point,
-    SharedString, Window, anchored, bounce, deferred, div, ease_in_out, img, prelude::*, px,
+    Animation, AnimationExt as _, App, ClickEvent, ElementId, FontWeight, Hsla, ObjectFit, Pixels,
+    Point, SharedString, Transformation, Window, anchored, deferred, div, img, percentage,
+    prelude::*, px,
 };
 
 use crate::anim;
@@ -188,6 +188,36 @@ fn initials(name: &str) -> String {
         .collect()
 }
 
+// ---- Spinner ----------------------------------------------------------------
+
+/// A turning arc: something is loading. Still when motion is reduced.
+pub fn spinner(id: impl Into<ElementId>, size: Pixels, color: Hsla) -> gpui::AnyElement {
+    let arc = icon("spinner", size, color);
+    if anim::reduced() {
+        return arc.into_any_element();
+    }
+    arc.with_animation(
+        id,
+        Animation::new(std::time::Duration::from_millis(800)).repeat(),
+        |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
+    )
+    .into_any_element()
+}
+
+/// A spinner and a short text, side by side: a loading status.
+pub fn loading_status(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    color: Hsla,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(7.))
+        .child(spinner(id, px(13.), color))
+        .child(text.into())
+}
+
 // ---- Context menu -----------------------------------------------------------
 
 pub struct MenuItem {
@@ -321,14 +351,7 @@ pub fn toast(serial: u64, status: Status) -> impl IntoElement {
     let content = match status {
         Status::Working(text) => div()
             .text_color(theme::text_title())
-            .child(text)
-            .with_animation(
-                "toast-pulse",
-                Animation::new(Duration::from_millis(1100))
-                    .repeat()
-                    .with_easing(bounce(ease_in_out)),
-                |el, t| el.opacity(0.5 + 0.5 * t),
-            )
+            .child(loading_status("toast-working", text, theme::text_muted()))
             .into_any_element(),
         Status::Done { message, reveal } => div()
             .flex()

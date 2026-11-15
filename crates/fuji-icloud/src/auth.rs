@@ -44,7 +44,7 @@ pub enum AuthError {
     InvalidCode,
     #[error("This Apple ID is locked. Unlock it at iforgot.apple.com, then try again.")]
     Locked,
-    #[error("Apple requires this account to use {0}, which fuji doesn't support yet.")]
+    #[error("Apple requires this account to use {0}, which Fuji doesn't support yet.")]
     WrongDomain(String),
     #[error("Your saved session has expired. Sign in again.")]
     SessionExpired,
@@ -54,6 +54,9 @@ pub enum AuthError {
     Network(#[from] ureq::Error),
     #[error("Apple returned an error ({status}): {message}")]
     Unexpected { status: u16, message: String },
+    /// Approval on a device didn't go through; the message says why.
+    #[error("{0}")]
+    Bridge(String),
 }
 
 /// The tokens worth keeping between runs. Store them in the OS keychain.
@@ -262,14 +265,20 @@ impl AuthClient {
         // SRP step 2: prove we know the password.
         let key = srp::derive_password_key(password, &salt, init.iteration, protocol);
         let proof = srp.process_challenge(&apple_id, &key, &salt, &server_public)?;
-        let trust_tokens: Vec<String> = self
-            .state
-            .lock()
-            .unwrap()
-            .trust_token
-            .iter()
-            .cloned()
-            .collect();
+        // FUJI_NO_TRUST=1 signs in as if on a new machine, so Apple asks for
+        // two-factor (for studying that page; see docs/skybridge.md).
+        let trust_tokens: Vec<String> = if std::env::var_os("FUJI_NO_TRUST").is_some() {
+            debug("sign-in: FUJI_NO_TRUST set, not sending the trust token");
+            Vec::new()
+        } else {
+            self.state
+                .lock()
+                .unwrap()
+                .trust_token
+                .iter()
+                .cloned()
+                .collect()
+        };
         let complete_body = json!({
             "accountName": apple_id,
             "c": init.c,
@@ -288,14 +297,13 @@ impl AuthClient {
             )
             .send_json(&complete_body)?;
         self.capture(&resp);
+        debug(&format!("signin/complete: {}", resp.status().as_u16()));
 
         match resp.status().as_u16() {
             200 => self.account_login(),
-            409 => {
-                // Two-factor needed. Ask Apple to push a code to trusted devices.
-                self.request_device_code()?;
-                Ok(SignInStep::NeedsCode)
-            }
+            // Two-factor needed. The caller starts approval on a device
+            // (`start_bridge`), or asks for a code (`request_device_code`).
+            409 => Ok(SignInStep::NeedsCode),
             412 => {
                 // Account needs a "repair" acknowledgement (no 2FA on it).
                 let mut resp = self
@@ -347,6 +355,20 @@ impl AuthClient {
         self.trust_and_login()
     }
 
+    /// The two-factor page's settings for approval on a device ("bridge"),
+    /// if Apple offers it for this sign-in.
+    pub fn bridge_config(&self) -> Result<Option<BridgeConfig>, AuthError> {
+        let mut resp = self
+            .auth_headers(self.agent.get(AUTH_ENDPOINT), false, "text/html")
+            .call()?;
+        self.capture(&resp);
+        if !resp.status().is_success() {
+            return Err(unexpected(resp.status().as_u16(), &mut resp));
+        }
+        let html = resp.body_mut().read_to_string()?;
+        Ok(parse_bridge_config(&html))
+    }
+
     /// Phone numbers that can get a code by text message.
     pub fn trusted_phones(&self) -> Result<Vec<TrustedPhone>, AuthError> {
         let mut resp = self
@@ -393,6 +415,77 @@ impl AuthClient {
         self.capture(&resp);
         check_code_response(&mut resp)?;
         self.trust_and_login()
+    }
+
+    pub(crate) fn set_apple_id(&self, apple_id: &str) {
+        self.state.lock().unwrap().apple_id = apple_id.to_string();
+    }
+
+    /// POST JSON to `idmsa.apple.com/appleauth/auth/<path>` and read the JSON
+    /// answer (`null` if there's no body).
+    pub(crate) fn auth_post(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Value, AuthError> {
+        let mut req = self.agent.post(format!("{AUTH_ENDPOINT}/{path}"));
+        for (key, value) in query {
+            req = req.query(*key, *value);
+        }
+        let mut resp = self.auth_headers(req, true, JSON_ACCEPT).send_json(body)?;
+        self.capture(&resp);
+        let status = resp.status().as_u16();
+        debug(&format!("{path}: {status}"));
+        match status {
+            200..=299 => {
+                let text = resp.body_mut().read_to_string().unwrap_or_default();
+                Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+            }
+            401 => Err(AuthError::InvalidCredentials),
+            403 => Err(AuthError::Locked),
+            status => Err(unexpected(status, &mut resp)),
+        }
+    }
+
+    /// POST JSON to `idmsa.apple.com/appleauth/auth/<path>`; only the status.
+    pub(crate) fn bridge_post_status(&self, path: &str, body: &Value) -> Result<u16, AuthError> {
+        let mut resp = self
+            .auth_headers(
+                self.agent.post(format!("{AUTH_ENDPOINT}/{path}")),
+                true,
+                JSON_ACCEPT,
+            )
+            .send_json(body)?;
+        self.capture(&resp);
+        let status = resp.status().as_u16();
+        debug(&format!("{path}: {status}"));
+        if status == 401 {
+            return Err(AuthError::SessionExpired);
+        }
+        let _ = resp.body_mut().read_to_string();
+        Ok(status)
+    }
+
+    /// After approval on a device: trust this machine and log in to iCloud,
+    /// as after a typed code.
+    pub(crate) fn after_bridge(&self) -> Result<SignInStep, AuthError> {
+        self.trust_and_login().map(SignInStep::Done)
+    }
+
+    /// After a passkey sign-in: a passkey is two factors in one, so trust
+    /// this machine and log in to iCloud.
+    pub(crate) fn after_passkey(&self) -> Result<SignInStep, AuthError> {
+        let resp = self
+            .auth_headers(
+                self.agent.get(format!("{AUTH_ENDPOINT}/2sv/trust")),
+                false,
+                JSON_ACCEPT,
+            )
+            .call()?;
+        self.capture(&resp);
+        debug(&format!("passkey: trust {}", resp.status().as_u16()));
+        self.account_login()
     }
 
     /// Mark this machine as trusted, then finish signing in to iCloud.
@@ -680,6 +773,77 @@ fn parse_trusted_phones(html: &str) -> Vec<TrustedPhone> {
         .unwrap_or_default()
 }
 
+/// What the two-factor page says about Apple's newer approval ("bridge"):
+/// the scripts the widget loads for it and the push channel it listens on.
+/// See `docs/skybridge.md`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BridgeConfig {
+    /// The push client script (`AppleID.service.bridge.APNS`).
+    pub push_script: Option<String>,
+    /// The key exchange worker script.
+    pub prover_script: Option<String>,
+    pub apns_environment: Option<String>,
+    pub apns_topic: Option<String>,
+}
+
+/// A script URL from a value that may be a whole `<script src=...>` tag.
+fn script_src(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.find("src=") {
+        Some(i) => {
+            let rest = &value[i + 4..];
+            let quote = rest.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                let end = rest[1..].find(quote)?;
+                Some(rest[1..1 + end].to_string())
+            } else {
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || c == '>')
+                    .unwrap_or(rest.len());
+                Some(rest[..end].to_string())
+            }
+        }
+        None => Some(value.to_string()),
+    }
+}
+
+fn parse_bridge_config(html: &str) -> Option<BridgeConfig> {
+    let v: Value = serde_json::from_str(boot_args(html)?).ok()?;
+    let boot = &v["direct"];
+    let initiate = &boot["twoSV"]["bridgeInitiateData"];
+    let text = |v: &Value| v.as_str().map(str::to_string).filter(|s| !s.is_empty());
+    let config = BridgeConfig {
+        push_script: boot["bridge"]["bridgeScriptTag"]
+            .as_str()
+            .and_then(script_src),
+        prover_script: boot["bridge"]["proverWorkerScriptTag"]
+            .as_str()
+            .and_then(script_src),
+        apns_environment: text(&initiate["apnsEnvironment"]),
+        apns_topic: text(&initiate["apnsTopic"]),
+    };
+    if debug_enabled() {
+        let keys = |v: &Value| {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_default()
+        };
+        debug(&format!("bridge: boot keys [{}]", keys(boot)));
+        debug(&format!("bridge: bridge keys [{}]", keys(&boot["bridge"])));
+        debug(&format!("bridge: twoSV keys [{}]", keys(&boot["twoSV"])));
+        debug(&format!("bridge: initiate keys [{}]", keys(initiate)));
+        debug(&format!("bridge: {config:?}"));
+    }
+    (config != BridgeConfig::default()).then_some(config)
+}
+
+fn debug_enabled() -> bool {
+    std::env::var_os("FUJI_DEBUG").is_some()
+}
+
 fn boot_args(html: &str) -> Option<&str> {
     let marker = html.find("class=\"boot_args\"")?;
     let tag_start = html[..marker].rfind("<script")?;
@@ -734,6 +898,21 @@ mod tests {
         assert_eq!(phones.len(), 2);
         assert_eq!(phones[0].id, 1);
         assert_eq!(phones[1].number, "+44 ••••• ••••34");
+    }
+
+    #[test]
+    fn reads_bridge_config() {
+        let html = r#"<script type="application/json" class="boot_args">
+            {"direct":{"bridge":{"bridgeScriptTag":"<script src=\"https://cdn.example/b.js\"><\/script>",
+            "proverWorkerScriptTag":"https://cdn.example/p.js"},
+            "twoSV":{"bridgeInitiateData":{"apnsEnvironment":"PROD","apnsTopic":"com.example.topic"}}}}
+            </script>"#;
+        let c = parse_bridge_config(html).unwrap();
+        assert_eq!(c.push_script.as_deref(), Some("https://cdn.example/b.js"));
+        assert_eq!(c.prover_script.as_deref(), Some("https://cdn.example/p.js"));
+        assert_eq!(c.apns_environment.as_deref(), Some("PROD"));
+        assert_eq!(c.apns_topic.as_deref(), Some("com.example.topic"));
+        assert_eq!(parse_bridge_config("<html></html>"), None);
     }
 
     #[test]

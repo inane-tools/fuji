@@ -70,6 +70,8 @@ pub struct TextInput {
     placeholder: SharedString,
     masked: bool,
     disabled: bool,
+    /// A shorter field with this icon before the text, for toolbars.
+    compact_icon: Option<&'static str>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -88,6 +90,7 @@ impl TextInput {
             placeholder: placeholder.into(),
             masked: false,
             disabled: false,
+            compact_icon: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -100,6 +103,12 @@ impl TextInput {
     /// Show bullets instead of the text, and block copying it.
     pub fn masked(mut self) -> Self {
         self.masked = true;
+        self
+    }
+
+    /// A 28 px field led by `icon`, to sit in the title bar.
+    pub fn compact(mut self, icon: &'static str) -> Self {
+        self.compact_icon = Some(icon);
         self
     }
 
@@ -702,8 +711,13 @@ impl Render for TextInput {
             // Field recipe: quiet border and fill; focus turns the border to
             // the accent.
             .w_full()
-            .h(px(36.))
-            .px(px(12.))
+            .h(px(if self.compact_icon.is_some() {
+                28.
+            } else {
+                36.
+            }))
+            .px(px(if self.compact_icon.is_some() { 9. } else { 12. }))
+            .gap(px(7.))
             .rounded(theme::RADIUS_CONTROL)
             .bg(theme::field())
             .border_1()
@@ -715,7 +729,15 @@ impl Render for TextInput {
             .when(self.disabled, |el| el.opacity(0.5))
             .text_size(px(13.))
             .line_height(px(18.))
-            .child(TextElement { input: cx.entity() })
+            .when_some(self.compact_icon, |el, name| {
+                el.child(crate::assets::icon(name, px(14.), theme::text_meta()))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(TextElement { input: cx.entity() }),
+            )
     }
 }
 

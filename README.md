@@ -1,9 +1,9 @@
-# fuji
+# Fuji
 
 A native desktop client for **iCloud Photos** (Apple Photos) on Windows and Linux.
 
 Apple ships Photos only for Apple platforms. On Windows the official option is
-"iCloud for Windows", which only syncs to a folder, and Linux has nothing. fuji
+"iCloud for Windows", which only syncs to a folder, and Linux has nothing. Fuji
 aims to be a real photo-library app: browse, search, view, download, and upload
 your iCloud library without a Mac.
 
@@ -33,7 +33,7 @@ Not yet: video playback, albums, shared albums, editing, HEIC decoding for
 originals that have no JPEG rendition.
 
 `cargo test -p fuji-icloud -- --ignored` runs a live check that Apple accepts
-fuji's sign-in request (it uses a made-up address, not your account).
+Fuji's sign-in request (it uses a made-up address, not your account).
 
 ## Stack
 
@@ -82,7 +82,7 @@ If that happens, set `CARGO_TARGET_DIR` to a short folder such as `C:\t\fuji`.
 
 ## How it talks to iCloud
 
-Apple has no public API for iCloud Photos. fuji will use the same private web
+Apple has no public API for iCloud Photos. Fuji will use the same private web
 endpoints that icloud.com uses (CloudKit-backed, reached after Apple ID SRP
 sign-in and 2FA). Open-source projects such as `pyicloud` and `icloudpd` have
 documented much of this. Because the API is private, Apple can change it at any
@@ -107,5 +107,5 @@ Notes:
 
 ## Disclaimer
 
-fuji is not affiliated with or endorsed by Apple. "Apple", "iCloud", and
+Fuji is not affiliated with or endorsed by Apple. "Apple", "iCloud", and
 "Apple Photos" are trademarks of Apple Inc.
