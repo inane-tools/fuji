@@ -31,7 +31,7 @@ use crate::assets::icon;
 use crate::grid::PhotoGrid;
 use crate::image_cache::LruImageCache;
 use crate::zoom::{Geometry, View};
-use crate::{net, theme, thumbs, ui};
+use crate::{net, theme, thumbs, titlebar, ui};
 
 actions!(
     viewer,
@@ -52,6 +52,14 @@ const SLIDE: f32 = 56.;
 const DRAG_THRESHOLD: f32 = 6.;
 /// Space around the image when it fits.
 const MARGIN: f32 = 16.;
+/// The viewer's own bar, under the app's title bar.
+const BAR_ROW: f32 = 52.;
+/// How close to the bottom the pointer brings up the filmstrip.
+const STRIP_ZONE: f32 = 150.;
+/// Filmstrip thumbnails: size, gap, and how many each side of the photo.
+const STRIP_THUMB: f32 = 46.;
+const STRIP_GAP: f32 = 3.;
+const STRIP_REACH: usize = 20;
 /// Zoom step for one wheel notch or key press.
 const ZOOM_STEP: f32 = 1.25;
 /// How quickly zoom eases to its target (higher is snappier).
@@ -107,6 +115,10 @@ pub struct Viewer {
     /// 1 or -1 down to 0 after stepping to the next or previous photo.
     slide: Eased,
     closing: bool,
+    /// The info panel is open.
+    info_open: bool,
+    /// The pointer is near the bottom: show the filmstrip.
+    strip_shown: bool,
 }
 
 struct Drag {
@@ -159,6 +171,8 @@ impl Viewer {
             },
             slide: Eased::new(0.),
             closing: false,
+            info_open: false,
+            strip_shown: false,
         };
         // The grid is mid-update while it creates us; read it once it's done.
         let this = cx.weak_entity();
@@ -259,7 +273,33 @@ impl Viewer {
         self.drag = None;
         self.press = None;
         self.load_around(cx);
+        if self.strip_shown {
+            self.want_strip_thumbnails(cx);
+        }
         cx.notify();
+    }
+
+    /// The filmstrip's range of photos around the current one.
+    fn strip_range(&self, cx: &App) -> std::ops::Range<usize> {
+        let count = self.count(cx);
+        self.index.saturating_sub(STRIP_REACH)..(self.index + STRIP_REACH + 1).min(count)
+    }
+
+    fn want_strip_thumbnails(&mut self, cx: &mut Context<Self>) {
+        let wanted: Vec<usize> = self.strip_range(cx).collect();
+        if let Some(grid) = self.grid.upgrade() {
+            grid.update(cx, |grid, cx| grid.want_thumbnails(wanted, cx));
+        }
+    }
+
+    fn set_strip_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if self.strip_shown != shown {
+            self.strip_shown = shown;
+            if shown {
+                self.want_strip_thumbnails(cx);
+            }
+            cx.notify();
+        }
     }
 
     /// Layout of the current image in the stage, once the stage has been laid out.
@@ -383,6 +423,12 @@ impl Viewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Near the bottom (and not dragging), the filmstrip comes up.
+        if let Some(bounds) = self.stage_bounds.get() {
+            let near = f32::from(bounds.bottom() - event.position.y) < STRIP_ZONE
+                && event.pressed_button.is_none();
+            self.set_strip_shown(near, cx);
+        }
         if let Some(start) = self.press {
             let moved = event.position - start;
             if event.pressed_button != Some(MouseButton::Left) {
@@ -533,13 +579,16 @@ impl Viewer {
             group_digits(count)
         );
 
-        div()
+        let info_open = self.info_open;
+        let row = div()
             .flex()
             .items_center()
             .gap_4()
-            .h(px(52.))
-            .px_4()
-            .flex_none()
+            .h(px(BAR_ROW))
+            // The close button's icon sits under the app's mark, the
+            // position under the window's right edge padding.
+            .pl(px(7.))
+            .pr(px(14.))
             .text_sm()
             .child(ui::icon_button(
                 "close",
@@ -594,13 +643,183 @@ impl Viewer {
                 cx.listener(|this, _, _, cx| this.download_current(cx)),
             ))
             .child(
+                ui::icon_button(
+                    "info",
+                    if info_open { "info-active" } else { "info" },
+                    cx.listener(|this, _, _, cx| {
+                        this.info_open = !this.info_open;
+                        cx.notify();
+                    }),
+                )
+                .when(info_open, |el| el.bg(theme::fill())),
+            )
+            .child(
                 div()
-                    .min_w(px(96.))
+                    .min_w(px(80.))
                     .text_right()
                     .text_size(px(12.))
-                    .text_color(theme::text_meta())
+                    .text_color(theme::text_muted())
                     .child(position),
+            );
+
+        // From the window's top: black behind the app's bar and this one,
+        // fading out below them.
+        let bar = f32::from(titlebar::HEIGHT);
+        let height = bar + BAR_ROW + 36.;
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(height))
+            .pt(titlebar::HEIGHT)
+            .bg(gpui::linear_gradient(
+                180.,
+                gpui::linear_color_stop(gpui::black().opacity(0.9), (bar + BAR_ROW - 8.) / height),
+                gpui::linear_color_stop(gpui::black().opacity(0.), 1.),
+            ))
+            .child(row)
+    }
+
+    /// Details of the photo, in a panel on the right.
+    fn render_info(&self, asset: &Asset) -> impl IntoElement + use<> {
+        let mut rows: Vec<(&'static str, String)> = Vec::new();
+        if let Some(name) = &asset.filename {
+            rows.push(("Name", name.clone()));
+        }
+        if let Some(date) = format_long_date(asset.created_at_ms) {
+            rows.push(("Taken", date));
+        }
+        rows.push((
+            "Kind",
+            match asset.kind {
+                AssetKind::Photo => "Photo".to_string(),
+                AssetKind::LivePhoto => "Live Photo".to_string(),
+                AssetKind::Video { duration_secs } => {
+                    format!("Video, {}:{:02}", duration_secs / 60, duration_secs % 60)
+                }
+            },
+        ));
+        if asset.width > 0 && asset.height > 0 {
+            let megapixels = asset.width as f32 * asset.height as f32 / 1_000_000.;
+            rows.push((
+                "Size",
+                format!(
+                    "{} \u{00d7} {} \u{00b7} {megapixels:.1} MP",
+                    asset.width, asset.height
+                ),
+            ));
+        }
+        if let Some(original) = &asset.original {
+            if original.size > 0 {
+                rows.push(("File", format_file_size(original.size)));
+            }
+            if let Some(format) = format_name(&original.file_type) {
+                rows.push(("Format", format));
+            }
+        }
+        if asset.favorite {
+            rows.push(("Favorite", "Yes".to_string()));
+        }
+
+        div()
+            .id("viewer-info")
+            .occlude()
+            .absolute()
+            .top(titlebar::HEIGHT + px(BAR_ROW + 4.))
+            .right(px(14.))
+            .w(px(280.))
+            .p(px(16.))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .rounded(px(16.))
+            .bg(theme::popover())
+            .border_1()
+            .border_color(theme::line())
+            .shadow_lg()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child("Info"),
             )
+            .children(rows.into_iter().map(|(label, value)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_meta())
+                            .child(label),
+                    )
+                    .child(div().text_color(theme::text_title()).child(value))
+            }))
+            .with_animation("viewer-info-open", anim::ease(anim::FAST), |el, t| {
+                el.opacity(t)
+            })
+    }
+
+    /// Thumbnails of the photos around this one, along the bottom; click
+    /// one to go to it. The current one sits in the middle.
+    fn render_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let grid = self.grid.upgrade()?;
+        let width = f32::from(self.stage_bounds.get()?.size.width);
+        let middle = width / 2.;
+        let step = STRIP_THUMB + STRIP_GAP;
+        let current = self.index;
+        let thumbs: Vec<_> = self
+            .strip_range(cx)
+            .map(|i| {
+                let grid = grid.read(cx);
+                let path = grid.asset(i).and_then(|a| grid.thumbnail_path(&a.id));
+                (i, path)
+            })
+            .collect();
+        let row_top = 26.;
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(row_top + STRIP_THUMB + 26.))
+                .bg(gpui::linear_gradient(
+                    0.,
+                    gpui::linear_color_stop(gpui::black().opacity(0.8), 0.),
+                    gpui::linear_color_stop(gpui::black().opacity(0.), 1.),
+                ))
+                .children(thumbs.into_iter().map(|(i, path)| {
+                    let offset = i as f32 - current as f32;
+                    let this = i == current;
+                    let size = if this { STRIP_THUMB + 8. } else { STRIP_THUMB };
+                    let x = middle + offset * step + offset.signum() * 4. - size / 2.;
+                    div()
+                        .id(ElementId::NamedInteger("strip".into(), i as u64))
+                        .occlude()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(row_top - if this { 4. } else { 0. }))
+                        .size(px(size))
+                        .rounded(px(6.))
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .bg(theme::placeholder())
+                        .when(this, |el| el.border_2().border_color(gpui::white()))
+                        .when(!this, |el| el.opacity(0.75).hover(|el| el.opacity(1.)))
+                        .when_some(path, |el, path| {
+                            el.child(img(path).size_full().object_fit(ObjectFit::Cover))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.go_to(i, cx)))
+                }))
+                .with_animation("viewer-strip", anim::ease(anim::FAST), |el, t| {
+                    el.opacity(t)
+                }),
+        )
     }
 }
 
@@ -665,11 +884,22 @@ impl Render for Viewer {
         };
         let bounds_cell = self.stage_bounds.clone();
 
+        let info = self
+            .info_open
+            .then(|| asset.as_ref().map(|a| self.render_info(a)))
+            .flatten();
+        let strip = if self.strip_shown && !zoomed {
+            self.render_strip(cx)
+        } else {
+            None
+        };
         let stage = div()
             .image_cache(self.image_cache.clone())
             .id("viewer-stage")
-            .flex_1()
-            .relative()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
             .overflow_hidden()
             .bg(gpui::black())
             .when(zoomed, |el| {
@@ -683,6 +913,11 @@ impl Render for Viewer {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::open_menu))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered {
+                    this.set_strip_shown(false, cx);
+                }
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.end_drag(cx)),
@@ -724,7 +959,7 @@ impl Render for Viewer {
                 el.child(
                     div()
                         .absolute()
-                        .bottom_4()
+                        .bottom(px(STRIP_ZONE / 2.))
                         .left_0()
                         .right_0()
                         .flex()
@@ -789,12 +1024,12 @@ impl Render for Viewer {
             .occlude()
             .absolute()
             .inset_0()
-            .flex()
-            .flex_col()
             .bg(gpui::black())
             .text_color(theme::text())
-            .child(top_bar)
             .child(stage)
+            .children(strip)
+            .child(top_bar)
+            .children(info)
             .with_animation(
                 if closing {
                     "viewer-close"
@@ -844,6 +1079,47 @@ fn format_date(ms: i64) -> Option<String> {
         .ok()?
         .to_zoned(jiff::tz::TimeZone::system());
     Some(zoned.strftime("%-d %b %Y, %H:%M").to_string())
+}
+
+/// "Sunday 1 November 2026 at 14:32".
+fn format_long_date(ms: i64) -> Option<String> {
+    if ms <= 0 {
+        return None;
+    }
+    let zoned = jiff::Timestamp::from_millisecond(ms)
+        .ok()?
+        .to_zoned(jiff::tz::TimeZone::system());
+    Some(zoned.strftime("%A %-d %B %Y at %H:%M").to_string())
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.;
+    let b = bytes as f64;
+    if b >= KB * KB * KB {
+        format!("{:.2} GB", b / (KB * KB * KB))
+    } else if b >= KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else {
+        format!("{:.0} KB", (b / KB).max(1.))
+    }
+}
+
+/// A file type's everyday name, from its uniform type identifier.
+fn format_name(uti: &str) -> Option<String> {
+    let name = match uti {
+        "" => return None,
+        "public.jpeg" => "JPEG",
+        "public.heic" => "HEIC",
+        "public.heif" => "HEIF",
+        "public.png" => "PNG",
+        "com.compuserve.gif" => "GIF",
+        "public.tiff" => "TIFF",
+        "com.adobe.raw-image" => "DNG",
+        "com.apple.quicktime-movie" => "QuickTime movie",
+        "public.mpeg-4" => "MPEG-4 video",
+        other => return other.rsplit('.').next().map(|s| s.to_uppercase()),
+    };
+    Some(name.to_string())
 }
 
 fn group_digits(n: usize) -> String {
@@ -910,6 +1186,15 @@ fn edge_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn info_formats() {
+        assert_eq!(format_file_size(2_400_000), "2.3 MB");
+        assert_eq!(format_file_size(10), "1 KB");
+        assert_eq!(format_name("public.heic").as_deref(), Some("HEIC"));
+        assert_eq!(format_name("org.webmproject.webp").as_deref(), Some("WEBP"));
+        assert_eq!(format_name(""), None);
+    }
 
     #[test]
     fn digits_are_grouped() {

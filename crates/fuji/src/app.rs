@@ -875,6 +875,7 @@ impl FujiApp {
     /// sign-in only the mark and the buttons.
     fn render_bar(
         &mut self,
+        overlay: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -1005,7 +1006,7 @@ impl FujiApp {
             .items_center()
             .h(titlebar::HEIGHT)
             .w_full()
-            .bg(theme::surface())
+            .when(!overlay, |el| el.bg(theme::surface()))
             .child(self.measured(BAR_KEY))
             .children(pill)
             .child(brand)
@@ -1030,13 +1031,20 @@ impl Render for FujiApp {
             .text_color(theme::text())
             .on_action(cx.listener(Self::focus_search));
         let main = matches!(self.screen, Screen::Main { .. });
+        // Over the gallery the bar is see-through: the photos run under it
+        // and the gallery's header shades it.
+        let overlay = matches!(self.screen, Screen::Main { grid: Some(_), .. })
+            && self.section_album(self.section).is_some();
+        let mut bar = (titlebar::CUSTOM || main).then(|| self.render_bar(overlay, window, cx));
         let root = root
-            .when(titlebar::CUSTOM || main, |el| {
-                el.child(self.render_bar(window, cx))
-            })
             .children(self.render_albums_menu(cx))
             .children(self.render_account_menu(cx));
         let body = div().flex_1().min_h_0();
+        let root = if overlay {
+            root.relative()
+        } else {
+            root.children(bar.take())
+        };
 
         let (grid, settings) = match &self.screen {
             Screen::Resuming => return root.child(body.child(resuming())),
@@ -1083,6 +1091,7 @@ impl Render for FujiApp {
             anim::ease(anim::NORMAL),
             |el, t| el.opacity(t),
         )))
+        .children(bar.map(|bar| div().absolute().top_0().left_0().right_0().child(bar)))
     }
 }
 

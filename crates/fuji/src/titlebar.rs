@@ -16,7 +16,8 @@ use gpui::{
 
 use crate::theme;
 
-pub const HEIGHT: Pixels = px(36.);
+pub const HEIGHT_PX: f32 = 36.;
+pub const HEIGHT: Pixels = px(HEIGHT_PX);
 const BUTTON_WIDTH: Pixels = px(46.);
 /// The caption-button icons of Windows 11, and of Windows 10 as a fallback.
 const ICON_FONT: &str = "Segoe Fluent Icons";

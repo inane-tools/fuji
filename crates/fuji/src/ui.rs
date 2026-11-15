@@ -219,6 +219,33 @@ pub fn loading_status(
         .child(text.into())
 }
 
+// ---- Tooltip ----------------------------------------------------------------
+
+struct Tooltip(SharedString);
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(8.))
+            .bg(theme::popover())
+            .border_1()
+            .border_color(theme::line())
+            .shadow_md()
+            .font_family(theme::FONT)
+            .text_size(px(12.))
+            .text_color(theme::text_title())
+            .child(self.0.clone())
+    }
+}
+
+/// For `.tooltip(...)`: a small label that shows on hover.
+pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+    let text = text.into();
+    move |_, cx| cx.new(|_| Tooltip(text.clone())).into()
+}
+
 // ---- Slider -----------------------------------------------------------------
 
 type SliderHandler = Rc<dyn Fn(f32, &mut Window, &mut App)>;

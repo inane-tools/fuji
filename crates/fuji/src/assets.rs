@@ -4,7 +4,8 @@
 //! drawn to match Apple's SF Symbols: outline when idle, fill when active.
 //! The Live Photo mark is Phosphor (MIT, assets/icons/LICENSE-phosphor) and
 //! the spinner is drawn for Fuji. The UI font, Hanken Grotesk, is under the
-//! OFL (assets/OFL-HankenGrotesk.txt).
+//! OFL (assets/OFL-HankenGrotesk.txt), with its letter spacing tightened by
+//! 2% of an em (scripts/track_font.py), since GPUI can't set tracking.
 
 use std::borrow::Cow;
 
@@ -61,6 +62,9 @@ impl AssetSource for Assets {
                 "select",
                 "upload",
                 "person",
+                "sync",
+                "info",
+                "info-active",
             ]
         );
         Ok(bytes.map(Cow::Borrowed))

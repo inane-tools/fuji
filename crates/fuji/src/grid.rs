@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 
 use fuji_icloud::{Album, Asset, AssetId, PhotosClient, PhotosError, Resource};
 use gpui::{
-    AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Subscription, Window, actions, div, img, point, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Subscription, Transformation, Window, actions, div, img, percentage, point,
+    prelude::*, px,
 };
 use jiff::civil::Date;
 
@@ -38,7 +39,7 @@ use crate::settings::{self, Settings};
 use crate::transfer::PendingUpload;
 use crate::ui::{self, MenuItem, Status};
 use crate::viewer::{Viewer, ViewerEvent};
-use crate::{net, theme, thumbs};
+use crate::{net, theme, thumbs, titlebar};
 
 actions!(
     gallery,
@@ -104,8 +105,12 @@ const FLYING_VIEWPORTS: f32 = 1.5;
 /// The strip on the right holding the timeline scrubber.
 const SCRUBBER_WIDTH: f32 = 48.;
 const SCRUBBER_INSET: f32 = 14.;
-/// The header floats over the top of the mosaic, which starts below it.
-const HEADER_SPACE: f32 = 88.;
+/// The gallery runs under the app's title bar; its header floats over the
+/// top of the mosaic, which starts below both.
+const BAR: f32 = titlebar::HEIGHT_PX;
+const HEADER_SPACE: f32 = BAR + 92.;
+/// The scrubber's track starts below the header.
+const SCRUBBER_TOP: f32 = HEADER_SPACE;
 /// How long the scrubber's date stays up after scrolling.
 const SCRUBBER_LINGER: Duration = Duration::from_millis(900);
 /// How far the pointer moves with the button down before a drag starts.
@@ -256,6 +261,8 @@ pub struct PhotoGrid {
     // Thumbnails.
     disk_thumbs: Option<Arc<HashSet<String>>>,
     thumbs_ready: HashMap<AssetId, Arc<Path>>,
+    /// Items whose thumbnails the viewer's filmstrip wants, besides those on screen.
+    wanted_thumbs: Vec<usize>,
     thumbs_failed: HashSet<AssetId>,
     thumbs_in_flight: HashSet<AssetId>,
     /// Thumbnails to fetch, highest priority last.
@@ -358,6 +365,7 @@ impl PhotoGrid {
             pages_in_flight: 0,
             disk_thumbs: None,
             thumbs_ready: HashMap::new(),
+            wanted_thumbs: Vec::new(),
             thumbs_failed: HashSet::new(),
             thumbs_in_flight: HashSet::new(),
             thumb_queue: Vec::new(),
@@ -907,13 +915,20 @@ impl PhotoGrid {
         name.to_str().is_some_and(|n| names.contains(n))
     }
 
+    /// Fetch these items' thumbnails too (the viewer's filmstrip).
+    pub(crate) fn want_thumbnails(&mut self, indices: Vec<usize>, cx: &mut Context<Self>) {
+        self.wanted_thumbs = indices;
+        self.request_visible(&[], cx);
+    }
+
     /// Called while rendering with the items on screen, top to bottom.
     fn request_visible(&mut self, visible: &[usize], cx: &mut Context<Self>) {
         if self.error.is_some() {
             return;
         }
         let mut queue = Vec::new();
-        for &ix in visible {
+        let wanted = std::mem::take(&mut self.wanted_thumbs);
+        for &ix in visible.iter().chain(&wanted) {
             let Some(item) = self.index.get(ix) else {
                 continue;
             };
@@ -938,6 +953,7 @@ impl PhotoGrid {
                 None => self.request_page(self.rank(ix) / PAGE),
             }
         }
+        self.wanted_thumbs = wanted;
         // Visible order, first popped first.
         queue.reverse();
         self.thumb_queue = queue;
@@ -1165,7 +1181,7 @@ impl PhotoGrid {
         let Some(track) = self.track else {
             return;
         };
-        let y = f32::from(pointer.y - self.scroll.bounds().top()) - SCRUBBER_INSET;
+        let y = f32::from(pointer.y - self.scroll.bounds().top()) - SCRUBBER_TOP;
         self.scrub.hover = Some(y.clamp(0., track.length));
         self.scroll_toward(track.scroll_for(y), cx);
     }
@@ -1411,7 +1427,7 @@ impl PhotoGrid {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let status: Option<SharedString> = match (&self.scan, &self.state) {
+        let sync_status: Option<SharedString> = match (&self.scan, &self.state) {
             (Some(scan), LoadState::Ready) if scan.progressive => Some(
                 format!(
                     "Loading {} of {}\u{2026}",
@@ -1423,12 +1439,46 @@ impl PhotoGrid {
             (Some(_), _) => Some("Updating\u{2026}".into()),
             _ => None,
         };
-        // A device's search in progress says so first.
+        // A device's search in progress says so in words.
         let status = self
             .device_pending
             .as_ref()
-            .map(|name| SharedString::from(format!("Asking {name}\u{2026}")))
-            .or(status);
+            .map(|name| SharedString::from(format!("Asking {name}\u{2026}")));
+        let syncing = sync_status.is_some();
+        let sync = div()
+            .id("sync")
+            .size(theme::CONTROL_HEIGHT)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::hover()))
+            .tooltip(ui::tooltip(
+                sync_status.unwrap_or_else(|| "Check for new photos".into()),
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.refresh(false, cx)))
+            .child(if syncing && !anim::reduced() {
+                icon("sync", px(16.), theme::accent_text())
+                    .with_animation(
+                        "sync-turning",
+                        Animation::new(Duration::from_millis(1100)).repeat(),
+                        |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
+                    )
+                    .into_any_element()
+            } else {
+                icon(
+                    "sync",
+                    px(16.),
+                    if syncing {
+                        theme::accent_text()
+                    } else {
+                        theme::text_muted()
+                    },
+                )
+                .into_any_element()
+            });
         // While a device searches and ours found nothing, no count yet.
         let waiting = self.device_pending.is_some() && self.index.is_empty();
         let count = (matches!(self.state, LoadState::Ready) && !waiting).then(|| {
@@ -1505,6 +1555,8 @@ impl PhotoGrid {
                 .flex()
                 .items_center()
                 .gap(px(2.))
+                .child(sync)
+                .child(div().w(px(6.)))
                 .child(ui::icon_button(
                     "zoom-out",
                     "minus",
@@ -1549,14 +1601,14 @@ impl PhotoGrid {
             .flex()
             .items_center()
             .gap_3()
-            .pl(px(theme::CONTENT_PADDING))
-            .pr(px(SCRUBBER_WIDTH))
-            .pt(px(10.))
-            .pb(px(28.))
-            // Solid behind the title, fading out over the photos.
+            .px(px(theme::CONTENT_PADDING))
+            .pt(px(BAR + 10.))
+            .pb(px(40.))
+            // Behind the app's bar too: solid behind the bar and the title,
+            // fading out over the photos below them.
             .bg(gpui::linear_gradient(
                 180.,
-                gpui::linear_color_stop(surface, 0.7),
+                gpui::linear_color_stop(surface, (BAR + 62.) / (BAR + 100.)),
                 gpui::linear_color_stop(clear, 1.),
             ))
             .child(
@@ -2126,7 +2178,7 @@ impl PhotoGrid {
         let track = Track {
             content: layout.height,
             viewport: viewport_h,
-            length: (viewport_h - 2. * SCRUBBER_INSET).max(1.),
+            length: (viewport_h - SCRUBBER_TOP - SCRUBBER_INSET).max(1.),
         };
         self.track = Some(track);
         let scrubber =
@@ -2424,8 +2476,7 @@ impl PhotoGrid {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if let Some(track) = this.track {
-                    let y =
-                        f32::from(event.position.y - this.scroll.bounds().top()) - SCRUBBER_INSET;
+                    let y = f32::from(event.position.y - this.scroll.bounds().top()) - SCRUBBER_TOP;
                     this.scrub.hover = Some(y.clamp(0., track.length));
                     cx.notify();
                 }
@@ -2440,7 +2491,7 @@ impl PhotoGrid {
                 div()
                     .absolute()
                     .right(px(10.))
-                    .top(px(SCRUBBER_INSET + y))
+                    .top(px(SCRUBBER_TOP + y))
                     .w(px(4.))
                     .h(px(1.))
                     .bg(theme::line())
@@ -2449,7 +2500,7 @@ impl PhotoGrid {
                 div()
                     .absolute()
                     .right(px(18.))
-                    .top(px(SCRUBBER_INSET + y - 7.))
+                    .top(px(SCRUBBER_TOP + y - 7.))
                     .h(px(14.))
                     .flex()
                     .items_center()
@@ -2464,7 +2515,7 @@ impl PhotoGrid {
                         .absolute()
                         .left(px(6.))
                         .right(px(6.))
-                        .top(px(SCRUBBER_INSET + y))
+                        .top(px(SCRUBBER_TOP + y))
                         .h(px(1.))
                         .bg(theme::text_meta()),
                 )
@@ -2474,7 +2525,7 @@ impl PhotoGrid {
                 div()
                     .absolute()
                     .right(px(4.))
-                    .top(px(SCRUBBER_INSET + thumb - 10.))
+                    .top(px(SCRUBBER_TOP + thumb - 10.))
                     .w(px(3.))
                     .h(px(20.))
                     .rounded_full()
@@ -2489,7 +2540,7 @@ impl PhotoGrid {
                     div()
                         .absolute()
                         .right(px(SCRUBBER_WIDTH + 4.))
-                        .top(px(SCRUBBER_INSET + date_at - 14.))
+                        .top(px(SCRUBBER_TOP + date_at - 14.))
                         .h(px(28.))
                         .px(px(10.))
                         .flex()
