@@ -31,20 +31,28 @@ mod imp {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
 
-    use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, POINT};
-    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::Foundation::{
+        E_OUTOFMEMORY, E_UNEXPECTED, GlobalFree, HANDLE, HGLOBAL, HWND, POINT,
+    };
+    use windows::Win32::System::Com::{
+        FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
+        STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    };
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
         OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-    use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY};
+    use windows::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    };
+    use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY, ReleaseStgMedium};
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
         BHID_DataObject, DROPFILES, DragQueryFileW, HDROP, ILCreateFromPathW, ILFree,
         SHCreateShellItemArrayFromIDLists, SHDoDragDrop,
     };
+    use windows::core::{BOOL, HRESULT, implement};
     use windows::core::{HSTRING, w};
 
     use super::ClipboardContent;
@@ -166,6 +174,114 @@ mod imp {
         unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) < 0 }
     }
 
+    fn is_hdrop(format: *const FORMATETC) -> bool {
+        // SAFETY: OLE passes a valid FORMATETC, or null.
+        unsafe { format.as_ref() }
+            .is_some_and(|f| f.cfFormat == CF_HDROP.0 && (f.tymed & TYMED_HGLOBAL.0 as u32) != 0)
+    }
+
+    /// The shell's data object for the dragged files, except that the file
+    /// list (`CF_HDROP`) comes as moveable memory.
+    ///
+    /// The shell hands it out as fixed memory, which is valid, but GPUI's
+    /// drop target reads the handle as a pointer to the `HDROP` (right only
+    /// for moveable memory) and crashes in `DragQueryFileW`. Every drag out
+    /// starts over fuji's own window, so it hit that at once.
+    #[implement(IDataObject)]
+    struct MovableHdrop(IDataObject);
+
+    impl MovableHdrop {
+        /// A moveable copy of the shell's `CF_HDROP` block.
+        fn hdrop(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+            unsafe {
+                let mut medium = self.0.GetData(format)?;
+                let source = medium.u.hGlobal;
+                let size = GlobalSize(source);
+                let from = GlobalLock(source);
+                let copy = (|| {
+                    if from.is_null() || size == 0 {
+                        return Err(windows::core::Error::from(E_UNEXPECTED));
+                    }
+                    let copy = GlobalAlloc(GMEM_MOVEABLE, size)?;
+                    let to = GlobalLock(copy);
+                    if to.is_null() {
+                        let _ = GlobalFree(Some(copy));
+                        return Err(E_OUTOFMEMORY.into());
+                    }
+                    std::ptr::copy_nonoverlapping(from.cast::<u8>(), to.cast::<u8>(), size);
+                    let _ = GlobalUnlock(copy);
+                    Ok(copy)
+                })();
+                if !from.is_null() {
+                    let _ = GlobalUnlock(source);
+                }
+                ReleaseStgMedium(&mut medium);
+                Ok(STGMEDIUM {
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                    u: STGMEDIUM_0 { hGlobal: copy? },
+                    pUnkForRelease: std::mem::ManuallyDrop::new(None),
+                })
+            }
+        }
+    }
+
+    #[allow(non_snake_case)]
+    impl IDataObject_Impl for MovableHdrop_Impl {
+        fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+            if is_hdrop(format) {
+                self.hdrop(format)
+            } else {
+                unsafe { self.0.GetData(format) }
+            }
+        }
+
+        fn GetDataHere(
+            &self,
+            format: *const FORMATETC,
+            medium: *mut STGMEDIUM,
+        ) -> windows::core::Result<()> {
+            unsafe { self.0.GetDataHere(format, medium) }
+        }
+
+        fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+            unsafe { self.0.QueryGetData(format) }
+        }
+
+        fn GetCanonicalFormatEtc(&self, format: *const FORMATETC, out: *mut FORMATETC) -> HRESULT {
+            unsafe { self.0.GetCanonicalFormatEtc(format, out) }
+        }
+
+        fn SetData(
+            &self,
+            format: *const FORMATETC,
+            medium: *const STGMEDIUM,
+            release: BOOL,
+        ) -> windows::core::Result<()> {
+            unsafe { self.0.SetData(format, medium, release.as_bool()) }
+        }
+
+        fn EnumFormatEtc(&self, direction: u32) -> windows::core::Result<IEnumFORMATETC> {
+            unsafe { self.0.EnumFormatEtc(direction) }
+        }
+
+        fn DAdvise(
+            &self,
+            format: *const FORMATETC,
+            advf: u32,
+            sink: windows::core::Ref<IAdviseSink>,
+        ) -> windows::core::Result<u32> {
+            unsafe { self.0.DAdvise(format, advf, sink.as_ref()) }
+        }
+
+        fn DUnadvise(&self, connection: u32) -> windows::core::Result<()> {
+            unsafe { self.0.DUnadvise(connection) }
+        }
+
+        fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
+            unsafe { self.0.EnumDAdvise() }
+        }
+    }
+
     struct IdList(*mut ITEMIDLIST);
 
     impl Drop for IdList {
@@ -178,6 +294,24 @@ mod imp {
     /// window's messages, until the files are dropped or the drag is
     /// cancelled.
     pub fn drag_files(hwnd: isize, files: &[PathBuf]) -> bool {
+        let Some(data) = drag_data(files) else {
+            return false;
+        };
+        // With no drop source of our own, the shell supplies one (and the
+        // drag picture).
+        unsafe {
+            SHDoDragDrop(
+                Some(HWND(hwnd as *mut core::ffi::c_void)),
+                &data,
+                None,
+                DROPEFFECT_COPY,
+            )
+            .is_ok()
+        }
+    }
+
+    /// The data object a drag of `files` hands to drop targets.
+    pub(super) fn drag_data(files: &[PathBuf]) -> Option<IDataObject> {
         let ids: Vec<IdList> = files
             .iter()
             .filter_map(|file| {
@@ -187,25 +321,15 @@ mod imp {
             })
             .collect();
         if ids.is_empty() {
-            return false;
+            return None;
         }
         let pointers: Vec<*const ITEMIDLIST> = ids.iter().map(|id| id.0.cast_const()).collect();
         unsafe {
-            let Ok(items) = SHCreateShellItemArrayFromIDLists(&pointers) else {
-                return false;
-            };
-            let Ok(data) = items.BindToHandler::<_, IDataObject>(None, &BHID_DataObject) else {
-                return false;
-            };
-            // With no drop source of our own, the shell supplies one (and
-            // the drag picture).
-            SHDoDragDrop(
-                Some(HWND(hwnd as *mut core::ffi::c_void)),
-                &data,
-                None,
-                DROPEFFECT_COPY,
-            )
-            .is_ok()
+            let items = SHCreateShellItemArrayFromIDLists(&pointers).ok()?;
+            let shell = items
+                .BindToHandler::<_, IDataObject>(None, &BHID_DataObject)
+                .ok()?;
+            Some(MovableHdrop(shell).into())
         }
     }
 }
@@ -269,6 +393,49 @@ pub const CAN_DRAG_OUT: bool = cfg!(windows);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GPUI's drop target (fuji's own window, where every drag out starts)
+    /// reads `CF_HDROP` by dereferencing the handle. The drag's data object
+    /// must give it memory where that works.
+    #[cfg(windows)]
+    #[test]
+    fn dragged_file_list_reads_the_way_gpui_reads_it() {
+        use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+        use windows::Win32::System::Ole::{CF_HDROP, OleInitialize, ReleaseStgMedium};
+        use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+        let dir = std::env::temp_dir().join(format!("fuji-drag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("IMG_0001.jpg");
+        std::fs::write(&file, b"not really a jpeg").unwrap();
+
+        let names = unsafe {
+            let _ = OleInitialize(None);
+            let data = imp::drag_data(std::slice::from_ref(&file)).expect("data object");
+            let format = FORMATETC {
+                cfFormat: CF_HDROP.0,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            };
+            let mut medium = data.GetData(&format).expect("CF_HDROP");
+            // Exactly what gpui 0.2.2's DragEnter does.
+            let hdrop = *(medium.u.hGlobal.0 as *mut HDROP);
+            let count = DragQueryFileW(hdrop, u32::MAX, None);
+            let mut names = Vec::new();
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, None) as usize;
+                let mut buffer = vec![0u16; len + 1];
+                DragQueryFileW(hdrop, i, Some(&mut buffer));
+                names.push(String::from_utf16_lossy(&buffer[..len]));
+            }
+            ReleaseStgMedium(&mut medium);
+            names
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(names, vec![file.to_string_lossy().into_owned()]);
+    }
 
     #[test]
     fn upload_types() {
