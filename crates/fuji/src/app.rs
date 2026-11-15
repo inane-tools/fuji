@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuji_icloud::{Account, Album, AuthClient, PhotosClient, SavedSession};
+use fuji_icloud::{Account, Album, AuthClient, PhotosClient, PhotosError, SavedSession, UserAlbum};
 use gpui::{
     Animation, AnimationExt as _, Context, ElementId, Entity, Focusable, FontWeight, ImageSource,
     Resource, SharedString, Subscription, Task, Window, bounce, div, ease_in_out, img, prelude::*,
@@ -16,7 +16,7 @@ use crate::assets::icon;
 use crate::grid::{GridEvent, PhotoGrid};
 use crate::login::{LoginEvent, LoginView};
 use crate::settings::{Settings, SettingsEvent, SettingsView};
-use crate::{net, session_store, theme, thumbs, titlebar, ui};
+use crate::{index, net, session_store, theme, thumbs, titlebar, ui};
 
 /// Height of a sidebar row plus the gap below it.
 const NAV_PITCH: f32 = 34.;
@@ -28,31 +28,33 @@ pub enum Section {
     Library,
     Favorites,
     Videos,
-    Albums,
     Shared,
     RecentlyDeleted,
+    /// A user album, by its place in `FujiApp::albums`.
+    Album(usize),
     Settings,
 }
 
 impl Section {
-    /// The sections listed at the top of the sidebar.
-    const NAV: [Section; 6] = [
+    /// The fixed sections at the top of the sidebar. The user's albums
+    /// follow, under an "Albums" heading one row tall.
+    const NAV: [Section; 5] = [
         Section::Library,
         Section::Favorites,
         Section::Videos,
-        Section::Albums,
         Section::Shared,
         Section::RecentlyDeleted,
     ];
 
-    fn label(self) -> &'static str {
+    /// Label for the fixed sections; albums are named by `FujiApp::label`.
+    fn fixed_label(self) -> &'static str {
         match self {
             Section::Library => "Library",
             Section::Favorites => "Favorites",
             Section::Videos => "Videos",
-            Section::Albums => "Albums",
             Section::Shared => "Shared Albums",
             Section::RecentlyDeleted => "Recently Deleted",
+            Section::Album(_) => "Album",
             Section::Settings => "Settings",
         }
     }
@@ -63,26 +65,27 @@ impl Section {
             Section::Library => "library",
             Section::Favorites => "favorites",
             Section::Videos => "videos",
-            Section::Albums => "albums",
             Section::Shared => "shared",
             Section::RecentlyDeleted => "deleted",
+            Section::Album(_) => "albums",
             Section::Settings => "settings",
         }
     }
 
-    /// The library view this section shows, if it's one of the built-in ones.
-    fn album(self) -> Option<Album> {
+    /// Row of the sidebar's list this section is on, counting the heading.
+    fn nav_position(self) -> Option<usize> {
         match self {
-            Section::Library => Some(Album::All),
-            Section::Favorites => Some(Album::Favorites),
-            Section::Videos => Some(Album::Videos),
-            Section::RecentlyDeleted => Some(Album::RecentlyDeleted),
-            Section::Albums | Section::Shared | Section::Settings => None,
+            Section::Album(i) => Some(Self::NAV.len() + 1 + i),
+            _ => Self::NAV.iter().position(|s| *s == self),
         }
     }
 
-    fn nav_position(self) -> Option<usize> {
-        Self::NAV.iter().position(|s| *s == self)
+    /// Distinct per section, for element ids and animations.
+    fn key(self) -> u64 {
+        match self {
+            Section::Album(i) => 100 + i as u64,
+            _ => self.nav_position().unwrap_or(99) as u64,
+        }
     }
 }
 
@@ -106,6 +109,8 @@ enum Screen {
 pub struct FujiApp {
     screen: Screen,
     section: Section,
+    /// The user's albums, listed under the fixed sections.
+    albums: Vec<UserAlbum>,
     /// The account picture, once it's been found or fetched.
     avatar: Option<Arc<Path>>,
     /// The sidebar's width, easing between full and compact.
@@ -129,6 +134,7 @@ impl FujiApp {
         let mut this = Self {
             screen: Screen::Resuming,
             section: Section::Library,
+            albums: Vec::new(),
             avatar: None,
             sidebar_width: Eased::new(sidebar_target(cx)),
             highlight: Eased::new(0.),
@@ -209,13 +215,21 @@ impl FujiApp {
         cx: &mut Context<Self>,
     ) {
         self._login_subscription = None;
-        if self.section == Section::Settings {
+        // The album list is reloaded for this account.
+        self.albums.clear();
+        if matches!(self.section, Section::Settings | Section::Album(_)) {
             self.section = Section::Library;
         }
-        let album = self.section.album().unwrap_or(Album::All);
-        let grid = PhotosClient::new(&auth, &account)
-            .ok()
-            .map(|client| cx.new(|cx| PhotoGrid::new(Arc::new(client), &account.dsid, album, cx)));
+        let (album, title) = self
+            .section_album(self.section)
+            .unwrap_or((Album::All, "Library".into()));
+        let client = PhotosClient::new(&auth, &account).ok().map(Arc::new);
+        let grid = client
+            .clone()
+            .map(|client| cx.new(|cx| PhotoGrid::new(client, &account.dsid, album, title, cx)));
+        if let Some(client) = client {
+            self.load_albums(client, &account.dsid, cx);
+        }
         let mut subscriptions = Vec::new();
         if let Some(grid) = &grid {
             let apple_id = account.apple_id.clone();
@@ -340,19 +354,121 @@ impl FujiApp {
         cx.notify();
     }
 
+    /// What a section shows in the gallery, and its heading; `None` for
+    /// pages that aren't the gallery.
+    fn section_album(&self, section: Section) -> Option<(Album, SharedString)> {
+        let album = match section {
+            Section::Library => Album::All,
+            Section::Favorites => Album::Favorites,
+            Section::Videos => Album::Videos,
+            Section::RecentlyDeleted => Album::RecentlyDeleted,
+            Section::Album(i) => {
+                let album = self.albums.get(i)?;
+                return Some((album.album(), album.name.clone().into()));
+            }
+            Section::Shared | Section::Settings => return None,
+        };
+        Some((album, section.fixed_label().into()))
+    }
+
+    fn label(&self, section: Section) -> SharedString {
+        match section {
+            Section::Album(i) => self
+                .albums
+                .get(i)
+                .map(|album| SharedString::from(album.name.clone()))
+                .unwrap_or_default(),
+            _ => section.fixed_label().into(),
+        }
+    }
+
+    /// The albums kept from last time at once, then the current list.
+    fn load_albums(&mut self, client: Arc<PhotosClient>, dsid: &str, cx: &mut Context<Self>) {
+        let path = index::albums_path(&thumbs::account_dir(dsid));
+        cx.spawn(async move |this, cx| {
+            let kept_path = path.clone();
+            let kept = cx
+                .background_spawn(async move { index::load_albums(&kept_path) })
+                .await;
+            if let Some(albums) = kept {
+                this.update(cx, |this, cx| this.set_albums(albums, cx)).ok();
+            }
+            let fetched = net::run(move || {
+                let albums = client.albums()?;
+                index::save_albums(&path, &albums);
+                Ok::<_, PhotosError>(albums)
+            })
+            .await;
+            match fetched {
+                Some(Ok(albums)) => {
+                    this.update(cx, |this, cx| this.set_albums(albums, cx)).ok();
+                }
+                // The gallery reports an expired session; the list just stays.
+                Some(Err(err)) if std::env::var_os("FUJI_DEBUG").is_some() => {
+                    eprintln!("[fuji] couldn't list albums: {err}");
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
+    /// Replace the album list, keeping the selected album selected if it's
+    /// still there (and following a rename).
+    fn set_albums(&mut self, albums: Vec<UserAlbum>, cx: &mut Context<Self>) {
+        if albums == self.albums {
+            return;
+        }
+        let selected = match self.section {
+            Section::Album(i) => self.albums.get(i).map(|a| a.id.clone()),
+            _ => None,
+        };
+        self.albums = albums;
+        if let Some(id) = selected {
+            let section = match self.albums.iter().position(|a| a.id == id) {
+                Some(i) => Section::Album(i),
+                None => Section::Library,
+            };
+            self.section = section;
+            if let Some(position) = section.nav_position() {
+                self.highlight.set(position as f32);
+            }
+            self.show_section_in_grid(section, cx);
+        }
+        cx.notify();
+    }
+
+    /// Point the gallery at what `section` shows, if it's a gallery section.
+    fn show_section_in_grid(&self, section: Section, cx: &mut Context<Self>) -> bool {
+        if let (
+            Some((album, title)),
+            Screen::Main {
+                grid: Some(grid), ..
+            },
+        ) = (self.section_album(section), &self.screen)
+        {
+            grid.update(cx, |grid, cx| grid.set_album(album, title, cx));
+            return true;
+        }
+        false
+    }
+
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
         if let Some(position) = section.nav_position() {
             self.highlight.set(position as f32);
         }
-        if let Screen::Main { grid, settings, .. } = &self.screen {
-            if let (Some(album), Some(grid)) = (section.album(), grid) {
-                grid.update(cx, |grid, cx| grid.set_album(album, cx));
-                grid.focus_handle(cx).focus(window);
-            }
-            if section == Section::Settings {
-                settings.update(cx, |settings, cx| settings.measure_cache(cx));
-            }
+        if self.show_section_in_grid(section, cx)
+            && let Screen::Main {
+                grid: Some(grid), ..
+            } = &self.screen
+        {
+            grid.focus_handle(cx).focus(window);
+        }
+        if section == Section::Settings
+            && let Screen::Main { settings, .. } = &self.screen
+        {
+            settings.update(cx, |settings, cx| settings.measure_cache(cx));
         }
         cx.notify();
     }
@@ -394,8 +510,9 @@ impl FujiApp {
         } else {
             section.icon().to_string()
         };
+        let label = self.label(section);
         div()
-            .id(SharedString::from(section.label()))
+            .id(ElementId::NamedInteger("nav".into(), section.key()))
             .h(theme::CONTROL_HEIGHT)
             .flex_none()
             .px(px(9.))
@@ -428,12 +545,36 @@ impl FujiApp {
                 },
             ))
             .when(open > 0.05, |el| {
-                el.child(
-                    div()
-                        .whitespace_nowrap()
-                        .opacity(open)
-                        .child(section.label()),
-                )
+                el.child(div().min_w_0().truncate().opacity(open).child(label))
+            })
+    }
+
+    /// The "Albums" heading: one row tall so rows keep a steady pitch for
+    /// the sliding highlight. A short rule in the compact sidebar.
+    fn albums_heading(open: f32) -> impl IntoElement {
+        div()
+            .h(theme::CONTROL_HEIGHT)
+            .flex_none()
+            .flex()
+            .items_end()
+            .px(px(9.))
+            .pb(px(4.))
+            .map(|el| {
+                if open > 0.05 {
+                    el.child(
+                        div()
+                            .opacity(open)
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_meta())
+                            .child("Albums"),
+                    )
+                } else {
+                    el.items_center()
+                        .pb_0()
+                        .child(div().w(px(18.)).h(px(1.)).bg(theme::line()))
+                }
             })
     }
 
@@ -458,6 +599,9 @@ impl FujiApp {
                 .rounded(theme::RADIUS_CONTROL)
                 .bg(theme::accent_soft())
         });
+        let albums = (0..self.albums.len())
+            .map(Section::Album)
+            .collect::<Vec<_>>();
         let nav = div()
             .relative()
             .flex()
@@ -468,7 +612,21 @@ impl FujiApp {
                 Section::NAV
                     .into_iter()
                     .map(|section| self.nav_row(section, false, open, cx)),
-            );
+            )
+            .when(!albums.is_empty(), |el| {
+                el.child(Self::albums_heading(open)).children(
+                    albums
+                        .into_iter()
+                        .map(|section| self.nav_row(section, false, open, cx)),
+                )
+            });
+        // Many albums scroll; the settings row and account stay put.
+        let nav = div()
+            .id("nav")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(nav);
 
         div()
             .flex()
@@ -510,8 +668,11 @@ impl FujiApp {
                 )
             })
             .child(nav)
-            .child(div().flex_1())
-            .child(self.nav_row(Section::Settings, true, open, cx))
+            .child(
+                div()
+                    .pt(px(8.))
+                    .child(self.nav_row(Section::Settings, true, open, cx)),
+            )
             .child(
                 div()
                     .flex()
@@ -667,23 +828,24 @@ impl Render for FujiApp {
                 .text_color(theme::text_muted())
                 .child(text)
         };
-        let content = match (self.section, self.section.album(), grid) {
+        let is_gallery = self.section_album(self.section).is_some();
+        let content = match (self.section, is_gallery, grid) {
             (Section::Settings, _, _) => div().size_full().child(settings),
-            (_, Some(_), Some(grid)) => div().size_full().child(grid),
-            (_, Some(_), None) => message(fuji_icloud::PhotosError::NotAvailable.to_string()),
-            (_, None, _) => message(format!(
+            (_, true, Some(grid)) => div().size_full().child(grid),
+            (_, true, None) => message(PhotosError::NotAvailable.to_string()),
+            (_, false, _) => message(format!(
                 "{} aren't available in fuji yet.",
-                self.section.label()
+                self.label(self.section)
             )),
         };
         // Pages that aren't the gallery fade in; the gallery fades itself
         // per album.
-        let content = if self.section.album().is_some() {
+        let content = if is_gallery {
             content.into_any_element()
         } else {
             content
                 .with_animation(
-                    ElementId::NamedInteger("section".into(), self.section as u64),
+                    ElementId::NamedInteger("section".into(), self.section.key()),
                     anim::ease(anim::NORMAL),
                     |el, t| el.opacity(t),
                 )

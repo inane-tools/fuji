@@ -178,6 +178,8 @@ pub struct PhotoGrid {
     thumb_dir: Arc<PathBuf>,
     pub(crate) preview_dir: Arc<PathBuf>,
     album: Album,
+    /// The album's name, shown as the heading.
+    title: SharedString,
     /// Bumped on album change so results for the old album are ignored.
     generation: u64,
     state: LoadState,
@@ -248,6 +250,7 @@ impl PhotoGrid {
         client: Arc<PhotosClient>,
         dsid: &str,
         album: Album,
+        title: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
         let thumb_dir = Arc::new(thumbs::cache_dir(dsid));
@@ -279,6 +282,7 @@ impl PhotoGrid {
             thumb_dir,
             preview_dir,
             album,
+            title,
             generation: 0,
             state: LoadState::Loading,
             index: Vec::new(),
@@ -326,7 +330,12 @@ impl PhotoGrid {
         grid
     }
 
-    pub fn set_album(&mut self, album: Album, cx: &mut Context<Self>) {
+    /// Show `album`, headed `title`. A rename alone just changes the heading.
+    pub fn set_album(&mut self, album: Album, title: SharedString, cx: &mut Context<Self>) {
+        if title != self.title {
+            self.title = title;
+            cx.notify();
+        }
         if album != self.album {
             self.album = album;
             self.load_album(cx);
@@ -398,7 +407,7 @@ impl PhotoGrid {
         cx.notify();
 
         let generation = self.generation;
-        let path = index::cache_path(&self.account_dir, self.album);
+        let path = index::cache_path(&self.account_dir, &self.album);
         cx.spawn(async move |this, cx| {
             // Cached index first, so the gallery shows right away.
             let cached = cx
@@ -436,11 +445,11 @@ impl PhotoGrid {
         }
         let generation = self.generation;
         let client = self.client.clone();
-        let album = self.album;
+        let album = self.album.clone();
         cx.spawn(async move |this, cx| {
             let count = net::run(move || {
                 client.check_ready()?;
-                client.count(album)
+                client.count(&album)
             })
             .await;
             this.update(cx, |this, cx| {
@@ -496,12 +505,12 @@ impl PhotoGrid {
             scan.in_flight += 1;
 
             let client = self.client.clone();
-            let album = self.album;
+            let album = self.album.clone();
             let generation = self.generation;
             cx.spawn(async move |this, cx| {
                 let result = net::run(move || {
                     client
-                        .scan(album, start, limit)
+                        .scan(&album, start, limit)
                         .map(|assets| assets.iter().map(IndexItem::from).collect::<Vec<_>>())
                 })
                 .await;
@@ -592,7 +601,7 @@ impl PhotoGrid {
     }
 
     fn save_index(&self, cx: &mut Context<Self>) {
-        let path = index::cache_path(&self.account_dir, self.album);
+        let path = index::cache_path(&self.account_dir, &self.album);
         let items = self.index.clone();
         cx.background_spawn(async move { index::save(&path, &items) })
             .detach();
@@ -620,12 +629,12 @@ impl PhotoGrid {
         }
         let limit = PAGE.min(count - start);
         let client = self.client.clone();
-        let album = self.album;
+        let album = self.album.clone();
         let generation = self.generation;
         self.pages_in_flight += 1;
 
         cx.spawn(async move |this, cx| {
-            let result = net::run(move || client.fetch(album, start, limit)).await;
+            let result = net::run(move || client.fetch(&album, start, limit)).await;
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -1304,7 +1313,7 @@ impl PhotoGrid {
                             .text_size(px(26.))
                             .font_weight(FontWeight::EXTRA_BOLD)
                             .text_color(theme::text())
-                            .child(album_title(self.album)),
+                            .child(self.title.clone()),
                     )
                     .when_some(count, |el, count| {
                         el.child(div().text_sm().text_color(theme::text_meta()).child(count))
@@ -1598,7 +1607,7 @@ impl Render for PhotoGrid {
                     .child(retry_link(cx)),
             ),
             LoadState::Ready if self.index.is_empty() && self.scan.is_none() => {
-                centered(div().child(empty_message(self.album)))
+                centered(div().child(empty_message(&self.album)))
             }
             LoadState::Ready => self.render_mosaic(window, cx),
         };
@@ -2221,21 +2230,13 @@ fn retry_link(cx: &mut Context<PhotoGrid>) -> impl IntoElement + use<> {
     )
 }
 
-pub fn album_title(album: Album) -> &'static str {
-    match album {
-        Album::All => "Library",
-        Album::Favorites => "Favorites",
-        Album::Videos => "Videos",
-        Album::RecentlyDeleted => "Recently Deleted",
-    }
-}
-
-fn empty_message(album: Album) -> &'static str {
+fn empty_message(album: &Album) -> &'static str {
     match album {
         Album::All => "Your library is empty.",
         Album::Favorites => "No favorites yet. Favorite a photo on your iPhone to see it here.",
         Album::Videos => "No videos.",
         Album::RecentlyDeleted => "Nothing recently deleted.",
+        Album::User(_) => "This album is empty.",
     }
 }
 

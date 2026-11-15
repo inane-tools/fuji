@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -47,41 +48,59 @@ pub enum PhotosError {
     Unexpected { status: u16, message: String },
 }
 
-/// The built-in views of the library.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A view of the library: one of the built-in ones, or an album the user made.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Album {
     All,
     Favorites,
     Videos,
     RecentlyDeleted,
+    /// A user album, by its CloudKit record name.
+    User(Arc<str>),
 }
 
 impl Album {
     /// Record type used for counting.
-    fn count_type(self) -> &'static str {
+    fn count_type(&self) -> String {
         match self {
-            Album::All => "CPLAssetByAssetDateWithoutHiddenOrDeleted",
-            Album::Favorites => "CPLAssetInSmartAlbumByAssetDate:Favorite",
-            Album::Videos => "CPLAssetInSmartAlbumByAssetDate:Video",
-            Album::RecentlyDeleted => "CPLAssetDeletedByExpungedDate",
+            Album::All => "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+            Album::Favorites => "CPLAssetInSmartAlbumByAssetDate:Favorite".into(),
+            Album::Videos => "CPLAssetInSmartAlbumByAssetDate:Video".into(),
+            Album::RecentlyDeleted => "CPLAssetDeletedByExpungedDate".into(),
+            Album::User(id) => format!("CPLContainerRelationNotDeletedByAssetDate:{id}"),
         }
     }
 
     /// Record type used for listing.
-    fn list_type(self) -> &'static str {
+    fn list_type(&self) -> &'static str {
         match self {
             Album::All => "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
             Album::Favorites | Album::Videos => "CPLAssetAndMasterInSmartAlbumByAssetDate",
             Album::RecentlyDeleted => "CPLAssetAndMasterDeletedByExpungedDate",
+            Album::User(_) => "CPLContainerRelationLiveByAssetDate",
         }
     }
 
-    fn smart_album(self) -> Option<&'static str> {
+    fn smart_album(&self) -> Option<&'static str> {
         match self {
             Album::Favorites => Some("FAVORITE"),
             Album::Videos => Some("VIDEO"),
             _ => None,
         }
+    }
+}
+
+/// An album the user made, as listed in the sidebar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserAlbum {
+    /// CloudKit record name; stable across renames.
+    pub id: Arc<str>,
+    pub name: String,
+}
+
+impl UserAlbum {
+    pub fn album(&self) -> Album {
+        Album::User(self.id.clone())
     }
 }
 
@@ -147,7 +166,7 @@ impl PhotosClient {
     }
 
     /// Number of items in an album.
-    pub fn count(&self, album: Album) -> Result<usize, PhotosError> {
+    pub fn count(&self, album: &Album) -> Result<usize, PhotosError> {
         let data = self.post(
             "internal/records/query/batch",
             &json!({
@@ -179,7 +198,7 @@ impl PhotosClient {
     /// the most recent). The result may be shorter at the end of the album.
     pub fn fetch(
         &self,
-        album: Album,
+        album: &Album,
         start_rank: usize,
         limit: usize,
     ) -> Result<Vec<Asset>, PhotosError> {
@@ -191,7 +210,7 @@ impl PhotosClient {
     /// download URLs. Used to index the whole library quickly.
     pub fn scan(
         &self,
-        album: Album,
+        album: &Album,
         start_rank: usize,
         limit: usize,
     ) -> Result<Vec<Asset>, PhotosError> {
@@ -200,7 +219,7 @@ impl PhotosClient {
 
     fn fetch_with(
         &self,
-        album: Album,
+        album: &Album,
         start_rank: usize,
         limit: usize,
         keys: &[&str],
@@ -242,6 +261,31 @@ impl PhotosClient {
             }
         }
         Ok(assets)
+    }
+
+    /// The albums the user made, in the order Photos shows them.
+    pub fn albums(&self) -> Result<Vec<UserAlbum>, PhotosError> {
+        let mut albums = Vec::new();
+        let mut marker: Option<Value> = None;
+        // Paged by continuation marker; a library rarely needs a second page.
+        for _ in 0..50 {
+            let mut body = json!({
+                "query": { "recordType": "CPLAlbumByPositionLive" },
+                "zoneID": { "zoneName": "PrimarySync" },
+            });
+            if let Some(marker) = marker.take() {
+                body["continuationMarker"] = marker;
+            }
+            let data = self.post("records/query", &body)?;
+            if let Some(records) = data["records"].as_array() {
+                albums.extend(records.iter().filter_map(parse_album));
+            }
+            match data.get("continuationMarker") {
+                Some(next) if !next.is_null() => marker = Some(next.clone()),
+                _ => break,
+            }
+        }
+        Ok(albums)
     }
 
     /// Download a small resource (thumbnail or preview) into memory.
@@ -397,7 +441,7 @@ fn cloudkit_error(status: u16, code: &str, reason: &str) -> PhotosError {
     }
 }
 
-fn list_query(album: Album, start_rank: usize, limit: usize, keys: &[&str]) -> Value {
+fn list_query(album: &Album, start_rank: usize, limit: usize, keys: &[&str]) -> Value {
     let mut filters = vec![
         json!({
             "fieldName": "startRank",
@@ -410,6 +454,13 @@ fn list_query(album: Album, start_rank: usize, limit: usize, keys: &[&str]) -> V
             "comparator": "EQUALS",
         }),
     ];
+    if let Album::User(id) = album {
+        filters.push(json!({
+            "fieldName": "parentId",
+            "fieldValue": { "type": "STRING", "value": &**id },
+            "comparator": "EQUALS",
+        }));
+    }
     if let Some(smart) = album.smart_album() {
         filters.push(json!({
             "fieldName": "smartAlbum",
@@ -562,14 +613,7 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
         AssetKind::Photo
     };
 
-    let filename = master["fields"].get("filenameEnc").and_then(|f| {
-        let value = f.get("value")?.as_str()?;
-        match f.get("type")?.as_str()? {
-            "STRING" => Some(value.to_string()),
-            "ENCRYPTED_BYTES" => String::from_utf8(BASE64.decode(value).ok()?).ok(),
-            _ => None,
-        }
-    });
+    let filename = text_field(master, "filenameEnc");
 
     let dim = |name: &str| field(master, name).and_then(Value::as_u64).unwrap_or(0) as u32;
     let thumbnail = resource_either(asset, master, "resJPEGThumb");
@@ -595,6 +639,40 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
         thumbnail,
         preview,
         original,
+    })
+}
+
+/// A text field, plain or as base64 UTF-8 (the `...Enc` fields).
+fn text_field(record: &Value, name: &str) -> Option<String> {
+    let f = record["fields"].get(name)?;
+    let value = f.get("value")?.as_str()?;
+    match f.get("type").and_then(Value::as_str) {
+        Some("ENCRYPTED_BYTES") => String::from_utf8(BASE64.decode(value).ok()?).ok(),
+        Some("STRING") | None => Some(value.to_string()),
+        Some(_) => None,
+    }
+}
+
+/// The album type of folders, which hold albums rather than photos.
+const FOLDER_ALBUM_TYPE: i64 = 3;
+
+fn parse_album(record: &Value) -> Option<UserAlbum> {
+    let id = record["recordName"].as_str()?;
+    // The library's root folders ("----Root-Folder----") are records too.
+    if id.starts_with("----")
+        || field(record, "isDeleted").and_then(Value::as_i64) == Some(1)
+        || field(record, "albumType").and_then(Value::as_i64) == Some(FOLDER_ALBUM_TYPE)
+    {
+        return None;
+    }
+    let name = text_field(record, "albumNameEnc")?;
+    Some(UserAlbum {
+        id: id.into(),
+        name: if name.trim().is_empty() {
+            "Untitled Album".into()
+        } else {
+            name
+        },
     })
 }
 
@@ -741,7 +819,7 @@ mod tests {
 
     #[test]
     fn list_query_shape() {
-        let q = list_query(Album::Favorites, 40, 100, DESIRED_KEYS);
+        let q = list_query(&Album::Favorites, 40, 100, DESIRED_KEYS);
         assert_eq!(q["resultsLimit"], 200);
         assert_eq!(
             q["query"]["recordType"],
@@ -751,12 +829,54 @@ mod tests {
         assert_eq!(filters[0]["fieldValue"]["value"], 40);
         assert_eq!(filters[2]["fieldValue"]["value"], "FAVORITE");
         assert_eq!(
-            list_query(Album::All, 0, 10, SCAN_KEYS)["query"]["filterBy"]
+            list_query(&Album::All, 0, 10, SCAN_KEYS)["query"]["filterBy"]
                 .as_array()
                 .unwrap()
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn user_album_query_filters_by_parent() {
+        let album = Album::User("ABC-123".into());
+        let q = list_query(&album, 0, 10, SCAN_KEYS);
+        assert_eq!(
+            q["query"]["recordType"],
+            "CPLContainerRelationLiveByAssetDate"
+        );
+        let filters = q["query"]["filterBy"].as_array().unwrap();
+        assert_eq!(filters[2]["fieldName"], "parentId");
+        assert_eq!(filters[2]["fieldValue"]["value"], "ABC-123");
+        assert_eq!(
+            album.count_type(),
+            "CPLContainerRelationNotDeletedByAssetDate:ABC-123"
+        );
+    }
+
+    #[test]
+    fn parses_albums_and_skips_folders() {
+        let record = |id: &str, name: &str, extra: Value| {
+            let mut fields = json!({
+                "albumNameEnc": { "type": "ENCRYPTED_BYTES", "value": BASE64.encode(name) },
+            });
+            let extra = extra.as_object().unwrap().clone();
+            fields.as_object_mut().unwrap().extend(extra);
+            json!({ "recordName": id, "recordType": "CPLAlbum", "fields": fields })
+        };
+        let trip = parse_album(&record(
+            "A1",
+            "Trip ✈",
+            json!({ "albumType": { "value": 0 } }),
+        ));
+        assert_eq!(trip.unwrap().name, "Trip ✈");
+        assert!(parse_album(&record("----Root-Folder----", "", json!({}))).is_none());
+        let folder = record("F", "Folder", json!({ "albumType": { "value": 3 } }));
+        assert!(parse_album(&folder).is_none());
+        let deleted = record("D", "Gone", json!({ "isDeleted": { "value": 1 } }));
+        assert!(parse_album(&deleted).is_none());
+        let blank = parse_album(&record("U", " ", json!({}))).unwrap();
+        assert_eq!(blank.name, "Untitled Album");
     }
 
     #[test]
