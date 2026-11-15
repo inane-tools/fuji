@@ -70,6 +70,7 @@ impl AssetSource for Assets {
                 "speaker",
                 "speaker-off",
                 "collections",
+                "memories",
                 "collections-active",
                 "hidden",
                 "shared-albums",

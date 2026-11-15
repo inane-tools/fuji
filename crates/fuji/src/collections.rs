@@ -1,4 +1,5 @@
-//! The Collections page: albums, shared albums, media types and utilities,
+//! The Collections page: memories, albums, shared albums, media types and
+//! utilities,
 //! as cards with a cover photo, after Photos' Collections tab.
 //!
 //! The app owns the data (what's there, counts, covers) and loads it; this
@@ -8,8 +9,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{
-    App, ClickEvent, Div, ElementId, FontWeight, ObjectFit, SharedString, Stateful, Window, div,
-    img, prelude::*, px,
+    AnyElement, App, ClickEvent, Div, ElementId, FontWeight, ObjectFit, SharedString, Stateful,
+    Window, div, img, prelude::*, px,
 };
 
 use crate::assets::icon;
@@ -24,6 +25,8 @@ pub struct Card {
     pub title: SharedString,
     /// Items in it, once counted.
     pub count: Option<usize>,
+    /// Said under the title instead of the count (a memory's date).
+    pub subtitle: Option<SharedString>,
     pub cover: Option<Arc<Path>>,
     /// Shown on the cover when there's no photo, and as a badge for media
     /// types.
@@ -33,16 +36,32 @@ pub struct Card {
 
 /// A titled run of cards that wraps onto new rows.
 pub fn section(title: &'static str, cards: Vec<Stateful<Div>>) -> Div {
+    section_with(title, None, cards)
+}
+
+/// The same, with something at the right of the title ("Show All").
+pub fn section_with(
+    title: &'static str,
+    action: Option<AnyElement>,
+    cards: Vec<Stateful<Div>>,
+) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(12.))
         .child(
             div()
-                .text_size(px(20.))
-                .font_weight(FontWeight::BLACK)
-                .text_color(theme::text())
-                .child(title),
+                .flex()
+                .items_baseline()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::BLACK)
+                        .text_color(theme::text())
+                        .child(title),
+                )
+                .children(action),
         )
         .child(div().flex().flex_wrap().gap(px(18.)).children(cards))
 }
@@ -114,7 +133,11 @@ pub fn card(
                 .h(px(16.))
                 .text_size(px(12.))
                 .text_color(theme::text_meta())
-                .children(card.count.map(group_digits)),
+                .truncate()
+                .map(|el| match card.subtitle {
+                    Some(subtitle) => el.child(subtitle),
+                    None => el.children(card.count.map(group_digits)),
+                }),
         )
 }
 

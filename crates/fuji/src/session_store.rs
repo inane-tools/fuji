@@ -462,6 +462,24 @@ mod live_collections {
                 items.len()
             );
         }
+        let memories = client.memories().expect("memories");
+        let with_titles = memories.iter().filter(|m| !m.title.is_empty()).count();
+        println!("{} memories, {with_titles} titled", memories.len());
+        if let Some(memory) = memories.first() {
+            let album = Album::Memory(memory.id.clone());
+            let count = client.count(&album).expect("memory count");
+            let items = client.fetch(&album, 0, count.min(8)).expect("memory fetch");
+            let thumbs = items.iter().filter(|i| i.thumbnail.is_some()).count();
+            let dated = items.iter().filter(|i| i.created_at_ms > 0).count();
+            let key = memory
+                .key_asset
+                .as_deref()
+                .map(|k| client.asset(k).map(|a| a.is_some()));
+            println!(
+                "  newest: {count} photos; fetched {}, {dated} dated, {thumbs} with thumbnails; key photo found: {key:?}",
+                items.len()
+            );
+        }
         let panoramas = Album::Smart(SmartAlbum::Panoramas);
         let items = client.scan(&panoramas, 0, 3).expect("scan");
         println!("panoramas: scanned {}", items.len());

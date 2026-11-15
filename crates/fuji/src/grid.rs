@@ -2698,6 +2698,7 @@ fn empty_message(album: &Album) -> &'static str {
         Album::Hidden => "Nothing hidden.",
         Album::Smart(_) => "None in your library.",
         Album::User(_) | Album::Shared(_) => "This album is empty.",
+        Album::Memory(_) => "This memory has no photos.",
     }
 }
 

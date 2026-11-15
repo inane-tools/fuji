@@ -9,9 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fuji_icloud::{
-    Account, Album, AuthClient, PhotosClient, PhotosError, SavedSession, SharedAlbum, SmartAlbum,
-    UserAlbum,
+    Account, Album, AuthClient, Memory, PhotosClient, PhotosError, SavedSession, SharedAlbum,
+    SmartAlbum, UserAlbum,
 };
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{
     AnimationExt as _, Bounds, Context, ElementId, Entity, Focusable, FontWeight, KeyBinding,
     Pixels, Point, SharedString, Subscription, Task, Window, actions, canvas, div, point,
@@ -67,6 +69,8 @@ pub enum Collection {
     Album(usize),
     /// A shared album, by its place in `FujiApp::shared_albums`.
     Shared(usize),
+    /// A memory, by its place in `FujiApp::memories`.
+    Memory(usize),
 }
 
 impl Collection {
@@ -83,6 +87,7 @@ impl Collection {
             Collection::RecentlyDeleted => 41,
             Collection::Album(i) => 1_000 + i as u64,
             Collection::Shared(i) => 100_000 + i as u64,
+            Collection::Memory(i) => 200_000 + i as u64,
         }
     }
 
@@ -104,6 +109,7 @@ impl Collection {
             Collection::RecentlyDeleted => "deleted",
             Collection::Album(_) => "albums",
             Collection::Shared(_) => "shared-albums",
+            Collection::Memory(_) => "memories",
         }
     }
 }
@@ -163,6 +169,10 @@ pub struct FujiApp {
     albums: Vec<UserAlbum>,
     /// Shared albums the user owns or joined.
     shared_albums: Vec<SharedAlbum>,
+    /// Memories Photos made, newest first.
+    memories: Vec<Memory>,
+    /// All memories shown on the Collections page, not just the newest.
+    memories_expanded: bool,
     /// Item counts for the Collections page, by album slug.
     counts: HashMap<String, usize>,
     /// Cover thumbnails for the Collections page, by album slug.
@@ -209,6 +219,8 @@ impl FujiApp {
             section: Section::Library,
             albums: Vec::new(),
             shared_albums: Vec::new(),
+            memories: Vec::new(),
+            memories_expanded: false,
             counts: HashMap::new(),
             covers: HashMap::new(),
             photos: None,
@@ -301,6 +313,7 @@ impl FujiApp {
         // The album lists are reloaded for this account.
         self.albums.clear();
         self.shared_albums.clear();
+        self.memories.clear();
         self.counts.clear();
         self.covers.clear();
         if matches!(self.section, Section::Settings | Section::Collection(_)) {
@@ -454,6 +467,7 @@ impl FujiApp {
             Collection::RecentlyDeleted => Album::RecentlyDeleted,
             Collection::Album(i) => self.albums.get(i)?.album(),
             Collection::Shared(i) => self.shared_albums.get(i)?.album(),
+            Collection::Memory(i) => Album::Memory(self.memories.get(i)?.id.clone()),
         })
     }
 
@@ -489,6 +503,11 @@ impl FujiApp {
                     .shared_albums
                     .get(i)
                     .map(|a| SharedString::from(a.name.clone()))
+                    .unwrap_or_default(),
+                Collection::Memory(i) => self
+                    .memories
+                    .get(i)
+                    .map(|m| SharedString::from(m.title.clone()))
                     .unwrap_or_default(),
             },
         }
@@ -599,10 +618,17 @@ impl FujiApp {
                         counts.insert(index::album_slug(&album.album()), n);
                     }
                 }
-                (shared, counts)
+                let memories = list_client.memories().unwrap_or_default();
+                for memory in &memories {
+                    counts.insert(
+                        index::album_slug(&Album::Memory(memory.id.clone())),
+                        memory.assets.len(),
+                    );
+                }
+                (shared, memories, counts)
             })
             .await;
-            let Some((shared, counts)) = listed else {
+            let Some((shared, memories, counts)) = listed else {
                 return;
             };
             // Covers for what isn't empty. Hidden and Recently Deleted show
@@ -626,25 +652,55 @@ impl FujiApp {
                 })
                 .collect();
             covered.sort_by_key(index::album_slug);
+            // Memories' covers are their key photos, newest memory first.
+            let keys: Vec<(String, String)> = memories
+                .iter()
+                .filter_map(|m| {
+                    let slug = index::album_slug(&Album::Memory(m.id.clone()));
+                    Some((slug, m.key_asset.clone()?))
+                })
+                .collect();
             this.update(cx, |this, cx| {
                 if this.shared_albums != shared {
                     this.shared_albums = shared;
+                }
+                if this.memories != memories {
+                    this.memories = memories;
                 }
                 this.counts = counts;
                 cx.notify();
             })
             .ok();
+            // All at once (the network pool limits how many run), each shown
+            // as it arrives.
+            let mut pending = FuturesUnordered::new();
+            for (slug, key) in keys {
+                let (client, dir) = (client.clone(), thumb_dir.clone());
+                pending.push(
+                    net::run(move || {
+                        let asset = client.asset(&key).ok()??;
+                        let thumb = asset.thumbnail.as_ref()?;
+                        let path = thumbs::ensure(&client, &dir, &asset.id, thumb).ok()?;
+                        Some((slug, path))
+                    })
+                    .boxed_local(),
+                );
+            }
             for album in covered {
                 let (client, dir) = (client.clone(), thumb_dir.clone());
                 let slug = index::album_slug(&album);
-                let cover = net::run(move || {
-                    let first = client.fetch(&album, 0, 1).ok()?.into_iter().next()?;
-                    let thumb = first.thumbnail.as_ref()?;
-                    thumbs::ensure(&client, &dir, &first.id, thumb).ok()
-                })
-                .await
-                .flatten();
-                if let Some(path) = cover {
+                pending.push(
+                    net::run(move || {
+                        let first = client.fetch(&album, 0, 1).ok()?.into_iter().next()?;
+                        let thumb = first.thumbnail.as_ref()?;
+                        let path = thumbs::ensure(&client, &dir, &first.id, thumb).ok()?;
+                        Some((slug, path))
+                    })
+                    .boxed_local(),
+                );
+            }
+            while let Some(done) = pending.next().await {
+                if let Some(Some((slug, path))) = done {
                     this.update(cx, |this, cx| {
                         this.covers.insert(slug, path.into());
                         cx.notify();
@@ -1202,6 +1258,14 @@ impl FujiApp {
                     key: collection.key(),
                     title: this.label(Section::Collection(collection)),
                     count: this.counts.get(&slug).copied(),
+                    subtitle: match collection {
+                        Collection::Memory(i) => this
+                            .memories
+                            .get(i)
+                            .map(|m| SharedString::from(m.subtitle.clone()))
+                            .filter(|s| !s.is_empty()),
+                        _ => None,
+                    },
                     cover: this.covers.get(&slug).cloned(),
                     icon: collection.icon(),
                     badge: matches!(collection, Collection::Videos | Collection::Smart(_)),
@@ -1218,6 +1282,35 @@ impl FujiApp {
                 .text_color(theme::text())
                 .child("Collections"),
         );
+        if !self.memories.is_empty() {
+            const NEWEST: usize = 10;
+            let shown = if self.memories_expanded {
+                self.memories.len()
+            } else {
+                self.memories.len().min(NEWEST)
+            };
+            let cards = (0..shown)
+                .map(|i| card(self, Collection::Memory(i), cx))
+                .collect();
+            let toggle = (self.memories.len() > NEWEST).then(|| {
+                let label = if self.memories_expanded {
+                    "Show Fewer".to_string()
+                } else {
+                    format!("Show All ({})", self.memories.len())
+                };
+                ui::link(
+                    "memories-all",
+                    label,
+                    cx.listener(|this, _, _, cx| {
+                        this.memories_expanded = !this.memories_expanded;
+                        cx.notify();
+                    }),
+                )
+                .text_size(px(13.))
+                .into_any_element()
+            });
+            page = page.child(collections::section_with("Memories", toggle, cards));
+        }
         if !self.albums.is_empty() {
             let cards = (0..self.albums.len())
                 .map(|i| card(self, Collection::Album(i), cx))

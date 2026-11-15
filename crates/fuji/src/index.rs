@@ -92,6 +92,7 @@ pub fn album_slug(album: &Album) -> String {
         // whatever they are.
         Album::User(id) => format!("album-{}", safe_name(id)),
         Album::Shared(guid) => format!("shared-{}", safe_name(guid)),
+        Album::Memory(id) => format!("memory-{}", safe_name(id)),
     }
 }
 

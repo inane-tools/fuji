@@ -10,6 +10,7 @@ pub mod bridge;
 mod cookies;
 pub mod details;
 pub mod ids;
+pub mod memories;
 pub mod ngm;
 pub mod passkey;
 pub mod photos;
@@ -25,6 +26,7 @@ pub use auth::{
 };
 pub use bridge::BridgeApproval;
 pub use details::{Location, PhotoDetails};
+pub use memories::Memory;
 pub use passkey::{PairingKey, PasskeyAssertion, PasskeyChallenge};
 pub use photos::{Album, PhotosClient, PhotosError, SharedAlbum, SmartAlbum, UserAlbum};
 pub use profile::account_picture;

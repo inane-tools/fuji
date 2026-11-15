@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -22,6 +22,7 @@ use crate::asset::{Asset, AssetId, AssetKind, Resource};
 use crate::auth::{Account, AuthClient};
 use crate::cookies::CookieLog;
 use crate::details::{self, PhotoDetails};
+use crate::memories::{self, Memory};
 
 const CLIENT_BUILD_NUMBER: &str = "2522Project44";
 const CLIENT_MASTERING_NUMBER: &str = "2522B2";
@@ -65,6 +66,9 @@ pub enum Album {
     /// A shared album, by its GUID (served by the shared streams service,
     /// not CloudKit).
     Shared(Arc<str>),
+    /// A memory, by its `CPLMemory` record name: its photos are looked up
+    /// one by one rather than listed by an index.
+    Memory(Arc<str>),
 }
 
 /// The media types Photos collects on its own, as icloud.com lists them.
@@ -155,7 +159,7 @@ impl Album {
                 None => "CPLAssetBurstStackAssetByAssetDate".into(),
             },
             Album::User(id) => format!("CPLContainerRelationNotDeletedByAssetDate:{id}"),
-            Album::Shared(_) => return None,
+            Album::Shared(_) | Album::Memory(_) => return None,
         })
     }
 
@@ -169,8 +173,8 @@ impl Album {
             Album::RecentlyDeleted => "CPLAssetAndMasterDeletedByExpungedDate",
             Album::Hidden => "CPLAssetAndMasterHiddenByAssetDate",
             Album::User(_) => "CPLContainerRelationLiveByAssetDate",
-            // Not listed through CloudKit.
-            Album::Shared(_) => "",
+            // Not listed through a CloudKit index.
+            Album::Shared(_) | Album::Memory(_) => "",
         }
     }
 
@@ -230,6 +234,8 @@ pub struct PhotosClient {
     upload_endpoint: Option<String>,
     /// Shared albums' service, if the account has it.
     shared_endpoint: Option<String>,
+    /// Each memory's photos, once read.
+    memory_assets: Mutex<HashMap<Arc<str>, Arc<Vec<String>>>>,
     dsid: String,
     query: Vec<(&'static str, String)>,
 }
@@ -259,6 +265,7 @@ impl PhotosClient {
                     account.dsid
                 )
             }),
+            memory_assets: Mutex::default(),
             dsid: account.dsid.clone(),
             query: vec![
                 ("clientBuildNumber", CLIENT_BUILD_NUMBER.into()),
@@ -341,6 +348,132 @@ impl PhotosClient {
         })
     }
 
+    /// The memories Photos made, newest first, each with the photos it
+    /// shows (remembered, so opening one needn't ask again).
+    pub fn memories(&self) -> Result<Vec<Memory>, PhotosError> {
+        let mut found = Vec::new();
+        let mut rank = 0;
+        loop {
+            let data = self.post(
+                "records/query",
+                &json!({
+                    "query": {
+                        "recordType": "CPLMemoryNotIsRejectedByCreateDate",
+                        "filterBy": [
+                            {
+                                "fieldName": "startRank",
+                                "fieldValue": { "type": "INT64", "value": rank },
+                                "comparator": "EQUALS",
+                            },
+                            {
+                                "fieldName": "direction",
+                                "fieldValue": { "type": "STRING", "value": "ASCENDING" },
+                                "comparator": "EQUALS",
+                            },
+                        ],
+                    },
+                    "resultsLimit": MEMORY_PAGE,
+                    "desiredKeys": ["title", "subtitle", "assetList", "isFavorite", "createDate"],
+                    "zoneID": { "zoneName": "PrimarySync" },
+                }),
+            )?;
+            let records = data["records"].as_array().cloned().unwrap_or_default();
+            rank += records.len();
+            found.extend(records.iter().filter_map(memories::parse));
+            if records.len() < MEMORY_PAGE || rank > 10_000 {
+                break;
+            }
+        }
+        found.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
+        if let Ok(mut known) = self.memory_assets.lock() {
+            for memory in &found {
+                known.insert(memory.id.clone(), memory.assets.clone());
+            }
+        }
+        Ok(found)
+    }
+
+    /// The photos a memory shows, asking iCloud if they aren't known yet.
+    fn memory_assets(&self, id: &Arc<str>) -> Result<Arc<Vec<String>>, PhotosError> {
+        if let Some(known) = self
+            .memory_assets
+            .lock()
+            .ok()
+            .and_then(|m| m.get(id).cloned())
+        {
+            return Ok(known);
+        }
+        let record = self
+            .lookup(&[id.to_string()], &["assetList"])?
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Null);
+        let assets = record["fields"]["assetList"]["value"]
+            .as_str()
+            .and_then(|v| BASE64.decode(v).ok())
+            .map(|b| memories::asset_list(&b).0)
+            .unwrap_or_default();
+        let assets = Arc::new(assets);
+        if let Ok(mut known) = self.memory_assets.lock() {
+            known.insert(id.clone(), assets.clone());
+        }
+        Ok(assets)
+    }
+
+    /// Records by name, in the order asked for (missing ones as errors in
+    /// place, which parse as nothing).
+    fn lookup(&self, names: &[String], keys: &[&str]) -> Result<Vec<Value>, PhotosError> {
+        let mut out = Vec::with_capacity(names.len());
+        for chunk in names.chunks(MAX_PAGE) {
+            let records: Vec<Value> = chunk.iter().map(|n| json!({ "recordName": n })).collect();
+            let data = self.post(
+                "records/lookup",
+                &json!({
+                    "records": records,
+                    "zoneID": { "zoneName": "PrimarySync" },
+                    "desiredKeys": keys,
+                }),
+            )?;
+            out.extend(data["records"].as_array().cloned().unwrap_or_default());
+        }
+        Ok(out)
+    }
+
+    /// Assets by `CPLAsset` record name, in that order, with their masters.
+    fn assets_by_name(&self, names: &[String], keys: &[&str]) -> Result<Vec<Asset>, PhotosError> {
+        let assets = self.lookup(names, keys)?;
+        let master_names: Vec<String> = assets
+            .iter()
+            .filter_map(|a| a["fields"]["masterRef"]["value"]["recordName"].as_str())
+            .map(str::to_string)
+            .collect();
+        let masters: HashMap<String, Value> = self
+            .lookup(&master_names, keys)?
+            .into_iter()
+            .filter_map(|m| Some((m["recordName"].as_str()?.to_string(), m)))
+            .collect();
+        Ok(assets
+            .iter()
+            .map(|asset| {
+                let master = asset["fields"]["masterRef"]["value"]["recordName"]
+                    .as_str()
+                    .and_then(|name| masters.get(name));
+                master
+                    .and_then(|master| parse_asset(asset, master))
+                    .unwrap_or_else(|| missing_asset(asset))
+            })
+            .collect())
+    }
+
+    /// One asset by its record name (a memory's key photo, say).
+    pub fn asset(&self, name: &str) -> Result<Option<Asset>, PhotosError> {
+        Ok(self
+            .assets_by_name(&[name.to_string()], DESIRED_KEYS)?
+            .into_iter()
+            .next()
+            .filter(|a| a.thumbnail.is_some()))
+    }
+
     /// Item counts for several of iCloud's count indexes in one request:
     /// (index id, count) for each index iCloud knows.
     pub fn index_counts(&self, ids: &[String]) -> Result<Vec<(String, usize)>, PhotosError> {
@@ -378,6 +511,9 @@ impl PhotosClient {
     }
 
     pub fn count(&self, album: &Album) -> Result<usize, PhotosError> {
+        if let Album::Memory(id) = album {
+            return Ok(self.memory_assets(id)?.len());
+        }
         if let Album::Shared(guid) = album {
             let data = self.shared_post("webgetassetcount", &json!({ "albumguid": &**guid }))?;
             return data["albumassetcount"]
@@ -448,6 +584,12 @@ impl PhotosClient {
         limit: usize,
         keys: &[&str],
     ) -> Result<Vec<Asset>, PhotosError> {
+        if let Album::Memory(id) = album {
+            let names = self.memory_assets(id)?;
+            let end = (start_rank + limit).min(names.len());
+            let page = names.get(start_rank..end).unwrap_or_default();
+            return self.assets_by_name(page, keys);
+        }
         let mut assets = Vec::with_capacity(limit);
         let mut masters: HashMap<String, Value> = HashMap::new();
         while assets.len() < limit {
@@ -733,6 +875,9 @@ fn list_query(album: &Album, start_rank: usize, limit: usize, keys: &[&str]) -> 
 }
 
 /// Just enough to index and lay out the library.
+/// Memories asked for at a time.
+const MEMORY_PAGE: usize = 100;
+
 const SCAN_KEYS: &[&str] = &[
     "recordName",
     "recordType",
