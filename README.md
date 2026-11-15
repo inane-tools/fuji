@@ -11,6 +11,8 @@ iCloud library, without a Mac.
 **Version 1.0, “Kanagawa-oki”.** Each release is named after one of Hokusai's
 *Thirty-six Views of Mount Fuji*.
 
+![Fuji's library in dark mode](docs/screenshots/library-dark.webp)
+
 > Fuji is unofficial and isn't affiliated with or endorsed by Apple. It uses
 > the same private web services as icloud.com, which Apple can change at any
 > time. See the [disclaimer](#disclaimer).
@@ -36,6 +38,14 @@ iCloud library, without a Mac.
 - **Looks like it belongs:** light and dark mode, Windows' accent color or
   Apple's blue, and a custom title bar that still snaps and drags like any
   window.
+
+| | |
+| --- | --- |
+| ![Collections, in light mode](docs/screenshots/collections-light.webp) | ![The viewer](docs/screenshots/viewer-dark.webp) |
+| ![The library, in light mode, with the account menu](docs/screenshots/account-light.webp) | ![Settings](docs/screenshots/settings-dark.webp) |
+
+The screenshots show a made-up library; its photos are public domain or CC0
+([credits](docs/screenshots/CREDITS.md)).
 
 Not yet: Live Photo motion, editing (favorite, hide, delete, add to album),
 People and Trips (not available on the web), and the iCloud Shared Library.
