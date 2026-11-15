@@ -1,10 +1,12 @@
 //! Design tokens. Neutral near-black surfaces, a zinc text ladder and one
-//! restrained accent (the mint from the app icon), after the dotmd UI
+//! accent (the system's, or the mint from the app icon), after the dotmd UI
 //! guidelines. Components use these roles, never raw colors.
+
+use std::sync::OnceLock;
 
 use gpui::{Hsla, Pixels, px, rgb, rgba};
 
-pub const FONT: &str = "Gabarito";
+pub const FONT: &str = "Hanken Grotesk";
 
 // Surfaces
 pub fn surface() -> Hsla {
@@ -59,19 +61,33 @@ pub fn text_meta() -> Hsla {
     rgb(0x71717a).into()
 }
 
-// Accent: a fill for selection and the primary action, and a lighter
-// foreground tuned for text and icons.
+// Accent: the system's accent color where there is one (Windows), else the
+// mint from the app icon. A fill for selection and the primary action, and
+// a lighter foreground tuned for text and icons on the dark surfaces.
+fn system_accent() -> Hsla {
+    static ACCENT: OnceLock<Hsla> = OnceLock::new();
+    *ACCENT.get_or_init(|| rgb(crate::platform::accent_color().unwrap_or(0x2f8f77)).into())
+}
 pub fn accent() -> Hsla {
-    rgb(0x2f8f77).into()
+    let mut color = system_accent();
+    // Dark enough for white text, light enough to see on near-black.
+    color.l = color.l.clamp(0.32, 0.5);
+    color
 }
 pub fn accent_hover() -> Hsla {
-    rgb(0x37a487).into()
+    let mut color = accent();
+    color.l += 0.06;
+    color
 }
 pub fn accent_text() -> Hsla {
-    rgb(0x82d4bc).into()
+    let mut color = system_accent();
+    color.l = color.l.max(0.7);
+    color
 }
 pub fn accent_soft() -> Hsla {
-    rgba(0x2f8f7733).into()
+    let mut color = accent();
+    color.a = 0.2;
+    color
 }
 pub fn focus_ring() -> Hsla {
     let mut color: Hsla = accent_text();
@@ -85,7 +101,8 @@ pub fn danger() -> Hsla {
 }
 
 // Rounding by role
-pub const RADIUS_CONTROL: Pixels = px(8.);
+/// Buttons, fields and tabs are pills (GPUI clamps this to half the height).
+pub const RADIUS_CONTROL: Pixels = px(999.);
 pub const RADIUS_TILE: Pixels = px(6.);
 pub const RADIUS_DIALOG: Pixels = px(16.);
 

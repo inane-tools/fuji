@@ -6,9 +6,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    Animation, AnimationExt as _, App, ClickEvent, ElementId, FontWeight, Hsla, ObjectFit, Pixels,
-    Point, SharedString, Transformation, Window, anchored, deferred, div, img, percentage,
-    prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, ClickEvent, Corner, CursorStyle,
+    ElementId, FontWeight, HitboxBehavior, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Transformation, Window, anchored, canvas,
+    deferred, div, img, percentage, prelude::*, px,
 };
 
 use crate::anim;
@@ -218,6 +219,150 @@ pub fn loading_status(
         .child(text.into())
 }
 
+// ---- Slider -----------------------------------------------------------------
+
+type SliderHandler = Rc<dyn Fn(f32, &mut Window, &mut App)>;
+
+/// A horizontal slider over 0..=1: click or drag anywhere on it.
+#[derive(IntoElement)]
+pub struct Slider {
+    id: ElementId,
+    value: f32,
+    width: Pixels,
+    on_change: SliderHandler,
+}
+
+pub fn slider(
+    id: impl Into<ElementId>,
+    value: f32,
+    width: Pixels,
+    on_change: impl Fn(f32, &mut Window, &mut App) + 'static,
+) -> Slider {
+    Slider {
+        id: id.into(),
+        value,
+        width,
+        on_change: Rc::new(on_change),
+    }
+}
+
+const SLIDER_KNOB: f32 = 14.;
+
+/// Where along the slider a pointer is, 0..=1.
+fn slider_fraction(bounds: Bounds<Pixels>, x: Pixels) -> f32 {
+    let travel = f32::from(bounds.size.width) - SLIDER_KNOB;
+    if travel <= 0. {
+        return 0.;
+    }
+    ((f32::from(x - bounds.left()) - SLIDER_KNOB / 2.) / travel).clamp(0., 1.)
+}
+
+impl RenderOnce for Slider {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Whether this slider is being dragged, kept between frames.
+        let dragging = window.use_keyed_state(self.id.clone(), cx, |_, _| false);
+        let value = if self.value.is_finite() {
+            self.value.clamp(0., 1.)
+        } else {
+            0.
+        };
+        let travel = f32::from(self.width) - SLIDER_KNOB;
+        let knob_x = value * travel;
+        let on_change = self.on_change;
+        let held = *dragging.read(cx);
+
+        let events = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |bounds, hitbox, window, _| {
+                window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                let (down_state, down_change) = (dragging.clone(), on_change.clone());
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase.bubble()
+                        && event.button == MouseButton::Left
+                        && hitbox.is_hovered(window)
+                    {
+                        down_state.update(cx, |held, cx| {
+                            *held = true;
+                            cx.notify();
+                        });
+                        down_change(slider_fraction(bounds, event.position.x), window, cx);
+                        cx.stop_propagation();
+                    }
+                });
+                let (move_state, move_change) = (dragging.clone(), on_change.clone());
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase.bubble() && *move_state.read(cx) {
+                        if event.dragging() {
+                            move_change(slider_fraction(bounds, event.position.x), window, cx);
+                        } else {
+                            move_state.update(cx, |held, cx| {
+                                *held = false;
+                                cx.notify();
+                            });
+                        }
+                    }
+                });
+                let up_state = dragging.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase.bubble() && *up_state.read(cx) {
+                        up_state.update(cx, |held, cx| {
+                            *held = false;
+                            cx.notify();
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
+        div()
+            .id(self.id)
+            .relative()
+            .w(self.width)
+            .h(px(20.))
+            .flex_none()
+            // The track, filled up to the knob.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(SLIDER_KNOB / 2.))
+                    .right(px(SLIDER_KNOB / 2.))
+                    .top(px(8.))
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(theme::fill_hover()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(SLIDER_KNOB / 2.))
+                    .top(px(8.))
+                    .w(px(knob_x))
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(theme::accent()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(knob_x))
+                    .top(px(3.))
+                    .size(px(SLIDER_KNOB))
+                    .rounded_full()
+                    .bg(if held {
+                        theme::text_title()
+                    } else {
+                        theme::text()
+                    })
+                    .shadow_sm(),
+            )
+            .child(events)
+    }
+}
+
 // ---- Context menu -----------------------------------------------------------
 
 pub struct MenuItem {
@@ -261,6 +406,19 @@ impl MenuItem {
 pub fn context_menu(
     serial: u64,
     position: Point<Pixels>,
+    items: Vec<MenuItem>,
+    dismiss: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    popup_menu(serial, position, Corner::TopLeft, None, items, dismiss)
+}
+
+/// A menu with that `corner` at `position`, and something above its items
+/// (the account menu's name and picture).
+pub fn popup_menu(
+    serial: u64,
+    position: Point<Pixels>,
+    corner: Corner,
+    header: Option<AnyElement>,
     items: Vec<MenuItem>,
     dismiss: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -317,6 +475,7 @@ pub fn context_menu(
         .rounded(px(12.))
         .shadow_lg()
         .on_mouse_down_out(move |_, window, cx| dismiss_out(window, cx))
+        .children(header)
         .children(rows)
         .with_animation(
             ElementId::NamedInteger("menu-open".into(), serial),
@@ -326,6 +485,7 @@ pub fn context_menu(
     deferred(
         anchored()
             .position(position)
+            .anchor(corner)
             .snap_to_window_with_margin(px(8.))
             .child(panel),
     )

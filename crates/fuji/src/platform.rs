@@ -390,6 +390,37 @@ pub fn native_handle(window: &gpui::Window) -> Option<isize> {
 /// Whether dragging files out works on this system.
 pub const CAN_DRAG_OUT: bool = cfg!(windows);
 
+/// The accent color picked in Windows' personalization settings, as
+/// 0xRRGGBB.
+#[cfg(windows)]
+pub fn accent_color() -> Option<u32> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::w;
+    let mut abgr = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: the buffer is a u32 and `size` says so.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\DWM"),
+            w!("AccentColor"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut abgr as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    status.is_ok().then(|| {
+        let [r, g, b, _] = abgr.to_le_bytes();
+        u32::from_be_bytes([0, r, g, b])
+    })
+}
+
+#[cfg(not(windows))]
+pub fn accent_color() -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

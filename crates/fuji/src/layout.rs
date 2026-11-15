@@ -20,6 +20,8 @@ pub struct Params {
     pub padding_right: f32,
     pub target_height: f32,
     pub gap: f32,
+    /// Space above the first row (the gallery's header floats over it).
+    pub top_padding: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,7 +73,6 @@ pub const MONTH_HEIGHT: f32 = 52.;
 pub const DAY_HEIGHT: f32 = 36.;
 /// Space after a day's photos.
 const DAY_SPACING: f32 = 16.;
-const TOP_PADDING: f32 = 4.;
 const BOTTOM_PADDING: f32 = 32.;
 /// Very wide or tall photos are cropped to these proportions in the mosaic.
 const MIN_ASPECT: f32 = 0.5;
@@ -165,7 +166,7 @@ pub fn build(items: &[IndexItem], days: &[Option<Date>], params: Params, today: 
     };
     let inner =
         (params.width - 2. * params.padding_x - params.padding_right).max(params.target_height);
-    let mut y = TOP_PADDING;
+    let mut y = params.top_padding;
 
     let mut last_month = None;
     let mut seen_unknown = false;
@@ -350,6 +351,7 @@ mod tests {
         padding_right: 0.,
         target_height: 200.,
         gap: 4.,
+        top_padding: 4.,
     };
 
     fn item(day: Date, aspect: f32) -> IndexItem {

@@ -147,6 +147,8 @@ pub struct FujiApp {
     tab_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
     /// The open Albums menu: its opening's serial and where it hangs.
     albums_menu: Option<(u64, Point<Pixels>)>,
+    /// The open account menu, the same way (it hangs from its right corner).
+    account_menu: Option<(u64, Point<Pixels>)>,
     menu_serial: u64,
     search: Entity<TextInput>,
     /// The query the gallery was last given.
@@ -176,6 +178,7 @@ impl FujiApp {
             pill_placed: false,
             tab_bounds: Rc::default(),
             albums_menu: None,
+            account_menu: None,
             menu_serial: 0,
             search,
             search_text: SharedString::default(),
@@ -494,6 +497,7 @@ impl FujiApp {
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
         self.albums_menu = None;
+        self.account_menu = None;
         if self.show_section_in_grid(section, cx)
             && let Screen::Main {
                 grid: Some(grid), ..
@@ -664,6 +668,99 @@ impl FujiApp {
         self.menu_serial += 1;
         self.albums_menu = Some((self.menu_serial, at));
         cx.notify();
+    }
+
+    fn open_account_menu(&mut self, cx: &mut Context<Self>) {
+        if self.account_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let at = self
+            .tab_bounds
+            .borrow()
+            .get(&Section::Settings.tab_key())
+            .map(|b| {
+                point(
+                    b.origin.x + b.size.width,
+                    b.origin.y + b.size.height + px(6.),
+                )
+            })
+            .unwrap_or_else(|| point(px(800.), titlebar::HEIGHT));
+        self.menu_serial += 1;
+        self.account_menu = Some((self.menu_serial, at));
+        cx.notify();
+    }
+
+    /// The account's picture and name, then Settings and Log Out.
+    fn render_account_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (serial, at) = self.account_menu?;
+        let Screen::Main { account, .. } = &self.screen else {
+            return None;
+        };
+        let name = display_name(account);
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(8.))
+            .pt(px(6.))
+            .pb(px(10.))
+            .mb(px(4.))
+            .border_b_1()
+            .border_color(theme::line())
+            .child(ui::avatar(self.avatar.clone(), &name, px(36.)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .truncate()
+                            .child(name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_meta())
+                            .truncate()
+                            .child(account.apple_id.clone()),
+                    ),
+            )
+            .into_any_element();
+        let this = cx.entity().downgrade();
+        let (to_settings, to_sign_out, on_dismiss) = (this.clone(), this.clone(), this);
+        let items = vec![
+            ui::MenuItem::new("settings", "Settings", move |window, cx| {
+                to_settings
+                    .update(cx, |this, cx| this.select(Section::Settings, window, cx))
+                    .ok();
+            }),
+            ui::MenuItem::new("sign-out", "Log Out", move |window, cx| {
+                to_sign_out
+                    .update(cx, |this, cx| this.sign_out(window, cx))
+                    .ok();
+            }),
+        ];
+        Some(ui::popup_menu(
+            serial,
+            at,
+            gpui::Corner::TopRight,
+            Some(header),
+            items,
+            move |_, cx| {
+                on_dismiss
+                    .update(cx, |this, cx| {
+                        this.account_menu = None;
+                        cx.notify();
+                    })
+                    .ok();
+            },
+        ))
     }
 
     fn render_albums_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -863,55 +960,43 @@ impl FujiApp {
             tabs
         });
 
-        let right =
-            main.then(|| {
-                let (name, avatar) = match &self.screen {
-                    Screen::Main { account, .. } => (display_name(account), self.avatar.clone()),
-                    _ => (String::new(), None),
-                };
-                titlebar::drag_area()
-                    .flex_none()
-                    .gap(px(4.))
-                    .pr(px(8.))
-                    .child(
-                        div()
-                            .occlude()
-                            .key_context(SEARCH_CONTEXT)
-                            .on_action(cx.listener(Self::close_search))
-                            .w(px(if wide { 240. } else { 170. }))
-                            .mr(px(4.))
-                            .child(self.search.clone()),
-                    )
-                    .child(
-                        self.tab(
-                            Section::Settings.key(),
-                            "settings",
-                            None,
-                            self.section == Section::Settings,
-                            false,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.select(Section::Settings, window, cx)
-                        })),
-                    )
-                    .child(
-                        div()
-                            .id("account")
-                            .occlude()
-                            .size(px(28.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .hover(|el| el.bg(theme::hover()))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.select(Section::Settings, window, cx)
-                            }))
-                            .child(ui::avatar(avatar, &name, px(22.))),
-                    )
-            });
+        let right = main.then(|| {
+            let (name, avatar) = match &self.screen {
+                Screen::Main { account, .. } => (display_name(account), self.avatar.clone()),
+                _ => (String::new(), None),
+            };
+            titlebar::drag_area()
+                .flex_none()
+                .gap(px(4.))
+                .pr(px(8.))
+                .child(
+                    div()
+                        .occlude()
+                        .key_context(SEARCH_CONTEXT)
+                        .on_action(cx.listener(Self::close_search))
+                        .w(px(if wide { 240. } else { 170. }))
+                        .mr(px(4.))
+                        .child(self.search.clone()),
+                )
+                .child(
+                    div()
+                        .id("account")
+                        .relative()
+                        .occlude()
+                        .size(px(28.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(|el| el.bg(theme::hover()))
+                        .when(self.account_menu.is_some(), |el| el.bg(theme::hover()))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_account_menu(cx)))
+                        .child(self.measured(Section::Settings.tab_key()))
+                        .child(ui::avatar(avatar, &name, px(22.))),
+                )
+        });
 
         div()
             .relative()
@@ -949,7 +1034,8 @@ impl Render for FujiApp {
             .when(titlebar::CUSTOM || main, |el| {
                 el.child(self.render_bar(window, cx))
             })
-            .children(self.render_albums_menu(cx));
+            .children(self.render_albums_menu(cx))
+            .children(self.render_account_menu(cx));
         let body = div().flex_1().min_h_0();
 
         let (grid, settings) = match &self.screen {

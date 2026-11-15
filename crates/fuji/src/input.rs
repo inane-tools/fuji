@@ -738,6 +738,31 @@ impl Render for TextInput {
                     .min_w_0()
                     .child(TextElement { input: cx.entity() }),
             )
+            // A toolbar field clears with a click.
+            .when(
+                self.compact_icon.is_some() && !self.text().is_empty(),
+                |el| {
+                    el.child(
+                        div()
+                            .id("clear-field")
+                            .size(px(16.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .bg(theme::fill_hover())
+                            .hover(|el| el.bg(theme::field_border()))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.clear(cx);
+                                this.focus_handle.focus(window);
+                            }))
+                            .child(crate::assets::icon("close", px(8.), theme::text_muted())),
+                    )
+                },
+            )
     }
 }
 

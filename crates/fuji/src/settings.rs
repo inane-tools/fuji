@@ -42,6 +42,16 @@ impl Default for Settings {
 
 impl Global for Settings {}
 
+/// Where a row height sits on a zoom slider, 0..=1 (even steps per doubling).
+pub fn zoom_fraction(row_height: f32) -> f32 {
+    ((row_height / MIN_ROW_HEIGHT).ln() / (MAX_ROW_HEIGHT / MIN_ROW_HEIGHT).ln()).clamp(0., 1.)
+}
+
+/// The row height at a zoom slider position.
+pub fn row_height_at(fraction: f32) -> f32 {
+    MIN_ROW_HEIGHT * (MAX_ROW_HEIGHT / MIN_ROW_HEIGHT).powf(fraction.clamp(0., 1.))
+}
+
 fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("fuji").join("settings.json"))
 }
@@ -222,14 +232,14 @@ impl Render for SettingsView {
                         "minus",
                         cx.listener(|this, _, _, cx| this.resize(1. / ROW_HEIGHT_STEP, cx)),
                     ))
-                    .child(
-                        div()
-                            .w(px(52.))
-                            .text_center()
-                            .text_size(px(12.))
-                            .text_color(theme::text_muted())
-                            .child(format!("{} px", settings.row_height.round())),
-                    )
+                    .child(ui::slider(
+                        "thumbs-size",
+                        zoom_fraction(settings.row_height),
+                        px(140.),
+                        |fraction, _, cx| {
+                            Settings::update(cx, |s| s.row_height = row_height_at(fraction))
+                        },
+                    ))
                     .child(ui::icon_button(
                         "thumbs-larger",
                         "plus",
@@ -300,7 +310,7 @@ impl Render for SettingsView {
                 .child(ui::text_button(
                     "settings-sign-out",
                     Some("sign-out"),
-                    "Sign out",
+                    "Log Out",
                     cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::SignOut)),
                 )),
         );
@@ -357,8 +367,8 @@ impl Render for SettingsView {
                         .text_size(px(12.))
                         .text_color(theme::text_meta())
                         .child(
-                            "Set in Gabarito (SIL Open Font License), with Phosphor icons \
-                             (MIT). Fuji is an independent project and is not affiliated \
+                            "Set in Hanken Grotesk (SIL Open Font License), with Framework7 \
+                             Icons (MIT). Fuji is an independent project and is not affiliated \
                              with Apple. iCloud is a trademark of Apple Inc.",
                         ),
                 )
@@ -374,8 +384,12 @@ impl Render for SettingsView {
             .size_full()
             .overflow_y_scroll()
             .bg(theme::surface())
+            .flex()
+            .flex_col()
+            .items_center()
             .child(
                 div()
+                    .w_full()
                     .max_w(px(680.))
                     .px(px(theme::CONTENT_PADDING))
                     .pt(px(12.))
@@ -528,6 +542,22 @@ mod tests {
             parse(br#"{ "row_height": 99999 }"#).row_height,
             MAX_ROW_HEIGHT
         );
+    }
+
+    #[test]
+    fn zoom_slider_round_trips() {
+        assert_eq!(zoom_fraction(MIN_ROW_HEIGHT), 0.);
+        assert!((zoom_fraction(MAX_ROW_HEIGHT) - 1.).abs() < 1e-5);
+        for h in [
+            MIN_ROW_HEIGHT,
+            120.,
+            DEFAULT_ROW_HEIGHT,
+            333.,
+            MAX_ROW_HEIGHT,
+        ] {
+            assert!((row_height_at(zoom_fraction(h)) - h).abs() < 0.01);
+        }
+        assert_eq!(zoom_fraction(1.), 0.);
     }
 
     #[test]

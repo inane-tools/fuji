@@ -104,6 +104,8 @@ const FLYING_VIEWPORTS: f32 = 1.5;
 /// The strip on the right holding the timeline scrubber.
 const SCRUBBER_WIDTH: f32 = 48.;
 const SCRUBBER_INSET: f32 = 14.;
+/// The header floats over the top of the mosaic, which starts below it.
+const HEADER_SPACE: f32 = 88.;
 /// How long the scrubber's date stays up after scrolling.
 const SCRUBBER_LINGER: Duration = Duration::from_millis(900);
 /// How far the pointer moves with the button down before a drag starts.
@@ -236,6 +238,8 @@ pub struct PhotoGrid {
     search: Option<Search>,
     /// What's typed in the search field, kept across album changes.
     search_text: String,
+    /// The month at the top of the mosaic, for the header.
+    month_in_view: Option<(i16, i8)>,
     /// A device is searching for `search_text`; its name if known.
     device_pending: Option<SharedString>,
     scan: Option<Scan>,
@@ -341,6 +345,7 @@ impl PhotoGrid {
             days: Vec::new(),
             search: None,
             search_text: String::new(),
+            month_in_view: None,
             device_pending: None,
             scan: None,
             layout: None,
@@ -1399,6 +1404,7 @@ impl PhotoGrid {
             padding_right: SCRUBBER_WIDTH - theme::CONTENT_PADDING,
             target_height: self.row_height.get(),
             gap: TILE_GAP,
+            top_padding: HEADER_SPACE,
         };
         self.layout = Some(layout::build(&self.index, &self.days, params, today));
         self.layout_dirty = false;
@@ -1494,6 +1500,7 @@ impl PhotoGrid {
                 })
                 .into_any_element()
         } else {
+            let weak = cx.weak_entity();
             div()
                 .flex()
                 .items_center()
@@ -1503,6 +1510,17 @@ impl PhotoGrid {
                     "minus",
                     cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
                 ))
+                .child(ui::slider(
+                    "zoom-slider",
+                    settings::zoom_fraction(self.row_height.target()),
+                    px(110.),
+                    move |fraction, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.zoom_to(settings::row_height_at(fraction), None, cx)
+                        })
+                        .ok();
+                    },
+                ))
                 .child(ui::icon_button(
                     "zoom-in",
                     "plus",
@@ -1511,29 +1529,76 @@ impl PhotoGrid {
                 .into_any_element()
         };
 
+        // Under the title: the month in view, then the count.
+        let month = self
+            .month_in_view
+            .filter(|_| self.search.is_none())
+            .map(|(year, month)| format!("{} {year}", layout::month_name(month)));
+        let subtitle: Vec<String> = month.into_iter().chain(count).collect();
+        let surface = theme::surface();
+        let mut clear = surface;
+        clear.a = 0.;
+
         div()
-            .flex_none()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            // Scrolling goes through to the mosaic; clicks don't.
+            .block_mouse_except_scroll()
             .flex()
             .items_center()
             .gap_3()
-            .px(px(theme::CONTENT_PADDING))
-            .pt(px(12.))
-            .pb(px(8.))
+            .pl(px(theme::CONTENT_PADDING))
+            .pr(px(SCRUBBER_WIDTH))
+            .pt(px(10.))
+            .pb(px(28.))
+            // Solid behind the title, fading out over the photos.
+            .bg(gpui::linear_gradient(
+                180.,
+                gpui::linear_color_stop(surface, 0.7),
+                gpui::linear_color_stop(clear, 1.),
+            ))
             .child(
                 div()
                     .flex()
-                    .items_baseline()
-                    .gap_3()
+                    .flex_col()
                     .child(
                         div()
                             .text_size(px(26.))
+                            .line_height(px(32.))
                             .font_weight(FontWeight::EXTRA_BOLD)
                             .text_color(theme::text())
                             .child(self.title.clone()),
                     )
-                    .when_some(count, |el, count| {
-                        el.child(div().text_sm().text_color(theme::text_meta()).child(count))
-                    }),
+                    .child(
+                        div()
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(13.))
+                            .children(subtitle.into_iter().enumerate().map(|(i, part)| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .when(i > 0, |el| {
+                                        el.child(
+                                            div().text_color(theme::text_meta()).child("\u{00b7}"),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .when(i == 0, |el| {
+                                                el.font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme::text_title())
+                                            })
+                                            .when(i > 0, |el| el.text_color(theme::text_meta()))
+                                            .child(part),
+                                    )
+                            })),
+                    ),
             )
             .child(div().flex_1())
             .when_some(status, |el, status| {
@@ -1808,8 +1873,7 @@ impl PhotoGrid {
 
 impl Render for PhotoGrid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = self.render_header(cx);
-
+        self.month_in_view = None;
         let body: AnyElement = match &self.state {
             LoadState::Loading => centered(
                 div()
@@ -1868,6 +1932,7 @@ impl Render for PhotoGrid {
             }
             LoadState::Ready => self.render_mosaic(window, cx),
         };
+        let header = self.render_header(cx);
         // Fade the album in when it changes.
         let body = div()
             .flex_1()
@@ -1904,8 +1969,8 @@ impl Render for PhotoGrid {
             .flex()
             .flex_col()
             .bg(theme::surface())
-            .child(header)
             .child(body)
+            .child(header)
             .when_some(self.viewer.as_ref(), |el, (viewer, _)| {
                 el.child(viewer.clone())
             })
@@ -1972,6 +2037,12 @@ impl PhotoGrid {
         let flying = self.scroller.is_moving()
             && !zooming
             && (self.scroller.target() - top).abs() > viewport_h * FLYING_VIEWPORTS;
+
+        // The month under the header, once its own heading has gone under.
+        self.month_in_view = layout
+            .month_at(top + HEADER_SPACE * 0.7)
+            .filter(|mark| mark.y + layout::MONTH_HEIGHT < top + HEADER_SPACE)
+            .map(|mark| (mark.year, mark.month));
 
         let rows = layout.rows_in(top - OVERSCAN, top + viewport_h + OVERSCAN);
         if !flying {

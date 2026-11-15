@@ -1,8 +1,10 @@
 //! Files compiled into the binary: icons, the app mark and the UI font.
 //!
-//! Icons are Phosphor (MIT, see assets/icons/LICENSE-phosphor), extracted
-//! from the icon font as small SVGs: regular weight when idle, fill when
-//! active. A few simple ones (check, plus, sliders, ...) are drawn for fuji. Gabarito is under the OFL (assets/OFL-Gabarito.txt).
+//! Icons are Framework7 Icons (MIT, see assets/icons/LICENSE-framework7),
+//! drawn to match Apple's SF Symbols: outline when idle, fill when active.
+//! The Live Photo mark is Phosphor (MIT, assets/icons/LICENSE-phosphor) and
+//! the spinner is drawn for Fuji. The UI font, Hanken Grotesk, is under the
+//! OFL (assets/OFL-HankenGrotesk.txt).
 
 use std::borrow::Cow;
 
@@ -47,7 +49,6 @@ impl AssetSource for Assets {
                 "play-fill",
                 "live",
                 "warning",
-                // Drawn for fuji in the same style.
                 "check",
                 "plus",
                 "minus",
@@ -59,6 +60,7 @@ impl AssetSource for Assets {
                 "open",
                 "select",
                 "upload",
+                "person",
             ]
         );
         Ok(bytes.map(Cow::Borrowed))
@@ -69,9 +71,9 @@ impl AssetSource for Assets {
     }
 }
 
-pub const FONT_BYTES: &[u8] = include_bytes!("../assets/Gabarito.ttf");
+pub const FONT_BYTES: &[u8] = include_bytes!("../assets/HankenGrotesk.ttf");
 
-/// A Phosphor icon by name (see the list above), sized and tinted.
+/// An icon by name (see the list above), sized and tinted.
 pub fn icon(name: &str, size: Pixels, color: Hsla) -> Svg {
     svg()
         .path(SharedString::from(format!("icons/{name}.svg")))
