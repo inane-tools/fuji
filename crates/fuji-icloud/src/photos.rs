@@ -24,9 +24,10 @@ use crate::cookies::CookieLog;
 
 const CLIENT_BUILD_NUMBER: &str = "2522Project44";
 const CLIENT_MASTERING_NUMBER: &str = "2522B2";
-/// CloudKit returns a master and an asset record per item.
-const RECORDS_PER_ITEM: usize = 2;
 const MAX_PAGE: usize = 200;
+/// CloudKit rejects a `resultsLimit` of 2 or less ("Result size limit must
+/// be greater than 2").
+const MIN_RESULTS: usize = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PhotosError {
@@ -78,6 +79,15 @@ impl Album {
             Album::Favorites | Album::Videos => "CPLAssetAndMasterInSmartAlbumByAssetDate",
             Album::RecentlyDeleted => "CPLAssetAndMasterDeletedByExpungedDate",
             Album::User(_) => "CPLContainerRelationLiveByAssetDate",
+        }
+    }
+
+    /// Records a list query returns per item: a master and an asset, plus
+    /// the album membership (`CPLContainerRelation`) in a user album.
+    fn records_per_item(&self) -> usize {
+        match self {
+            Album::User(_) => 3,
+            _ => 2,
         }
     }
 
@@ -470,7 +480,7 @@ fn list_query(album: &Album, start_rank: usize, limit: usize, keys: &[&str]) -> 
     }
     json!({
         "query": { "filterBy": filters, "recordType": album.list_type() },
-        "resultsLimit": limit * RECORDS_PER_ITEM,
+        "resultsLimit": (limit * album.records_per_item()).max(MIN_RESULTS),
         "desiredKeys": keys,
         "zoneID": { "zoneName": "PrimarySync" },
     })
@@ -845,6 +855,10 @@ mod tests {
             q["query"]["recordType"],
             "CPLContainerRelationLiveByAssetDate"
         );
+        // Each item is three records here, and Apple wants more than two.
+        assert_eq!(q["resultsLimit"], 30);
+        assert_eq!(list_query(&album, 0, 1, SCAN_KEYS)["resultsLimit"], 3);
+        assert_eq!(list_query(&Album::All, 0, 1, SCAN_KEYS)["resultsLimit"], 3);
         let filters = q["query"]["filterBy"].as_array().unwrap();
         assert_eq!(filters[2]["fieldName"], "parentId");
         assert_eq!(filters[2]["fieldValue"]["value"], "ABC-123");

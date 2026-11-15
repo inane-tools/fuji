@@ -153,3 +153,48 @@ fn clear_cookies() {
     }
     write(COOKIE_KEY, None);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fuji_icloud::PhotosClient;
+
+    /// Reads (never writes) the signed-in library's albums with the saved
+    /// session. Run with `cargo test -p fuji live_albums -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_albums() {
+        let saved = load().expect("a saved session: sign in to fuji first");
+        let auth = AuthClient::from_saved(&saved);
+        restore_cookies(&auth);
+        let account = auth.resume().expect("session resumes");
+        persist(&auth);
+        let client = PhotosClient::new(&auth, &account).expect("photos service");
+        let albums = client.albums().expect("album list");
+        println!("{} albums", albums.len());
+        for (n, album) in albums.iter().enumerate() {
+            let a = album.album();
+            let count = client.count(&a);
+            println!("album {n}: count {count:?}");
+            if let Ok(count) = count {
+                for limit in [count.min(200), 1, 2, 7] {
+                    match client.scan(&a, 0, limit) {
+                        Ok(items) => {
+                            let undated = items.iter().filter(|i| i.created_at_ms == 0).count();
+                            println!("  scan {limit}: {} items, {undated} undated", items.len());
+                        }
+                        Err(err) => println!("  scan {limit}: {err}"),
+                    }
+                }
+                match client.fetch(&a, 0, count.min(100)) {
+                    Ok(items) => {
+                        let thumbs = items.iter().filter(|i| i.thumbnail.is_some()).count();
+                        println!("  fetch: {} items, {thumbs} with thumbnails", items.len());
+                    }
+                    Err(err) => println!("  fetch: {err}"),
+                }
+            }
+        }
+        persist(&auth);
+    }
+}
