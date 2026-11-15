@@ -8,6 +8,7 @@ mod asset;
 pub mod auth;
 pub mod bridge;
 mod cookies;
+pub mod details;
 pub mod ids;
 pub mod ngm;
 pub mod passkey;
@@ -23,6 +24,7 @@ pub use auth::{
     Account, AuthClient, AuthError, BridgeConfig, SavedSession, SignInStep, TrustedPhone,
 };
 pub use bridge::BridgeApproval;
+pub use details::{Location, PhotoDetails};
 pub use passkey::{PairingKey, PasskeyAssertion, PasskeyChallenge};
-pub use photos::{Album, PhotosClient, PhotosError, UserAlbum};
+pub use photos::{Album, PhotosClient, PhotosError, SharedAlbum, SmartAlbum, UserAlbum};
 pub use profile::account_picture;

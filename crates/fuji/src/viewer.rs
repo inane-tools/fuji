@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fuji_icloud::{Asset, AssetId, AssetKind, PhotosClient, Resource};
+use fuji_icloud::{Asset, AssetId, AssetKind, PhotoDetails, PhotosClient, Resource};
 use gpui::{
     AnimationExt as _, App, Bounds, Context, CursorStyle, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -30,13 +30,14 @@ use crate::anim::{self, Eased};
 use crate::assets::icon;
 use crate::grid::PhotoGrid;
 use crate::image_cache::LruImageCache;
+use crate::video::{self, VideoPlayer};
 use crate::zoom::{Geometry, View};
-use crate::{net, theme, thumbs, titlebar, ui};
+use crate::{net, theme, thumbs, ui};
 
 actions!(
     viewer,
     [
-        Close, Previous, Next, CopyImage, Download, ZoomIn, ZoomOut, ZoomFit
+        Close, Previous, Next, CopyImage, Download, ZoomIn, ZoomOut, ZoomFit, PlayPause
     ]
 );
 
@@ -60,6 +61,9 @@ const STRIP_ZONE: f32 = 150.;
 const STRIP_THUMB: f32 = 46.;
 const STRIP_GAP: f32 = 3.;
 const STRIP_REACH: usize = 20;
+/// The bar hides this long after the pointer last moved.
+const CHROME_LINGER: Duration = Duration::from_millis(2500);
+const CHROME_FADE_MS: u64 = 220;
 /// Zoom step for one wheel notch or key press.
 const ZOOM_STEP: f32 = 1.25;
 /// How quickly zoom eases to its target (higher is snappier).
@@ -81,6 +85,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("-", ZoomOut, Some(CONTEXT)),
         KeyBinding::new("ctrl--", ZoomOut, Some(CONTEXT)),
         KeyBinding::new("0", ZoomFit, Some(CONTEXT)),
+        KeyBinding::new("space", PlayPause, Some(CONTEXT)),
         KeyBinding::new("ctrl-0", ZoomFit, Some(CONTEXT)),
     ]);
 }
@@ -117,8 +122,25 @@ pub struct Viewer {
     closing: bool,
     /// The info panel is open.
     info_open: bool,
+    /// Camera, lens, exposure and so on, by photo; `None` if it failed.
+    details: HashMap<AssetId, Option<PhotoDetails>>,
+    details_in_flight: HashSet<AssetId>,
     /// The pointer is near the bottom: show the filmstrip.
     strip_shown: bool,
+    /// The video playing, and which photo it belongs to.
+    player: Option<(usize, VideoPlayer)>,
+    /// Its newest frame (dropped from the GPU when replaced).
+    video_frame: Option<Arc<gpui::RenderImage>>,
+    /// Why the current video can't play.
+    video_error: Option<(usize, String)>,
+    /// The bar shows while the pointer moves, and hides when it rests.
+    chrome_shown: bool,
+    /// Bumped on each show and hide, so each one fades.
+    chrome_serial: u64,
+    chrome_hidden_at: Instant,
+    /// The pointer is over the bar: keep it.
+    pointer_near_top: bool,
+    _chrome_timer: Option<gpui::Task<()>>,
 }
 
 struct Drag {
@@ -172,12 +194,26 @@ impl Viewer {
             slide: Eased::new(0.),
             closing: false,
             info_open: false,
+            details: HashMap::new(),
+            details_in_flight: HashSet::new(),
             strip_shown: false,
+            player: None,
+            video_frame: None,
+            video_error: None,
+            chrome_shown: true,
+            chrome_serial: 0,
+            chrome_hidden_at: Instant::now(),
+            pointer_near_top: false,
+            _chrome_timer: None,
         };
         // The grid is mid-update while it creates us; read it once it's done.
         let this = cx.weak_entity();
         cx.defer(move |cx| {
-            this.update(cx, |viewer, cx| viewer.load_around(cx)).ok();
+            this.update(cx, |viewer, cx| {
+                viewer.load_around(cx);
+                viewer.show_chrome(cx);
+            })
+            .ok();
         });
         viewer
     }
@@ -259,6 +295,143 @@ impl Viewer {
         .detach();
     }
 
+    /// With the info panel open, fetch the current photo's details.
+    fn want_details(&mut self, cx: &mut Context<Self>) {
+        if !self.info_open {
+            return;
+        }
+        let Some(asset) = self.asset(self.index, cx) else {
+            return;
+        };
+        let Some(master) = asset.master.clone() else {
+            return;
+        };
+        let id = asset.id.clone();
+        if self.details.contains_key(&id) || !self.details_in_flight.insert(id.clone()) {
+            return;
+        }
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = net::run(move || client.details(&master)).await;
+            this.update(cx, |this, cx| {
+                this.details_in_flight.remove(&id);
+                this.details.insert(id, result.and_then(Result::ok));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Play the current photo if it's a video and isn't playing yet.
+    fn ensure_video(&mut self, asset: Option<&Asset>, cx: &mut Context<Self>) {
+        let index = self.index;
+        if self.player.as_ref().is_some_and(|(i, _)| *i == index)
+            || self.video_error.as_ref().is_some_and(|(i, _)| *i == index)
+        {
+            return;
+        }
+        self.stop_video(cx);
+        let Some(url) = asset.and_then(|a| a.video.as_ref()).map(|v| v.url.clone()) else {
+            return;
+        };
+        match VideoPlayer::open(&url, true) {
+            Ok(player) => self.player = Some((index, player)),
+            Err(err) => self.video_error = Some((index, err)),
+        }
+    }
+
+    fn stop_video(&mut self, cx: &mut Context<Self>) {
+        self.player = None;
+        if let Some(frame) = self.video_frame.take() {
+            cx.drop_image(frame, None);
+        }
+    }
+
+    fn play_pause(&mut self, _: &PlayPause, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, player)) = &self.player {
+            player.toggle();
+            self.show_chrome(cx);
+            cx.notify();
+        }
+    }
+
+    /// Play, pause, where it is (drag to seek), and sound on or off.
+    fn render_video_controls(
+        &self,
+        player: &VideoPlayer,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (position, duration) = player.position();
+        let paused = player.is_paused();
+        let muted = player.is_muted();
+        let weak = cx.weak_entity();
+        let time = |t: f64| {
+            div()
+                .w(px(44.))
+                .text_size(px(11.))
+                .text_color(theme::text_muted())
+                .child(video::format_time(t))
+        };
+        div()
+            .id("video-controls")
+            .occlude()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded_full()
+            .bg(theme::popover())
+            .shadow_lg()
+            .child(
+                ui::icon_button(
+                    "video-play",
+                    if paused { "play-fill" } else { "pause-fill" },
+                    cx.listener(|this, _, window, cx| this.play_pause(&PlayPause, window, cx)),
+                )
+                .tooltip(ui::tooltip(if paused {
+                    "Play (Space)"
+                } else {
+                    "Pause (Space)"
+                })),
+            )
+            .child(time(position).text_right())
+            .child(ui::slider(
+                "video-seek",
+                if duration > 0. {
+                    (position / duration) as f32
+                } else {
+                    0.
+                },
+                px(320.),
+                move |fraction, _, cx| {
+                    weak.update(cx, |this, cx| {
+                        if let Some((_, player)) = &this.player {
+                            let (_, duration) = player.position();
+                            player.seek(fraction as f64 * duration);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                },
+            ))
+            .child(time(duration))
+            .child(
+                ui::icon_button(
+                    "video-mute",
+                    if muted { "speaker-off" } else { "speaker" },
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some((_, player)) = &this.player {
+                            player.set_muted(!muted);
+                            cx.notify();
+                        }
+                    }),
+                )
+                .tooltip(ui::tooltip(if muted { "Sound on" } else { "Mute" })),
+            )
+    }
+
     fn go_to(&mut self, index: usize, cx: &mut Context<Self>) {
         let count = self.count(cx);
         if count == 0 || index >= count || index == self.index {
@@ -272,7 +445,9 @@ impl Viewer {
         self.target = View::FIT;
         self.drag = None;
         self.press = None;
+        self.stop_video(cx);
         self.load_around(cx);
+        self.want_details(cx);
         if self.strip_shown {
             self.want_strip_thumbnails(cx);
         }
@@ -290,6 +465,52 @@ impl Viewer {
         if let Some(grid) = self.grid.upgrade() {
             grid.update(cx, |grid, cx| grid.want_thumbnails(wanted, cx));
         }
+    }
+
+    /// The pointer moved somewhere in the window.
+    fn pointer_moved(&mut self, position: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
+        let Some(bounds) = self.stage_bounds.get() else {
+            return;
+        };
+        if !bounds.contains(&position) {
+            return;
+        }
+        // Near the bottom (and not dragging), the filmstrip comes up.
+        let near_bottom = f32::from(bounds.bottom() - position.y) < STRIP_ZONE && !pressed;
+        self.set_strip_shown(near_bottom, cx);
+        self.pointer_near_top = f32::from(position.y - bounds.top()) < BAR_ROW + 36.;
+        self.show_chrome(cx);
+    }
+
+    /// Show the bar, and hide it again once the pointer has rested.
+    fn show_chrome(&mut self, cx: &mut Context<Self>) {
+        if !self.chrome_shown {
+            self.chrome_shown = true;
+            self.chrome_serial += 1;
+            cx.notify();
+        }
+        self._chrome_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CHROME_LINGER).await;
+            this.update(cx, |this, cx| this.rest_chrome(cx)).ok();
+        }));
+    }
+
+    fn rest_chrome(&mut self, cx: &mut Context<Self>) {
+        if self.info_open || self.pointer_near_top {
+            self.show_chrome(cx);
+            return;
+        }
+        self.chrome_shown = false;
+        self.chrome_serial += 1;
+        self.chrome_hidden_at = Instant::now();
+        cx.notify();
+        // Draw once more after the fade, to drop the hidden bar.
+        self._chrome_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(CHROME_FADE_MS + 40))
+                .await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
     }
 
     fn set_strip_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
@@ -423,12 +644,6 @@ impl Viewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Near the bottom (and not dragging), the filmstrip comes up.
-        if let Some(bounds) = self.stage_bounds.get() {
-            let near = f32::from(bounds.bottom() - event.position.y) < STRIP_ZONE
-                && event.pressed_button.is_none();
-            self.set_strip_shown(near, cx);
-        }
         if let Some(start) = self.press {
             let moved = event.position - start;
             if event.pressed_button != Some(MouseButton::Left) {
@@ -568,7 +783,7 @@ impl Viewer {
         count: usize,
         zoom_percent: Option<u32>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    ) -> gpui::Div {
         let title = asset
             .and_then(|a| a.filename.clone())
             .unwrap_or_else(|| "Photo".into());
@@ -580,36 +795,19 @@ impl Viewer {
         );
 
         let info_open = self.info_open;
-        let row = div()
+        let subtitle = match date {
+            Some(date) => format!("{date} \u{00b7} {position}"),
+            None => position,
+        };
+        // Three columns: close on the left, the photo's name in the middle,
+        // its actions on the right. The sides share the rest equally, so the
+        // name stays centered.
+        let actions = div()
+            .flex_1()
             .flex()
             .items_center()
-            .gap_4()
-            .h(px(BAR_ROW))
-            // The close button's icon sits under the app's mark, the
-            // position under the window's right edge padding.
-            .pl(px(7.))
-            .pr(px(14.))
-            .text_sm()
-            .child(ui::icon_button(
-                "close",
-                "close",
-                cx.listener(|this, _, _, cx| this.begin_close(cx)),
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child(title),
-                    )
-                    .when_some(date, |el, date| {
-                        el.child(div().text_xs().text_color(theme::text_muted()).child(date))
-                    }),
-            )
-            .child(div().flex_1())
+            .justify_end()
+            .gap(px(2.))
             .when_some(zoom_percent, |el, percent| {
                 // Click to go back to fit.
                 el.child(
@@ -626,126 +824,330 @@ impl Viewer {
                         .text_size(px(12.))
                         .text_color(theme::text_muted())
                         .hover(|el| el.bg(theme::hover()).text_color(theme::text()))
+                        .tooltip(ui::tooltip("Fit to window"))
                         .on_click(cx.listener(|this, _, _, cx| this.set_target(View::FIT, cx)))
                         .child(format!("{percent}%")),
                 )
             })
-            .child(ui::text_button(
-                "copy",
-                Some("copy"),
-                "Copy",
-                cx.listener(|this, _, _, cx| this.copy_current(cx)),
-            ))
-            .child(ui::text_button(
-                "download",
-                Some("download"),
-                "Download",
-                cx.listener(|this, _, _, cx| this.download_current(cx)),
-            ))
+            .child(
+                ui::icon_button(
+                    "copy",
+                    "copy",
+                    cx.listener(|this, _, _, cx| this.copy_current(cx)),
+                )
+                .tooltip(ui::tooltip("Copy (Ctrl+C)")),
+            )
+            .child(
+                ui::icon_button(
+                    "download",
+                    "download",
+                    cx.listener(|this, _, _, cx| this.download_current(cx)),
+                )
+                .tooltip(ui::tooltip("Download (Ctrl+S)")),
+            )
             .child(
                 ui::icon_button(
                     "info",
                     if info_open { "info-active" } else { "info" },
                     cx.listener(|this, _, _, cx| {
                         this.info_open = !this.info_open;
+                        this.want_details(cx);
                         cx.notify();
                     }),
                 )
-                .when(info_open, |el| el.bg(theme::fill())),
+                .tooltip(ui::tooltip("Info")),
+            );
+
+        let row = div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .h(px(BAR_ROW))
+            // The close icon sits under the app's mark; the right side
+            // mirrors that inset.
+            .px(px(7.))
+            .child(
+                div().flex_1().flex().items_center().child(
+                    ui::icon_button(
+                        "close",
+                        "close",
+                        cx.listener(|this, _, _, cx| this.begin_close(cx)),
+                    )
+                    .tooltip(ui::tooltip("Close (Esc)")),
+                ),
             )
             .child(
                 div()
-                    .min_w(px(80.))
-                    .text_right()
-                    .text_size(px(12.))
-                    .text_color(theme::text_muted())
-                    .child(position),
-            );
+                    .flex_none()
+                    .max_w(px(460.))
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .max_w_full()
+                            .truncate()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_muted())
+                            .child(subtitle),
+                    ),
+            )
+            .child(actions);
 
-        // From the window's top: black behind the app's bar and this one,
-        // fading out below them.
-        let bar = f32::from(titlebar::HEIGHT);
-        let height = bar + BAR_ROW + 36.;
+        // Flat and translucent, like the gallery's header.
+        let mut bar_fill = theme::surface();
+        bar_fill.a = 0.72;
         div()
             .absolute()
             .top_0()
             .left_0()
             .right_0()
-            .h(px(height))
-            .pt(titlebar::HEIGHT)
-            .bg(gpui::linear_gradient(
-                180.,
-                gpui::linear_color_stop(gpui::black().opacity(0.9), (bar + BAR_ROW - 8.) / height),
-                gpui::linear_color_stop(gpui::black().opacity(0.), 1.),
-            ))
+            .bg(bar_fill)
             .child(row)
     }
 
-    /// Details of the photo, in a panel on the right.
+    /// Details of the photo, in a panel on the right: when, what took it
+    /// and how, how big, where, and the app that saved it.
     fn render_info(&self, asset: &Asset) -> impl IntoElement + use<> {
-        let mut rows: Vec<(&'static str, String)> = Vec::new();
-        if let Some(name) = &asset.filename {
-            rows.push(("Name", name.clone()));
-        }
-        if let Some(date) = format_long_date(asset.created_at_ms) {
-            rows.push(("Taken", date));
-        }
-        rows.push((
-            "Kind",
-            match asset.kind {
-                AssetKind::Photo => "Photo".to_string(),
-                AssetKind::LivePhoto => "Live Photo".to_string(),
-                AssetKind::Video { duration_secs } => {
-                    format!("Video, {}:{:02}", duration_secs / 60, duration_secs % 60)
-                }
-            },
-        ));
+        let details = self.details.get(&asset.id).cloned().flatten();
+        let loading = self.details_in_flight.contains(&asset.id);
+        let d = details.unwrap_or_default();
+
+        // Size, megapixels, file size.
+        let mut size_parts = Vec::new();
         if asset.width > 0 && asset.height > 0 {
             let megapixels = asset.width as f32 * asset.height as f32 / 1_000_000.;
-            rows.push((
-                "Size",
-                format!(
-                    "{} \u{00d7} {} \u{00b7} {megapixels:.1} MP",
-                    asset.width, asset.height
-                ),
-            ));
+            size_parts.push(format!("{megapixels:.1} MP"));
+            size_parts.push(format!("{} \u{00d7} {}", asset.width, asset.height));
         }
-        if let Some(original) = &asset.original {
-            if original.size > 0 {
-                rows.push(("File", format_file_size(original.size)));
-            }
-            if let Some(format) = format_name(&original.file_type) {
-                rows.push(("Format", format));
-            }
+        if let Some(original) = asset.original.as_ref().filter(|o| o.size > 0) {
+            size_parts.push(format_file_size(original.size));
+        }
+        let format = asset
+            .original
+            .as_ref()
+            .and_then(|o| format_name(&o.file_type));
+
+        // ISO 1250 · 27 mm · −0.1 ev · ƒ2.2 · 1/11 s
+        let mut exposure = Vec::new();
+        if let Some(iso) = d.iso {
+            exposure.push(format!("ISO {iso}"));
+        }
+        if let Some(mm) = d.focal_length_35mm {
+            exposure.push(format!("{mm} mm"));
+        }
+        if let Some(ev) = d.exposure_bias {
+            exposure.push(format_ev(ev));
+        }
+        if let Some(f) = d.f_number {
+            exposure.push(format!("\u{0192}{}", trim_number(f, 2)));
+        }
+        if let Some(t) = d.exposure_time {
+            exposure.push(format_shutter(t));
+        }
+
+        let kind = match asset.kind {
+            AssetKind::Photo => None,
+            AssetKind::LivePhoto => Some("Live Photo".to_string()),
+            AssetKind::Video { duration_secs } => Some(format!(
+                "Video, {}:{:02}",
+                duration_secs / 60,
+                duration_secs % 60
+            )),
+        };
+        let mut rows: Vec<(&'static str, String)> = Vec::new();
+        if let Some(kind) = kind {
+            rows.push(("Kind", kind));
+        }
+        if let Some(app) = &d.saved_from {
+            rows.push(("Saved from", app.clone()));
+        }
+        if let Some(software) = &d.software {
+            rows.push(("Software", software.clone()));
         }
         if asset.favorite {
             rows.push(("Favorite", "Yes".to_string()));
         }
 
+        let camera_card = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .p(px(12.))
+            .rounded(px(12.))
+            .bg(theme::fill())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(match d.camera.clone() {
+                        Some(camera) => div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(camera),
+                        // Screenshots and saved images say nothing about a camera.
+                        None => div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(theme::text_muted())
+                            .child(if loading {
+                                "Camera"
+                            } else {
+                                "No camera information"
+                            }),
+                    })
+                    .when_some(format, |el, format| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(5.))
+                                .bg(theme::fill_hover())
+                                .text_size(px(10.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::text_muted())
+                                .child(format),
+                        )
+                    }),
+            )
+            .when_some(d.lens.clone(), |el, lens| {
+                el.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_muted())
+                        .child(lens),
+                )
+            })
+            .when(!size_parts.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_muted())
+                        .child(size_parts.join(" \u{00b7} ")),
+                )
+            })
+            .when(!exposure.is_empty(), |el| {
+                el.child(
+                    div()
+                        .mt(px(8.))
+                        .pt(px(8.))
+                        .border_t_1()
+                        .border_color(theme::hover())
+                        .flex()
+                        .justify_between()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text_title())
+                        .children(exposure.into_iter().map(|part| div().child(part))),
+                )
+            })
+            .when(d.flash_fired, |el| {
+                el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_meta())
+                        .child("Flash fired"),
+                )
+            });
+
+        let location = d.location.map(|place| {
+            let ns = if place.latitude >= 0. { "N" } else { "S" };
+            let ew = if place.longitude >= 0. { "E" } else { "W" };
+            let mut text = format!(
+                "{:.4}\u{00b0} {ns}, {:.4}\u{00b0} {ew}",
+                place.latitude.abs(),
+                place.longitude.abs()
+            );
+            if let Some(altitude) = place.altitude {
+                text.push_str(&format!(" \u{00b7} {altitude:.0} m"));
+            }
+            let url = format!(
+                "https://www.openstreetmap.org/?mlat={lat:.5}&mlon={lon:.5}#map=15/{lat:.5}/{lon:.5}",
+                lat = place.latitude,
+                lon = place.longitude
+            );
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_meta())
+                        .child("Location"),
+                )
+                .child(div().text_color(theme::text_title()).child(text))
+                .child(
+                    div().flex().child(ui::link("info-map", "Show on map", move |_, _, cx| {
+                        cx.open_url(&url)
+                    })),
+                )
+        });
+
         div()
             .id("viewer-info")
             .occlude()
             .absolute()
-            .top(titlebar::HEIGHT + px(BAR_ROW + 4.))
+            .top(px(BAR_ROW + 8.))
             .right(px(14.))
-            .w(px(280.))
+            .w(px(300.))
             .p(px(16.))
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(12.))
             .rounded(px(16.))
             .bg(theme::popover())
-            .border_1()
-            .border_color(theme::line())
             .shadow_lg()
             .text_size(px(13.))
             .child(
                 div()
-                    .text_size(px(15.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text())
-                    .child("Info"),
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .truncate()
+                            .child(asset.filename.clone().unwrap_or_else(|| "Photo".into())),
+                    )
+                    .when_some(format_long_date(asset.created_at_ms), |el, date| {
+                        el.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::text_muted())
+                                .child(date),
+                        )
+                    }),
             )
+            .child(camera_card)
+            .when(loading, |el| {
+                el.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_meta())
+                        .child(ui::loading_status(
+                            "info-loading",
+                            "Loading details\u{2026}",
+                            theme::text_meta(),
+                        )),
+                )
+            })
+            .children(location)
             .children(rows.into_iter().map(|(label, value)| {
                 div()
                     .flex()
@@ -776,11 +1178,15 @@ impl Viewer {
             .strip_range(cx)
             .map(|i| {
                 let grid = grid.read(cx);
-                let path = grid.asset(i).and_then(|a| grid.thumbnail_path(&a.id));
+                let path = grid.item_thumbnail(i);
                 (i, path)
             })
             .collect();
         let row_top = 26.;
+        let mut strip_from = theme::surface();
+        strip_from.a = 0.85;
+        let mut strip_to = strip_from;
+        strip_to.a = 0.;
         Some(
             div()
                 .absolute()
@@ -790,8 +1196,8 @@ impl Viewer {
                 .h(px(row_top + STRIP_THUMB + 26.))
                 .bg(gpui::linear_gradient(
                     0.,
-                    gpui::linear_color_stop(gpui::black().opacity(0.8), 0.),
-                    gpui::linear_color_stop(gpui::black().opacity(0.), 1.),
+                    gpui::linear_color_stop(strip_from, 0.),
+                    gpui::linear_color_stop(strip_to, 1.),
                 ))
                 .children(thumbs.into_iter().map(|(i, path)| {
                     let offset = i as f32 - current as f32;
@@ -809,7 +1215,7 @@ impl Viewer {
                         .overflow_hidden()
                         .cursor_pointer()
                         .bg(theme::placeholder())
-                        .when(this, |el| el.border_2().border_color(gpui::white()))
+                        .when(this, |el| el.border_2().border_color(theme::text()))
                         .when(!this, |el| el.opacity(0.75).hover(|el| el.opacity(1.)))
                         .when_some(path, |el, path| {
                             el.child(img(path).size_full().object_fit(ObjectFit::Cover))
@@ -841,10 +1247,51 @@ impl Render for Viewer {
             .is_some_and(|a| self.previews_failed.contains(&a.id));
         let has_preview = asset.as_ref().is_some_and(|a| a.preview.is_some());
         let loading = asset.is_none() || (has_preview && preview.is_none() && !preview_failed);
-        let note = asset.as_ref().and_then(|a| match a.kind {
-            AssetKind::Video { .. } => Some("Video playback is coming soon. Download to watch."),
-            _ => None,
-        });
+        // Videos play as soon as they're shown.
+        self.ensure_video(asset.as_ref(), cx);
+        let index_now = self.index;
+        let mut playing = false;
+        if let Some((_, player)) = self.player.as_mut().filter(|(i, _)| *i == index_now) {
+            if let Some(frame) = player.next_frame()
+                && let Some(old) = self.video_frame.replace(frame)
+            {
+                cx.drop_image(old, Some(window));
+            }
+            if let Some(err) = player.error() {
+                self.video_error = Some((index_now, err));
+            }
+            playing = !player.is_paused();
+        }
+        if self
+            .video_error
+            .as_ref()
+            .is_some_and(|(i, _)| *i == index_now)
+        {
+            self.stop_video(cx);
+        }
+        if playing {
+            window.request_animation_frame();
+        }
+        let video_frame = self.video_frame.clone();
+        // The controls rest with the bar while playing; paused, they stay.
+        let video_controls = self
+            .player
+            .as_ref()
+            .filter(|(i, player)| *i == index_now && (self.chrome_shown || player.is_paused()))
+            .map(|(_, player)| self.render_video_controls(player, cx));
+        let note: Option<gpui::SharedString> = self
+            .video_error
+            .as_ref()
+            .filter(|(i, _)| *i == index_now)
+            .map(|(_, err)| err.clone().into())
+            .or_else(|| {
+                asset.as_ref().and_then(|a| match a.kind {
+                    AssetKind::Video { .. } if a.video.is_none() => {
+                        Some("This video has no playable version. Download to watch.".into())
+                    }
+                    _ => None,
+                })
+            });
 
         let closing = self.closing;
         let geometry = self.geometry(window, cx);
@@ -865,7 +1312,38 @@ impl Render for Viewer {
             .map(|g| (self.target.zoom / g.actual_size_zoom() * 100.).round() as u32);
         let zoomed = !self.target.is_fit();
 
-        let top_bar = self.render_top_bar(asset.as_ref(), count, zoom_percent, cx);
+        // The bar fades in when the pointer moves and out when it rests.
+        let chrome_shown = self.chrome_shown;
+        let top_bar = (chrome_shown
+            || self.chrome_hidden_at.elapsed() < Duration::from_millis(CHROME_FADE_MS))
+        .then(|| {
+            self.render_top_bar(asset.as_ref(), count, zoom_percent, cx)
+                .with_animation(
+                    ElementId::NamedInteger("viewer-chrome".into(), self.chrome_serial),
+                    anim::ease(if chrome_shown { 140 } else { CHROME_FADE_MS }),
+                    move |el, t| el.opacity(if chrome_shown { t } else { 1. - t }),
+                )
+        });
+        // Every pointer move in the window, whatever is under it, so the
+        // filmstrip and bar don't flicker as the pointer crosses them.
+        let weak = cx.weak_entity();
+        let pointer = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let weak = weak.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase.bubble() {
+                        let pressed = event.pressed_button.is_some();
+                        weak.update(cx, |viewer, cx| {
+                            viewer.pointer_moved(event.position, pressed, cx)
+                        })
+                        .ok();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
         let index = self.index;
         let has_previous = index > 0 && !zoomed;
         let has_next = index + 1 < count && !zoomed;
@@ -888,6 +1366,7 @@ impl Render for Viewer {
             .info_open
             .then(|| asset.as_ref().map(|a| self.render_info(a)))
             .flatten();
+        let strip_up = self.strip_shown && !zoomed;
         let strip = if self.strip_shown && !zoomed {
             self.render_strip(cx)
         } else {
@@ -901,7 +1380,7 @@ impl Render for Viewer {
             .left_0()
             .size_full()
             .overflow_hidden()
-            .bg(gpui::black())
+            .bg(theme::surface())
             .when(zoomed, |el| {
                 el.cursor(if self.drag.is_some() {
                     CursorStyle::ClosedHand
@@ -913,11 +1392,6 @@ impl Render for Viewer {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::open_menu))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if !hovered {
-                    this.set_strip_shown(false, cx);
-                }
-            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.end_drag(cx)),
@@ -980,6 +1454,16 @@ impl Render for Viewer {
                         ),
                 )
             })
+            // The video's frames over its poster.
+            .when_some(video_frame, |el, frame| {
+                el.child(
+                    place(div()).child(
+                        img(gpui::ImageSource::Render(frame))
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+                )
+            })
             .when_some(note, |el, note| {
                 el.child(
                     div()
@@ -1021,15 +1505,29 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_fit))
+            .on_action(cx.listener(Self::play_pause))
             .occlude()
             .absolute()
             .inset_0()
-            .bg(gpui::black())
+            .bg(theme::surface())
             .text_color(theme::text())
             .child(stage)
             .children(strip)
-            .child(top_bar)
+            .when_some(video_controls, |el, controls| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(px(if strip_up { 112. } else { 24. }))
+                        .flex()
+                        .justify_center()
+                        .child(controls),
+                )
+            })
+            .children(top_bar)
             .children(info)
+            .child(pointer)
             .with_animation(
                 if closing {
                     "viewer-close"
@@ -1092,6 +1590,37 @@ fn format_long_date(ms: i64) -> Option<String> {
     Some(zoned.strftime("%A %-d %B %Y at %H:%M").to_string())
 }
 
+/// "1/120 s", "0.5 s", "2 s".
+fn format_shutter(seconds: f64) -> String {
+    if seconds >= 0.3 {
+        format!("{} s", trim_number(seconds, 1))
+    } else {
+        format!("1/{} s", (1. / seconds).round() as u64)
+    }
+}
+
+/// "0 ev", "+0.3 ev", "-1 ev" (with a minus sign).
+fn format_ev(ev: f64) -> String {
+    let rounded = (ev * 10.).round() / 10.;
+    if rounded == 0. {
+        "0 ev".to_string()
+    } else if rounded > 0. {
+        format!("+{} ev", trim_number(rounded, 1))
+    } else {
+        format!("\u{2212}{} ev", trim_number(-rounded, 1))
+    }
+}
+
+/// At most `places` decimals, without trailing zeros: 2.2, 1.78, 4.
+fn trim_number(n: f64, places: usize) -> String {
+    let text = format!("{n:.places$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
 fn format_file_size(bytes: u64) -> String {
     const KB: f64 = 1024.;
     let b = bytes as f64;
@@ -1134,7 +1663,7 @@ fn group_digits(n: usize) -> String {
     out
 }
 
-fn pill(text: &'static str) -> gpui::Div {
+fn pill(text: impl Into<gpui::SharedString>) -> gpui::Div {
     div()
         .px_3()
         .py_1()
@@ -1142,7 +1671,7 @@ fn pill(text: &'static str) -> gpui::Div {
         .bg(gpui::black().opacity(0.6))
         .text_xs()
         .text_color(gpui::white())
-        .child(text)
+        .child(text.into())
 }
 
 type ClickHandler = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>;
@@ -1186,6 +1715,19 @@ fn edge_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exposure_formats() {
+        assert_eq!(format_shutter(1. / 11.), "1/11 s");
+        assert_eq!(format_shutter(1. / 120.), "1/120 s");
+        assert_eq!(format_shutter(2.), "2 s");
+        assert_eq!(format_ev(-0.07421875), "\u{2212}0.1 ev");
+        assert_eq!(format_ev(0.01), "0 ev");
+        assert_eq!(format_ev(0.33), "+0.3 ev");
+        assert_eq!(trim_number(2.2, 2), "2.2");
+        assert_eq!(trim_number(1.78, 2), "1.78");
+        assert_eq!(trim_number(4., 2), "4");
+    }
 
     #[test]
     fn info_formats() {

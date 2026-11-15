@@ -1,5 +1,5 @@
-//! The main window: the title bar, which is also the navigation (sections
-//! as tabs, albums in a menu, search, settings, account), then the page.
+//! The main window: the title bar, which is also the navigation (Library,
+//! Favorites and Collections as tabs, search, the account), then the page.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -8,15 +8,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuji_icloud::{Account, Album, AuthClient, PhotosClient, PhotosError, SavedSession, UserAlbum};
+use fuji_icloud::{
+    Account, Album, AuthClient, PhotosClient, PhotosError, SavedSession, SharedAlbum, SmartAlbum,
+    UserAlbum,
+};
 use gpui::{
-    AnimationExt as _, Bounds, ClickEvent, Context, ElementId, Entity, Focusable, FontWeight,
-    KeyBinding, Pixels, Point, SharedString, Subscription, Task, Window, actions, canvas, div,
-    point, prelude::*, px,
+    AnimationExt as _, Bounds, Context, ElementId, Entity, Focusable, FontWeight, KeyBinding,
+    Pixels, Point, SharedString, Subscription, Task, Window, actions, canvas, div, point,
+    prelude::*, px,
 };
 
 use crate::anim::{self, Eased};
 use crate::assets::icon;
+use crate::collections::{self, Card};
 use crate::device_search::DeviceSearch;
 use crate::grid::{GridEvent, PhotoGrid};
 use crate::input::TextInput;
@@ -28,8 +32,6 @@ use crate::{index, net, session_store, theme, thumbs, titlebar, ui};
 const PILL_RATE: f32 = 18.;
 /// Below this window width the tabs show icons only.
 const TAB_LABELS_MIN_WIDTH: f32 = 1040.;
-/// Tab keys of the bar's entries that aren't a single section.
-const ALBUMS_TAB: u64 = 50;
 /// The bar itself, measured so tab positions can be made relative to it.
 const BAR_KEY: u64 = 999;
 const SEARCH_CONTEXT: &str = "SearchField";
@@ -47,47 +49,72 @@ pub fn bind_keys(cx: &mut gpui::App) {
 pub enum Section {
     Library,
     Favorites,
-    Videos,
-    Shared,
-    RecentlyDeleted,
-    /// A user album, by its place in `FujiApp::albums`.
-    Album(usize),
+    /// The Collections page.
+    Collections,
+    /// Something opened from Collections, in the gallery.
+    Collection(Collection),
     Settings,
 }
 
+/// What the Collections page offers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Collection {
+    Videos,
+    Smart(SmartAlbum),
+    Hidden,
+    RecentlyDeleted,
+    /// A user album, by its place in `FujiApp::albums`.
+    Album(usize),
+    /// A shared album, by its place in `FujiApp::shared_albums`.
+    Shared(usize),
+}
+
+impl Collection {
+    fn key(self) -> u64 {
+        match self {
+            Collection::Videos => 10,
+            Collection::Smart(smart) => {
+                20 + SmartAlbum::ALL
+                    .iter()
+                    .position(|s| *s == smart)
+                    .unwrap_or(0) as u64
+            }
+            Collection::Hidden => 40,
+            Collection::RecentlyDeleted => 41,
+            Collection::Album(i) => 1_000 + i as u64,
+            Collection::Shared(i) => 100_000 + i as u64,
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Collection::Videos => "videos",
+            Collection::Smart(smart) => match smart {
+                SmartAlbum::LivePhotos => "type-live",
+                SmartAlbum::Portrait => "type-portrait",
+                SmartAlbum::LongExposure => "type-long-exposure",
+                SmartAlbum::Panoramas => "type-panoramas",
+                SmartAlbum::TimeLapse => "type-time-lapse",
+                SmartAlbum::SloMo => "type-slo-mo",
+                SmartAlbum::Bursts => "type-bursts",
+                SmartAlbum::Screenshots => "type-screenshots",
+                SmartAlbum::Animated => "type-animated",
+            },
+            Collection::Hidden => "hidden",
+            Collection::RecentlyDeleted => "deleted",
+            Collection::Album(_) => "albums",
+            Collection::Shared(_) => "shared-albums",
+        }
+    }
+}
+
 impl Section {
-    /// Gallery title for the fixed sections; albums are named by
-    /// `FujiApp::label`.
-    fn fixed_label(self) -> &'static str {
-        match self {
-            Section::Library => "Library",
-            Section::Favorites => "Favorites",
-            Section::Videos => "Videos",
-            Section::Shared => "Shared Albums",
-            Section::RecentlyDeleted => "Recently Deleted",
-            Section::Album(_) => "Album",
-            Section::Settings => "Settings",
-        }
-    }
-
-    /// The shorter name on its tab.
-    fn tab_label(self) -> &'static str {
-        match self {
-            Section::Shared => "Shared",
-            Section::RecentlyDeleted => "Deleted",
-            _ => self.fixed_label(),
-        }
-    }
-
     /// Icon name; the `-active` (filled) variant marks the selection.
     fn icon(self) -> &'static str {
         match self {
             Section::Library => "library",
             Section::Favorites => "favorites",
-            Section::Videos => "videos",
-            Section::Shared => "shared",
-            Section::RecentlyDeleted => "deleted",
-            Section::Album(_) => "albums",
+            Section::Collections | Section::Collection(_) => "collections",
             Section::Settings => "settings",
         }
     }
@@ -97,18 +124,16 @@ impl Section {
         match self {
             Section::Library => 0,
             Section::Favorites => 1,
-            Section::Videos => 2,
-            Section::Shared => 3,
-            Section::RecentlyDeleted => 4,
+            Section::Collections => 2,
             Section::Settings => 5,
-            Section::Album(i) => 100 + i as u64,
+            Section::Collection(collection) => collection.key(),
         }
     }
 
     /// The bar entry that shows this section as selected.
     fn tab_key(self) -> u64 {
         match self {
-            Section::Album(_) => ALBUMS_TAB,
+            Section::Collection(_) => Section::Collections.key(),
             _ => self.key(),
         }
     }
@@ -134,8 +159,17 @@ enum Screen {
 pub struct FujiApp {
     screen: Screen,
     section: Section,
-    /// The user's albums, listed in the Albums menu.
+    /// The user's albums, on the Collections page.
     albums: Vec<UserAlbum>,
+    /// Shared albums the user owns or joined.
+    shared_albums: Vec<SharedAlbum>,
+    /// Item counts for the Collections page, by album slug.
+    counts: HashMap<String, usize>,
+    /// Cover thumbnails for the Collections page, by album slug.
+    covers: HashMap<String, Arc<Path>>,
+    /// The library client and thumbnail folder, for loading Collections.
+    photos: Option<(Arc<PhotosClient>, Arc<Path>)>,
+    _collections_load: Option<Task<()>>,
     /// The account picture, once it's been found or fetched.
     avatar: Option<Arc<Path>>,
     /// The highlight behind the selected tab: its left edge and width,
@@ -145,9 +179,8 @@ pub struct FujiApp {
     pill_placed: bool,
     /// Where each bar entry was drawn last frame, by tab key.
     tab_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
-    /// The open Albums menu: its opening's serial and where it hangs.
-    albums_menu: Option<(u64, Point<Pixels>)>,
-    /// The open account menu, the same way (it hangs from its right corner).
+    /// The open account menu: its opening's serial and where it hangs (from
+    /// its right corner).
     account_menu: Option<(u64, Point<Pixels>)>,
     menu_serial: u64,
     search: Entity<TextInput>,
@@ -168,16 +201,23 @@ impl FujiApp {
             let text = SharedString::from(input.read(cx).text().to_string());
             this.search_changed(text, cx);
         });
+        // Follow Windows switching between light and dark.
+        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
+            .detach();
         let mut this = Self {
             screen: Screen::Resuming,
             section: Section::Library,
             albums: Vec::new(),
+            shared_albums: Vec::new(),
+            counts: HashMap::new(),
+            covers: HashMap::new(),
+            photos: None,
+            _collections_load: None,
             avatar: None,
             pill_x: Eased::new(0.),
             pill_width: Eased::new(0.),
             pill_placed: false,
             tab_bounds: Rc::default(),
-            albums_menu: None,
             account_menu: None,
             menu_serial: 0,
             search,
@@ -258,9 +298,12 @@ impl FujiApp {
         cx: &mut Context<Self>,
     ) {
         self._login_subscription = None;
-        // The album list is reloaded for this account.
+        // The album lists are reloaded for this account.
         self.albums.clear();
-        if matches!(self.section, Section::Settings | Section::Album(_)) {
+        self.shared_albums.clear();
+        self.counts.clear();
+        self.covers.clear();
+        if matches!(self.section, Section::Settings | Section::Collection(_)) {
             self.section = Section::Library;
         }
         let (album, title) = self
@@ -270,6 +313,9 @@ impl FujiApp {
         let grid = client
             .clone()
             .map(|client| cx.new(|cx| PhotoGrid::new(client, &account.dsid, album, title, cx)));
+        self.photos = client
+            .clone()
+            .map(|client| (client, Arc::from(thumbs::cache_dir(&account.dsid))));
         if let Some(client) = client {
             self.load_albums(client, &account.dsid, cx);
         }
@@ -281,6 +327,7 @@ impl FujiApp {
                     grid,
                     window,
                     move |this, _, event, window, cx| match event {
+                        GridEvent::Back => this.select(Section::Collections, window, cx),
                         GridEvent::SessionExpired => {
                             let saved = session_store::load().unwrap_or_default();
                             let auth = Arc::new(AuthClient::from_saved(&SavedSession {
@@ -398,31 +445,52 @@ impl FujiApp {
         cx.notify();
     }
 
+    /// What a collection shows in the gallery.
+    fn collection_album(&self, collection: Collection) -> Option<Album> {
+        Some(match collection {
+            Collection::Videos => Album::Videos,
+            Collection::Smart(smart) => Album::Smart(smart),
+            Collection::Hidden => Album::Hidden,
+            Collection::RecentlyDeleted => Album::RecentlyDeleted,
+            Collection::Album(i) => self.albums.get(i)?.album(),
+            Collection::Shared(i) => self.shared_albums.get(i)?.album(),
+        })
+    }
+
     /// What a section shows in the gallery, and its heading; `None` for
     /// pages that aren't the gallery.
     fn section_album(&self, section: Section) -> Option<(Album, SharedString)> {
         let album = match section {
             Section::Library => Album::All,
             Section::Favorites => Album::Favorites,
-            Section::Videos => Album::Videos,
-            Section::RecentlyDeleted => Album::RecentlyDeleted,
-            Section::Album(i) => {
-                let album = self.albums.get(i)?;
-                return Some((album.album(), album.name.clone().into()));
-            }
-            Section::Shared | Section::Settings => return None,
+            Section::Collection(collection) => self.collection_album(collection)?,
+            Section::Collections | Section::Settings => return None,
         };
-        Some((album, section.fixed_label().into()))
+        Some((album, self.label(section)))
     }
 
     fn label(&self, section: Section) -> SharedString {
         match section {
-            Section::Album(i) => self
-                .albums
-                .get(i)
-                .map(|album| SharedString::from(album.name.clone()))
-                .unwrap_or_default(),
-            _ => section.fixed_label().into(),
+            Section::Library => "Library".into(),
+            Section::Favorites => "Favorites".into(),
+            Section::Collections => "Collections".into(),
+            Section::Settings => "Settings".into(),
+            Section::Collection(collection) => match collection {
+                Collection::Videos => "Videos".into(),
+                Collection::Smart(smart) => smart.title().into(),
+                Collection::Hidden => "Hidden".into(),
+                Collection::RecentlyDeleted => "Recently Deleted".into(),
+                Collection::Album(i) => self
+                    .albums
+                    .get(i)
+                    .map(|a| SharedString::from(a.name.clone()))
+                    .unwrap_or_default(),
+                Collection::Shared(i) => self
+                    .shared_albums
+                    .get(i)
+                    .map(|a| SharedString::from(a.name.clone()))
+                    .unwrap_or_default(),
+            },
         }
     }
 
@@ -464,14 +532,14 @@ impl FujiApp {
             return;
         }
         let selected = match self.section {
-            Section::Album(i) => self.albums.get(i).map(|a| a.id.clone()),
+            Section::Collection(Collection::Album(i)) => self.albums.get(i).map(|a| a.id.clone()),
             _ => None,
         };
         self.albums = albums;
         if let Some(id) = selected {
             let section = match self.albums.iter().position(|a| a.id == id) {
-                Some(i) => Section::Album(i),
-                None => Section::Library,
+                Some(i) => Section::Collection(Collection::Album(i)),
+                None => Section::Collections,
             };
             self.section = section;
             self.show_section_in_grid(section, cx);
@@ -488,16 +556,111 @@ impl FujiApp {
             },
         ) = (self.section_album(section), &self.screen)
         {
-            grid.update(cx, |grid, cx| grid.set_album(album, title, cx));
+            let back = matches!(section, Section::Collection(_));
+            grid.update(cx, |grid, cx| {
+                grid.set_back(back, cx);
+                grid.set_album(album, title, cx);
+            });
             return true;
         }
         false
     }
 
+    /// Count what the Collections page shows and find covers for it.
+    fn load_collections(&mut self, cx: &mut Context<Self>) {
+        let Some((client, thumb_dir)) = self.photos.clone() else {
+            return;
+        };
+        let albums = self.albums.clone();
+        self._collections_load = Some(cx.spawn(async move |this, cx| {
+            let list_client = client.clone();
+            let listed_albums = albums.clone();
+            let listed = net::run(move || {
+                let albums = listed_albums;
+                let shared = list_client.shared_albums().unwrap_or_default();
+                let mut wanted: Vec<Album> =
+                    vec![Album::Videos, Album::Hidden, Album::RecentlyDeleted];
+                wanted.extend(SmartAlbum::ALL.iter().map(|s| Album::Smart(*s)));
+                wanted.extend(albums.iter().map(UserAlbum::album));
+                let ids: Vec<String> = wanted.iter().filter_map(Album::count_id).collect();
+                let found: HashMap<String, usize> = list_client
+                    .index_counts(&ids)
+                    .map(|c| c.into_iter().collect())
+                    .unwrap_or_default();
+                let mut counts: HashMap<String, usize> = wanted
+                    .iter()
+                    .filter_map(|album| {
+                        let n = *found.get(&album.count_id()?)?;
+                        Some((index::album_slug(album), n))
+                    })
+                    .collect();
+                for album in &shared {
+                    if let Ok(n) = list_client.count(&album.album()) {
+                        counts.insert(index::album_slug(&album.album()), n);
+                    }
+                }
+                (shared, counts)
+            })
+            .await;
+            let Some((shared, counts)) = listed else {
+                return;
+            };
+            // Covers for what isn't empty. Hidden and Recently Deleted show
+            // no preview, as in Photos.
+            let mut covered: Vec<Album> = counts
+                .iter()
+                .filter(|(slug, n)| {
+                    **n > 0 && !matches!(slug.as_str(), "hidden" | "recently-deleted")
+                })
+                .filter_map(|(slug, _)| {
+                    let album = match slug.as_str() {
+                        "videos" => Album::Videos,
+                        _ => SmartAlbum::ALL
+                            .iter()
+                            .map(|s| Album::Smart(*s))
+                            .chain(albums.iter().map(UserAlbum::album))
+                            .chain(shared.iter().map(SharedAlbum::album))
+                            .find(|a| index::album_slug(a) == *slug)?,
+                    };
+                    Some(album)
+                })
+                .collect();
+            covered.sort_by_key(index::album_slug);
+            this.update(cx, |this, cx| {
+                if this.shared_albums != shared {
+                    this.shared_albums = shared;
+                }
+                this.counts = counts;
+                cx.notify();
+            })
+            .ok();
+            for album in covered {
+                let (client, dir) = (client.clone(), thumb_dir.clone());
+                let slug = index::album_slug(&album);
+                let cover = net::run(move || {
+                    let first = client.fetch(&album, 0, 1).ok()?.into_iter().next()?;
+                    let thumb = first.thumbnail.as_ref()?;
+                    thumbs::ensure(&client, &dir, &first.id, thumb).ok()
+                })
+                .await
+                .flatten();
+                if let Some(path) = cover {
+                    this.update(cx, |this, cx| {
+                        this.covers.insert(slug, path.into());
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        }));
+    }
+
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
-        self.albums_menu = None;
         self.account_menu = None;
+        if section == Section::Collections {
+            self.load_collections(cx);
+        }
         if self.show_section_in_grid(section, cx)
             && let Screen::Main {
                 grid: Some(grid), ..
@@ -654,22 +817,6 @@ impl FujiApp {
 
     // ---- The bar ----------------------------------------------------------------
 
-    fn open_albums_menu(&mut self, cx: &mut Context<Self>) {
-        if self.albums_menu.take().is_some() {
-            cx.notify();
-            return;
-        }
-        let at = self
-            .tab_bounds
-            .borrow()
-            .get(&ALBUMS_TAB)
-            .map(|b| point(b.origin.x, b.origin.y + b.size.height + px(4.)))
-            .unwrap_or_else(|| point(px(200.), titlebar::HEIGHT));
-        self.menu_serial += 1;
-        self.albums_menu = Some((self.menu_serial, at));
-        cx.notify();
-    }
-
     fn open_account_menu(&mut self, cx: &mut Context<Self>) {
         if self.account_menu.take().is_some() {
             cx.notify();
@@ -763,38 +910,6 @@ impl FujiApp {
         ))
     }
 
-    fn render_albums_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let (serial, at) = self.albums_menu?;
-        let this = cx.entity().downgrade();
-        let items = if self.albums.is_empty() {
-            vec![ui::MenuItem::new("albums", "No albums yet", |_, _| {})]
-        } else {
-            self.albums
-                .iter()
-                .enumerate()
-                .map(|(i, album)| {
-                    let this = this.clone();
-                    let chosen = self.section == Section::Album(i);
-                    ui::MenuItem::new(
-                        if chosen { "check" } else { "albums" },
-                        album.name.clone(),
-                        move |window, cx| {
-                            this.update(cx, |this, cx| this.select(Section::Album(i), window, cx))
-                                .ok();
-                        },
-                    )
-                })
-                .collect()
-        };
-        Some(ui::context_menu(serial, at, items, move |_, cx| {
-            this.update(cx, |this, cx| {
-                this.albums_menu = None;
-                cx.notify();
-            })
-            .ok();
-        }))
-    }
-
     /// Something in the bar that remembers where it was drawn, so the
     /// highlight can find it.
     fn measured(&self, key: u64) -> impl IntoElement + use<> {
@@ -875,7 +990,6 @@ impl FujiApp {
     /// sign-in only the mark and the buttons.
     fn render_bar(
         &mut self,
-        overlay: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -927,36 +1041,20 @@ impl FujiApp {
 
         let tabs = main.then(|| {
             let mut tabs = titlebar::drag_area().flex_none().gap(px(2.));
-            let section_tab = |this: &Self, section: Section, cx: &mut Context<Self>| {
-                this.tab(
-                    section.key(),
-                    section.icon(),
-                    wide.then(|| section.tab_label().into()),
-                    this.section == section,
-                    false,
-                )
-                .on_click(cx.listener(move |this, _, window, cx| this.select(section, window, cx)))
-            };
-            for section in [Section::Library, Section::Favorites, Section::Videos] {
-                tabs = tabs.child(section_tab(self, section, cx));
-            }
-            let album_label = match self.section {
-                Section::Album(i) => self.albums.get(i).map(|a| a.name.clone()),
-                _ => None,
-            }
-            .unwrap_or_else(|| "Albums".into());
-            tabs = tabs.child(
-                self.tab(
-                    ALBUMS_TAB,
-                    "albums",
-                    wide.then(|| album_label.into()),
-                    matches!(self.section, Section::Album(_)),
-                    true,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_albums_menu(cx))),
-            );
-            for section in [Section::Shared, Section::RecentlyDeleted] {
-                tabs = tabs.child(section_tab(self, section, cx));
+            for section in [Section::Library, Section::Favorites, Section::Collections] {
+                let active = self.section.tab_key() == section.key();
+                tabs = tabs.child(
+                    self.tab(
+                        section.key(),
+                        section.icon(),
+                        wide.then(|| self.label(section)),
+                        active,
+                        false,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.select(section, window, cx)),
+                    ),
+                );
             }
             tabs
         });
@@ -1006,7 +1104,7 @@ impl FujiApp {
             .items_center()
             .h(titlebar::HEIGHT)
             .w_full()
-            .when(!overlay, |el| el.bg(theme::surface()))
+            .bg(theme::surface())
             .child(self.measured(BAR_KEY))
             .children(pill)
             .child(brand)
@@ -1019,6 +1117,12 @@ impl FujiApp {
 
 impl Render for FujiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Light or dark, and the accent, before anything is drawn.
+        let system_light = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight
+        );
+        crate::settings::Settings::get(cx).apply_theme(system_light);
         // One font and base color for every screen. The bar is drawn on
         // every system: where the system draws the title bar, it's a
         // toolbar under it.
@@ -1031,20 +1135,12 @@ impl Render for FujiApp {
             .text_color(theme::text())
             .on_action(cx.listener(Self::focus_search));
         let main = matches!(self.screen, Screen::Main { .. });
-        // Over the gallery the bar is see-through: the photos run under it
-        // and the gallery's header shades it.
-        let overlay = matches!(self.screen, Screen::Main { grid: Some(_), .. })
-            && self.section_album(self.section).is_some();
-        let mut bar = (titlebar::CUSTOM || main).then(|| self.render_bar(overlay, window, cx));
         let root = root
-            .children(self.render_albums_menu(cx))
+            .when(titlebar::CUSTOM || main, |el| {
+                el.child(self.render_bar(window, cx))
+            })
             .children(self.render_account_menu(cx));
         let body = div().flex_1().min_h_0();
-        let root = if overlay {
-            root.relative()
-        } else {
-            root.children(bar.take())
-        };
 
         let (grid, settings) = match &self.screen {
             Screen::Resuming => return root.child(body.child(resuming())),
@@ -1065,6 +1161,7 @@ impl Render for FujiApp {
         let is_gallery = self.section_album(self.section).is_some();
         let content = match (self.section, is_gallery, grid) {
             (Section::Settings, _, _) => div().size_full().child(settings),
+            (Section::Collections, _, _) => self.render_collections(cx),
             (_, true, Some(grid)) => div().size_full().child(grid),
             (_, true, None) => message(PhotosError::NotAvailable.to_string()),
             (_, false, _) => message(format!(
@@ -1091,7 +1188,76 @@ impl Render for FujiApp {
             anim::ease(anim::NORMAL),
             |el, t| el.opacity(t),
         )))
-        .children(bar.map(|bar| div().absolute().top_0().left_0().right_0().child(bar)))
+    }
+}
+
+impl FujiApp {
+    /// Albums, shared albums, media types and utilities, as cards.
+    fn render_collections(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let card = |this: &Self, collection: Collection, cx: &mut Context<Self>| {
+            let album = this.collection_album(collection);
+            let slug = album.as_ref().map(index::album_slug).unwrap_or_default();
+            collections::card(
+                Card {
+                    key: collection.key(),
+                    title: this.label(Section::Collection(collection)),
+                    count: this.counts.get(&slug).copied(),
+                    cover: this.covers.get(&slug).cloned(),
+                    icon: collection.icon(),
+                    badge: matches!(collection, Collection::Videos | Collection::Smart(_)),
+                },
+                cx.listener(move |this, _, window, cx| {
+                    this.select(Section::Collection(collection), window, cx)
+                }),
+            )
+        };
+        let mut page = div().flex().flex_col().gap(px(28.)).child(
+            div()
+                .text_size(px(28.))
+                .font_weight(FontWeight::BLACK)
+                .text_color(theme::text())
+                .child("Collections"),
+        );
+        if !self.albums.is_empty() {
+            let cards = (0..self.albums.len())
+                .map(|i| card(self, Collection::Album(i), cx))
+                .collect();
+            page = page.child(collections::section("Albums", cards));
+        }
+        if !self.shared_albums.is_empty() {
+            let cards = (0..self.shared_albums.len())
+                .map(|i| card(self, Collection::Shared(i), cx))
+                .collect();
+            page = page.child(collections::section("Shared Albums", cards));
+        }
+        // Media types the library has any of (all of them until counted).
+        let counted = !self.counts.is_empty();
+        let media: Vec<Collection> = std::iter::once(Collection::Videos)
+            .chain(SmartAlbum::ALL.iter().map(|s| Collection::Smart(*s)))
+            .filter(|c| {
+                let slug = self
+                    .collection_album(*c)
+                    .map(|a| index::album_slug(&a))
+                    .unwrap_or_default();
+                !counted || self.counts.get(&slug).is_some_and(|n| *n > 0)
+            })
+            .collect();
+        let cards = media.into_iter().map(|c| card(self, c, cx)).collect();
+        page = page.child(collections::section("Media Types", cards));
+        let cards = [Collection::Hidden, Collection::RecentlyDeleted]
+            .into_iter()
+            .map(|c| card(self, c, cx))
+            .collect();
+        page = page.child(collections::section("Utilities", cards));
+
+        div().size_full().child(
+            div()
+                .id("collections")
+                .size_full()
+                .overflow_y_scroll()
+                .bg(theme::surface())
+                .child(page.px(px(theme::CONTENT_PADDING)).pt(px(10.)).pb(px(40.))),
+        )
     }
 }
 

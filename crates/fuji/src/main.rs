@@ -3,6 +3,7 @@
 mod anim;
 mod app;
 mod assets;
+mod collections;
 mod device_search;
 mod export;
 mod grid;
@@ -14,6 +15,7 @@ mod login;
 mod net;
 mod passkey;
 mod platform;
+mod release;
 mod scrubber;
 mod search;
 mod session_store;
@@ -23,6 +25,7 @@ mod thumbs;
 mod titlebar;
 mod transfer;
 mod ui;
+mod video;
 mod viewer;
 mod zoom;
 

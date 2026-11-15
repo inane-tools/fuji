@@ -219,6 +219,52 @@ pub fn loading_status(
         .child(text.into())
 }
 
+// ---- Segmented control ------------------------------------------------------
+
+/// A row of choices, one picked: a pill inside a pill.
+pub fn segmented(
+    id: &'static str,
+    labels: &[&'static str],
+    selected: usize,
+    on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_select = Rc::new(on_select);
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .p(px(3.))
+        .gap(px(2.))
+        .rounded_full()
+        .bg(theme::fill())
+        .children(labels.iter().enumerate().map(|(i, label)| {
+            let on_select = on_select.clone();
+            let chosen = i == selected;
+            div()
+                .id(ElementId::NamedInteger(id.into(), i as u64))
+                .h(px(26.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .rounded_full()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .map(|el| {
+                    if chosen {
+                        el.bg(theme::popover())
+                            .shadow_sm()
+                            .text_color(theme::text())
+                    } else {
+                        el.text_color(theme::text_muted())
+                            .hover(|el| el.text_color(theme::text()))
+                    }
+                })
+                .on_click(move |_, window, cx| on_select(i, window, cx))
+                .child(*label)
+        }))
+}
+
 // ---- Tooltip ----------------------------------------------------------------
 
 struct Tooltip(SharedString);
@@ -230,8 +276,6 @@ impl Render for Tooltip {
             .py(px(4.))
             .rounded(px(8.))
             .bg(theme::popover())
-            .border_1()
-            .border_color(theme::line())
             .shadow_md()
             .font_family(theme::FONT)
             .text_size(px(12.))
@@ -379,12 +423,13 @@ impl RenderOnce for Slider {
                     .top(px(3.))
                     .size(px(SLIDER_KNOB))
                     .rounded_full()
+                    // White in either theme, like a system slider's knob.
                     .bg(if held {
-                        theme::text_title()
+                        gpui::rgb(0xe5e5ea).into()
                     } else {
-                        theme::text()
+                        gpui::white()
                     })
-                    .shadow_sm(),
+                    .shadow_md(),
             )
             .child(events)
     }
@@ -497,8 +542,6 @@ pub fn popup_menu(
         .flex()
         .flex_col()
         .bg(theme::popover())
-        .border_1()
-        .border_color(theme::line())
         .rounded(px(12.))
         .shadow_lg()
         .on_mouse_down_out(move |_, window, cx| dismiss_out(window, cx))
@@ -576,8 +619,6 @@ pub fn toast(serial: u64, status: Status) -> impl IntoElement {
                 .items_center()
                 .rounded(px(12.))
                 .bg(theme::popover())
-                .border_1()
-                .border_color(theme::line())
                 .shadow_lg()
                 .text_size(px(13.))
                 .child(content),
@@ -620,8 +661,6 @@ pub fn confirm_dialog(
                 .gap(px(8.))
                 .rounded(theme::RADIUS_DIALOG)
                 .bg(theme::popover())
-                .border_1()
-                .border_color(theme::line())
                 .shadow_lg()
                 .on_mouse_down_out(move |_, window, cx| cancel_out(window, cx))
                 .child(

@@ -21,6 +21,7 @@ use ureq::Agent;
 use crate::asset::{Asset, AssetId, AssetKind, Resource};
 use crate::auth::{Account, AuthClient};
 use crate::cookies::CookieLog;
+use crate::details::{self, PhotoDetails};
 
 const CLIENT_BUILD_NUMBER: &str = "2522Project44";
 const CLIENT_MASTERING_NUMBER: &str = "2522B2";
@@ -56,20 +57,106 @@ pub enum Album {
     Favorites,
     Videos,
     RecentlyDeleted,
+    Hidden,
+    /// One of the media types Photos sorts photos into.
+    Smart(SmartAlbum),
     /// A user album, by its CloudKit record name.
     User(Arc<str>),
+    /// A shared album, by its GUID (served by the shared streams service,
+    /// not CloudKit).
+    Shared(Arc<str>),
+}
+
+/// The media types Photos collects on its own, as icloud.com lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SmartAlbum {
+    LivePhotos,
+    Portrait,
+    LongExposure,
+    Panoramas,
+    TimeLapse,
+    SloMo,
+    Bursts,
+    Screenshots,
+    Animated,
+}
+
+impl SmartAlbum {
+    pub const ALL: [SmartAlbum; 9] = [
+        SmartAlbum::LivePhotos,
+        SmartAlbum::Portrait,
+        SmartAlbum::LongExposure,
+        SmartAlbum::Panoramas,
+        SmartAlbum::TimeLapse,
+        SmartAlbum::SloMo,
+        SmartAlbum::Bursts,
+        SmartAlbum::Screenshots,
+        SmartAlbum::Animated,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            SmartAlbum::LivePhotos => "Live Photos",
+            SmartAlbum::Portrait => "Portrait",
+            SmartAlbum::LongExposure => "Long Exposure",
+            SmartAlbum::Panoramas => "Panoramas",
+            SmartAlbum::TimeLapse => "Time-lapse",
+            SmartAlbum::SloMo => "Slo-mo",
+            SmartAlbum::Bursts => "Bursts",
+            SmartAlbum::Screenshots => "Screenshots",
+            SmartAlbum::Animated => "Animated",
+        }
+    }
+
+    /// A name for file names and ids.
+    pub fn slug(self) -> &'static str {
+        match self {
+            SmartAlbum::LivePhotos => "live",
+            SmartAlbum::Portrait => "portrait",
+            SmartAlbum::LongExposure => "long-exposure",
+            SmartAlbum::Panoramas => "panoramas",
+            SmartAlbum::TimeLapse => "time-lapse",
+            SmartAlbum::SloMo => "slo-mo",
+            SmartAlbum::Bursts => "bursts",
+            SmartAlbum::Screenshots => "screenshots",
+            SmartAlbum::Animated => "animated",
+        }
+    }
+
+    /// The count index's name and the list query's `smartAlbum` filter
+    /// (icloud.com's names). Bursts have their own index instead.
+    fn names(self) -> Option<(&'static str, &'static str)> {
+        Some(match self {
+            SmartAlbum::LivePhotos => ("Live", "LIVE"),
+            SmartAlbum::Portrait => ("Depth", "DEPTH"),
+            SmartAlbum::LongExposure => ("Exposure", "EXPOSURE"),
+            SmartAlbum::Panoramas => ("Panorama", "PANORAMA"),
+            SmartAlbum::TimeLapse => ("Timelapse", "TIMELAPSE"),
+            SmartAlbum::SloMo => ("Slomo", "SLOMO"),
+            SmartAlbum::Screenshots => ("Screenshot", "SCREENSHOT"),
+            SmartAlbum::Animated => ("Animated", "ANIMATED"),
+            SmartAlbum::Bursts => return None,
+        })
+    }
 }
 
 impl Album {
-    /// Record type used for counting.
-    fn count_type(&self) -> String {
-        match self {
+    /// The id of the count index for [`PhotosClient::index_counts`]; `None`
+    /// for shared albums, which count another way.
+    pub fn count_id(&self) -> Option<String> {
+        Some(match self {
             Album::All => "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
             Album::Favorites => "CPLAssetInSmartAlbumByAssetDate:Favorite".into(),
             Album::Videos => "CPLAssetInSmartAlbumByAssetDate:Video".into(),
             Album::RecentlyDeleted => "CPLAssetDeletedByExpungedDate".into(),
+            Album::Hidden => "CPLAssetHiddenByAssetDate".into(),
+            Album::Smart(smart) => match smart.names() {
+                Some((index, _)) => format!("CPLAssetInSmartAlbumByAssetDate:{index}"),
+                None => "CPLAssetBurstStackAssetByAssetDate".into(),
+            },
             Album::User(id) => format!("CPLContainerRelationNotDeletedByAssetDate:{id}"),
-        }
+            Album::Shared(_) => return None,
+        })
     }
 
     /// Record type used for listing.
@@ -77,8 +164,13 @@ impl Album {
         match self {
             Album::All => "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
             Album::Favorites | Album::Videos => "CPLAssetAndMasterInSmartAlbumByAssetDate",
+            Album::Smart(SmartAlbum::Bursts) => "CPLBurstStackAssetAndMasterByAssetDate",
+            Album::Smart(_) => "CPLAssetAndMasterInSmartAlbumByAssetDate",
             Album::RecentlyDeleted => "CPLAssetAndMasterDeletedByExpungedDate",
+            Album::Hidden => "CPLAssetAndMasterHiddenByAssetDate",
             Album::User(_) => "CPLContainerRelationLiveByAssetDate",
+            // Not listed through CloudKit.
+            Album::Shared(_) => "",
         }
     }
 
@@ -95,8 +187,24 @@ impl Album {
         match self {
             Album::Favorites => Some("FAVORITE"),
             Album::Videos => Some("VIDEO"),
+            Album::Smart(smart) => smart.names().map(|(_, filter)| filter),
             _ => None,
         }
+    }
+}
+
+/// A shared album the user owns or was invited to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAlbum {
+    pub guid: Arc<str>,
+    pub name: String,
+    /// The user made it (rather than joined it).
+    pub owned: bool,
+}
+
+impl SharedAlbum {
+    pub fn album(&self) -> Album {
+        Album::Shared(self.guid.clone())
     }
 }
 
@@ -120,6 +228,8 @@ pub struct PhotosClient {
     endpoint: String,
     /// Where new photos are sent, if the account has the upload service.
     upload_endpoint: Option<String>,
+    /// Shared albums' service, if the account has it.
+    shared_endpoint: Option<String>,
     dsid: String,
     query: Vec<(&'static str, String)>,
 }
@@ -142,6 +252,13 @@ impl PhotosClient {
                 .webservices
                 .get("uploadimagews")
                 .map(|root| format!("{}/upload", root.trim_end_matches('/'))),
+            shared_endpoint: account.webservices.get("sharedstreams").map(|root| {
+                format!(
+                    "{}/{}/sharedstreams",
+                    root.trim_end_matches('/'),
+                    account.dsid
+                )
+            }),
             dsid: account.dsid.clone(),
             query: vec![
                 ("clientBuildNumber", CLIENT_BUILD_NUMBER.into()),
@@ -176,7 +293,104 @@ impl PhotosClient {
     }
 
     /// Number of items in an album.
+    /// The shared albums the user owns or has joined, as icloud.com lists
+    /// them.
+    pub fn shared_albums(&self) -> Result<Vec<SharedAlbum>, PhotosError> {
+        let data = self.shared_post("webgetalbumslist", &json!({}))?;
+        Ok(data["albums"]
+            .as_array()
+            .map(|albums| {
+                albums
+                    .iter()
+                    .filter_map(|album| {
+                        Some(SharedAlbum {
+                            guid: album["albumguid"].as_str()?.into(),
+                            name: album["attributes"]["name"]
+                                .as_str()
+                                .unwrap_or("Shared Album")
+                                .to_string(),
+                            owned: album["ownerdsid"].as_str() == Some(self.dsid.as_str()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn shared_post(&self, endpoint: &str, body: &Value) -> Result<Value, PhotosError> {
+        let root = self
+            .shared_endpoint
+            .as_ref()
+            .ok_or(PhotosError::NotAvailable)?;
+        let mut resp = self
+            .agent
+            .post(format!("{root}/{endpoint}"))
+            .header("Origin", "https://www.icloud.com")
+            .header("Referer", "https://www.icloud.com/")
+            .content_type("text/plain;charset=UTF-8")
+            .send(serde_json::to_vec(body).expect("serializable query"))?;
+        self.cookies.record(&resp);
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string()?;
+        if !(200..300).contains(&status) {
+            return Err(error_for(status, &text));
+        }
+        serde_json::from_str(&text).map_err(|_| PhotosError::Unexpected {
+            status,
+            message: "response wasn't JSON".into(),
+        })
+    }
+
+    /// Item counts for several of iCloud's count indexes in one request:
+    /// (index id, count) for each index iCloud knows.
+    pub fn index_counts(&self, ids: &[String]) -> Result<Vec<(String, usize)>, PhotosError> {
+        let data = self.post(
+            "internal/records/query/batch",
+            &json!({
+                "batch": [{
+                    "resultsLimit": ids.len().max(1),
+                    "query": {
+                        "filterBy": {
+                            "fieldName": "indexCountID",
+                            "fieldValue": { "type": "STRING_LIST", "value": ids },
+                            "comparator": "IN",
+                        },
+                        "recordType": "HyperionIndexCountLookup",
+                    },
+                    "zoneWide": true,
+                    "zoneID": { "zoneName": "PrimarySync" },
+                }]
+            }),
+        )?;
+        Ok(data["batch"][0]["records"]
+            .as_array()
+            .map(|records| {
+                records
+                    .iter()
+                    .filter_map(|r| {
+                        let id = r["recordName"].as_str()?.to_string();
+                        let n = r["fields"]["itemCount"]["value"].as_u64()? as usize;
+                        Some((id, n))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub fn count(&self, album: &Album) -> Result<usize, PhotosError> {
+        if let Album::Shared(guid) = album {
+            let data = self.shared_post("webgetassetcount", &json!({ "albumguid": &**guid }))?;
+            return data["albumassetcount"]
+                .as_u64()
+                .map(|n| n as usize)
+                .ok_or_else(|| PhotosError::Unexpected {
+                    status: 200,
+                    message: "missing item count".into(),
+                });
+        }
+        let Some(count_id) = album.count_id() else {
+            return Err(PhotosError::NotAvailable);
+        };
         let data = self.post(
             "internal/records/query/batch",
             &json!({
@@ -185,7 +399,7 @@ impl PhotosClient {
                     "query": {
                         "filterBy": {
                             "fieldName": "indexCountID",
-                            "fieldValue": { "type": "STRING_LIST", "value": [album.count_type()] },
+                            "fieldValue": { "type": "STRING_LIST", "value": [count_id] },
                             "comparator": "IN",
                         },
                         "recordType": "HyperionIndexCountLookup",
@@ -239,7 +453,18 @@ impl PhotosClient {
         while assets.len() < limit {
             let want = (limit - assets.len()).min(MAX_PAGE);
             let rank = start_rank + assets.len();
-            let data = self.post("records/query", &list_query(album, rank, want, keys))?;
+            let data = match album {
+                // `limit` there is where the page ends, not its length.
+                Album::Shared(guid) => self.shared_post(
+                    "webgetassets",
+                    &json!({
+                        "albumguid": &**guid,
+                        "offset": rank.to_string(),
+                        "limit": (rank + want).to_string(),
+                    }),
+                )?,
+                _ => self.post("records/query", &list_query(album, rank, want, keys))?,
+            };
             let records = data["records"].as_array().cloned().unwrap_or_default();
 
             let mut page_assets = Vec::new();
@@ -271,6 +496,27 @@ impl PhotosClient {
             }
         }
         Ok(assets)
+    }
+
+    /// What took a photo and how (camera, lens, exposure, place, the app
+    /// that saved it), from its master record. Asked for when the viewer's
+    /// info panel opens, so library pages stay small.
+    pub fn details(&self, master: &str) -> Result<PhotoDetails, PhotosError> {
+        let body = json!({
+            "records": [{ "recordName": master }],
+            "zoneID": { "zoneName": "PrimarySync" },
+            "desiredKeys": details::DETAIL_KEYS,
+        });
+        let data = self.post("records/lookup", &body)?;
+        let record = data["records"].get(0).cloned().unwrap_or(Value::Null);
+        if let Some(code) = record["serverErrorCode"].as_str() {
+            return Err(cloudkit_error(
+                200,
+                code,
+                record["reason"].as_str().unwrap_or(""),
+            ));
+        }
+        Ok(details::from_fields(&record["fields"]))
     }
 
     /// The albums the user made, in the order Photos shows them.
@@ -626,6 +872,13 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
     };
 
     let filename = text_field(master, "filenameEnc");
+    let video = matches!(kind, AssetKind::Video { .. })
+        .then(|| {
+            resource_either(asset, master, "resVidMed")
+                .or_else(|| resource_either(asset, master, "resVidSmall"))
+                .or_else(|| resource(master, "resOriginal"))
+        })
+        .flatten();
 
     let dim = |name: &str| field(master, name).and_then(Value::as_u64).unwrap_or(0) as u32;
     let thumbnail = resource_either(asset, master, "resJPEGThumb");
@@ -646,11 +899,16 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
         height: dim("resOriginalHeight"),
         favorite: field(asset, "isFavorite").and_then(Value::as_i64) == Some(1),
         created_at_ms: field(asset, "assetDate")
+            .or_else(|| field(master, "originalCreationDate"))
             .and_then(Value::as_i64)
             .unwrap_or(0),
         thumbnail,
         preview,
         original,
+        master: field(asset, "masterRef")
+            .and_then(|m| m["recordName"].as_str())
+            .map(str::to_string),
+        video,
     })
 }
 
@@ -702,6 +960,8 @@ fn missing_asset(asset: &Value) -> Asset {
         thumbnail: None,
         preview: None,
         original: None,
+        master: None,
+        video: None,
     }
 }
 
@@ -865,9 +1125,37 @@ mod tests {
         assert_eq!(filters[2]["fieldName"], "parentId");
         assert_eq!(filters[2]["fieldValue"]["value"], "ABC-123");
         assert_eq!(
-            album.count_type(),
-            "CPLContainerRelationNotDeletedByAssetDate:ABC-123"
+            album.count_id().as_deref(),
+            Some("CPLContainerRelationNotDeletedByAssetDate:ABC-123")
         );
+    }
+
+    #[test]
+    fn media_types_query_like_icloud_com() {
+        let panoramas = Album::Smart(SmartAlbum::Panoramas);
+        assert_eq!(
+            panoramas.count_id().as_deref(),
+            Some("CPLAssetInSmartAlbumByAssetDate:Panorama")
+        );
+        let q = list_query(&panoramas, 0, 10, SCAN_KEYS);
+        assert_eq!(
+            q["query"]["recordType"],
+            "CPLAssetAndMasterInSmartAlbumByAssetDate"
+        );
+        let filters = q["query"]["filterBy"].as_array().unwrap();
+        assert_eq!(filters[2]["fieldValue"]["value"], "PANORAMA");
+        // Bursts and Hidden have their own indexes and no filter.
+        let bursts = list_query(&Album::Smart(SmartAlbum::Bursts), 0, 10, SCAN_KEYS);
+        assert_eq!(
+            bursts["query"]["recordType"],
+            "CPLBurstStackAssetAndMasterByAssetDate"
+        );
+        assert_eq!(bursts["query"]["filterBy"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            Album::Hidden.count_id().as_deref(),
+            Some("CPLAssetHiddenByAssetDate")
+        );
+        assert_eq!(Album::Shared("G".into()).count_id(), None);
     }
 
     #[test]

@@ -20,11 +20,10 @@ use std::time::{Duration, Instant};
 
 use fuji_icloud::{Album, Asset, AssetId, PhotosClient, PhotosError, Resource};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    SharedString, Subscription, Transformation, Window, actions, div, img, percentage, point,
-    prelude::*, px,
+    AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Subscription, Window, actions, canvas, div, img, point, prelude::*, px,
 };
 use jiff::civil::Date;
 
@@ -39,7 +38,7 @@ use crate::settings::{self, Settings};
 use crate::transfer::PendingUpload;
 use crate::ui::{self, MenuItem, Status};
 use crate::viewer::{Viewer, ViewerEvent};
-use crate::{net, theme, thumbs, titlebar};
+use crate::{net, theme, thumbs};
 
 actions!(
     gallery,
@@ -105,12 +104,10 @@ const FLYING_VIEWPORTS: f32 = 1.5;
 /// The strip on the right holding the timeline scrubber.
 const SCRUBBER_WIDTH: f32 = 48.;
 const SCRUBBER_INSET: f32 = 14.;
-/// The gallery runs under the app's title bar; its header floats over the
-/// top of the mosaic, which starts below both.
-const BAR: f32 = titlebar::HEIGHT_PX;
-const HEADER_SPACE: f32 = BAR + 92.;
+/// The header floats over the top of the mosaic, which starts below it.
+const HEADER_SPACE: f32 = 80.;
 /// The scrubber's track starts below the header.
-const SCRUBBER_TOP: f32 = HEADER_SPACE;
+const SCRUBBER_TOP: f32 = HEADER_SPACE + 12.;
 /// How long the scrubber's date stays up after scrolling.
 const SCRUBBER_LINGER: Duration = Duration::from_millis(900);
 /// How far the pointer moves with the button down before a drag starts.
@@ -119,6 +116,8 @@ const TOAST_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub enum GridEvent {
     SessionExpired,
+    /// The back button: return to the Collections page.
+    Back,
 }
 
 enum LoadState {
@@ -232,6 +231,8 @@ pub struct PhotoGrid {
     album: Album,
     /// The album's name, shown as the heading.
     title: SharedString,
+    /// Opened from Collections: a back button before the title.
+    back: bool,
     /// Bumped on album change so results for the old album are ignored.
     generation: u64,
     state: LoadState,
@@ -346,6 +347,7 @@ impl PhotoGrid {
             preview_dir,
             album,
             title,
+            back: false,
             generation: 0,
             state: LoadState::Loading,
             index: Vec::new(),
@@ -399,6 +401,14 @@ impl PhotoGrid {
     }
 
     /// Show `album`, headed `title`. A rename alone just changes the heading.
+    /// Show a back button (opened from Collections) or not.
+    pub fn set_back(&mut self, back: bool, cx: &mut Context<Self>) {
+        if self.back != back {
+            self.back = back;
+            cx.notify();
+        }
+    }
+
     pub fn set_album(&mut self, album: Album, title: SharedString, cx: &mut Context<Self>) {
         if title != self.title {
             self.title = title;
@@ -563,6 +573,11 @@ impl PhotoGrid {
     pub fn asset(&self, index: usize) -> Option<&Asset> {
         let item = self.index.get(index)?;
         self.assets.get(&AssetId(item.id.clone()))
+    }
+
+    /// The thumbnail of the item at `index`, if it's here yet.
+    pub fn item_thumbnail(&self, index: usize) -> Option<Arc<Path>> {
+        self.thumbnail_path(&self.index.get(index)?.asset_id())
     }
 
     pub fn thumbnail_path(&self, id: &AssetId) -> Option<Arc<Path>> {
@@ -1133,30 +1148,34 @@ impl PhotoGrid {
         self.zoom_to(target, at, cx);
     }
 
+    /// The photo row at `screen_y` (from the gallery's top), to hold there
+    /// while the layout changes.
+    fn anchor_at(&self, screen_y: f32) -> Option<ZoomAnchor> {
+        let layout = self.layout.as_ref()?;
+        let y = self.top() + screen_y;
+        let row = layout.tile_row_at(y)?;
+        let RowKind::Tiles(tiles) = &row.kind else {
+            return None;
+        };
+        Some(ZoomAnchor {
+            index: tiles.first()?.index,
+            fraction: ((y - row.y) / row.height).clamp(0., 1.),
+            screen_y,
+        })
+    }
+
     fn zoom_to(&mut self, target: f32, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
         if (target - self.row_height.target()).abs() < 0.01 {
             return;
         }
-        if self.zoom_anchor.is_none()
-            && let Some(layout) = &self.layout
-        {
+        if self.zoom_anchor.is_none() {
             let bounds = self.scroll.bounds();
             let viewport = f32::from(bounds.size.height);
             let screen_y = at
                 .map(|p| f32::from(p.y - bounds.top()))
                 .filter(|y| (0. ..=viewport).contains(y))
                 .unwrap_or(viewport / 2.);
-            let y = self.top() + screen_y;
-            self.zoom_anchor = layout.tile_row_at(y).and_then(|row| {
-                let RowKind::Tiles(tiles) = &row.kind else {
-                    return None;
-                };
-                Some(ZoomAnchor {
-                    index: tiles.first()?.index,
-                    fraction: ((y - row.y) / row.height).clamp(0., 1.),
-                    screen_y,
-                })
-            });
+            self.zoom_anchor = self.anchor_at(screen_y);
         }
         // The anchor decides the scroll position while zooming.
         self.scroller.jump(self.top());
@@ -1178,7 +1197,7 @@ impl PhotoGrid {
 
     /// Scroll to the scrubber position under the pointer.
     fn scrub_to(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(track) = self.track else {
+        let Some(track) = self.track.clone() else {
             return;
         };
         let y = f32::from(pointer.y - self.scroll.bounds().top()) - SCRUBBER_TOP;
@@ -1459,25 +1478,10 @@ impl PhotoGrid {
                 sync_status.unwrap_or_else(|| "Check for new photos".into()),
             ))
             .on_click(cx.listener(|this, _, _, cx| this.refresh(false, cx)))
-            .child(if syncing && !anim::reduced() {
-                icon("sync", px(16.), theme::accent_text())
-                    .with_animation(
-                        "sync-turning",
-                        Animation::new(Duration::from_millis(1100)).repeat(),
-                        |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
-                    )
-                    .into_any_element()
+            .child(if syncing {
+                ui::spinner("sync-spinner", px(15.), theme::text_muted())
             } else {
-                icon(
-                    "sync",
-                    px(16.),
-                    if syncing {
-                        theme::accent_text()
-                    } else {
-                        theme::text_muted()
-                    },
-                )
-                .into_any_element()
+                icon("sync", px(16.), theme::text_muted()).into_any_element()
             });
         // While a device searches and ours found nothing, no count yet.
         let waiting = self.device_pending.is_some() && self.index.is_empty();
@@ -1517,34 +1521,43 @@ impl PhotoGrid {
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(2.))
                 .child(
                     div()
+                        .mr(px(8.))
                         .text_sm()
                         .text_color(theme::accent_text())
                         .child(format!("{} selected", group_digits(chosen))),
                 )
-                .child(ui::text_button(
-                    "selection-copy",
-                    Some("copy"),
-                    "Copy",
-                    cx.listener(|this, _, window, cx| {
-                        this.copy_selection(&CopySelection, window, cx)
-                    }),
-                ))
-                .child(ui::text_button(
-                    "selection-download",
-                    Some("download"),
-                    "Download",
-                    cx.listener(|this, _, window, cx| {
-                        this.download_selection(&DownloadSelection, window, cx)
-                    }),
-                ))
-                .child(ui::icon_button(
-                    "selection-clear",
-                    "close",
-                    cx.listener(|this, _, _, cx| this.clear_selection(cx)),
-                ))
+                // Plain icons, as in the viewer's bar.
+                .child(
+                    ui::icon_button(
+                        "selection-copy",
+                        "copy",
+                        cx.listener(|this, _, window, cx| {
+                            this.copy_selection(&CopySelection, window, cx)
+                        }),
+                    )
+                    .tooltip(ui::tooltip("Copy (Ctrl+C)")),
+                )
+                .child(
+                    ui::icon_button(
+                        "selection-download",
+                        "download",
+                        cx.listener(|this, _, window, cx| {
+                            this.download_selection(&DownloadSelection, window, cx)
+                        }),
+                    )
+                    .tooltip(ui::tooltip("Download (Ctrl+S)")),
+                )
+                .child(
+                    ui::icon_button(
+                        "selection-clear",
+                        "close",
+                        cx.listener(|this, _, _, cx| this.clear_selection(cx)),
+                    )
+                    .tooltip(ui::tooltip("Clear selection (Esc)")),
+                )
                 .with_animation("selection-tools", anim::ease(anim::NORMAL), |el, t| {
                     el.opacity(t)
                 })
@@ -1557,11 +1570,14 @@ impl PhotoGrid {
                 .gap(px(2.))
                 .child(sync)
                 .child(div().w(px(6.)))
-                .child(ui::icon_button(
-                    "zoom-out",
-                    "minus",
-                    cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
-                ))
+                .child(
+                    ui::icon_button(
+                        "zoom-out",
+                        "minus",
+                        cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
+                    )
+                    .tooltip(ui::tooltip("Smaller (Ctrl+-)")),
+                )
                 .child(ui::slider(
                     "zoom-slider",
                     settings::zoom_fraction(self.row_height.target()),
@@ -1573,11 +1589,14 @@ impl PhotoGrid {
                         .ok();
                     },
                 ))
-                .child(ui::icon_button(
-                    "zoom-in",
-                    "plus",
-                    cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx)),
-                ))
+                .child(
+                    ui::icon_button(
+                        "zoom-in",
+                        "plus",
+                        cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx)),
+                    )
+                    .tooltip(ui::tooltip("Larger (Ctrl+=)")),
+                )
                 .into_any_element()
         };
 
@@ -1587,9 +1606,8 @@ impl PhotoGrid {
             .filter(|_| self.search.is_none())
             .map(|(year, month)| format!("{} {year}", layout::month_name(month)));
         let subtitle: Vec<String> = month.into_iter().chain(count).collect();
-        let surface = theme::surface();
-        let mut clear = surface;
-        clear.a = 0.;
+        let mut translucent = theme::surface();
+        translucent.a = 0.86;
 
         div()
             .absolute()
@@ -1602,26 +1620,37 @@ impl PhotoGrid {
             .items_center()
             .gap_3()
             .px(px(theme::CONTENT_PADDING))
-            .pt(px(BAR + 10.))
-            .pb(px(40.))
-            // Behind the app's bar too: solid behind the bar and the title,
-            // fading out over the photos below them.
-            .bg(gpui::linear_gradient(
-                180.,
-                gpui::linear_color_stop(surface, (BAR + 62.) / (BAR + 100.)),
-                gpui::linear_color_stop(clear, 1.),
-            ))
+            .pt(px(10.))
+            .pb(px(12.))
+            // Flat and translucent: the photos pass faintly under it.
+            .bg(translucent)
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(26.))
-                            .line_height(px(32.))
-                            .font_weight(FontWeight::EXTRA_BOLD)
-                            .text_color(theme::text())
-                            .child(self.title.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .when(self.back, |el| {
+                                el.ml(px(-8.)).child(
+                                    ui::icon_button(
+                                        "gallery-back",
+                                        "previous",
+                                        cx.listener(|_, _, _, cx| cx.emit(GridEvent::Back)),
+                                    )
+                                    .tooltip(ui::tooltip("Collections")),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(28.))
+                                    .line_height(px(32.))
+                                    .font_weight(FontWeight::BLACK)
+                                    .text_color(theme::text())
+                                    .child(self.title.clone()),
+                            ),
                     )
                     .child(
                         div()
@@ -2056,6 +2085,16 @@ impl PhotoGrid {
             self.layout_dirty = true;
             window.request_animation_frame();
         }
+        // A new width re-flows the rows: keep the photo at the top in place.
+        if self.zoom_anchor.is_none()
+            && self.top() > 0.
+            && self
+                .layout
+                .as_ref()
+                .is_some_and(|l| (l.width - width).abs() > 0.5)
+        {
+            self.zoom_anchor = self.anchor_at(HEADER_SPACE);
+        }
         self.ensure_layout(width);
         let Some(layout) = self.layout.take() else {
             return div().flex_1().into_any_element();
@@ -2128,7 +2167,7 @@ impl PhotoGrid {
                         .items_end()
                         .pb(px(6.))
                         .text_size(px(20.))
-                        .font_weight(FontWeight::EXTRA_BOLD)
+                        .font_weight(FontWeight::BLACK)
                         .text_color(theme::text())
                         .into_any_element(),
                 ),
@@ -2136,7 +2175,7 @@ impl PhotoGrid {
                     self.render_header_row(row, label, false, selecting, cx)
                         .items_center()
                         .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(FontWeight::BOLD)
                         .text_color(theme::text_title())
                         .into_any_element(),
                 ),
@@ -2175,12 +2214,14 @@ impl PhotoGrid {
                 .update(cx, |cache, _| cache.set_capacity(wanted));
         }
 
-        let track = Track {
-            content: layout.height,
-            viewport: viewport_h,
-            length: (viewport_h - SCRUBBER_TOP - SCRUBBER_INSET).max(1.),
-        };
-        self.track = Some(track);
+        let marks: Vec<f32> = layout.months.iter().map(|m| m.y).collect();
+        let track = Track::new(
+            layout.height,
+            viewport_h,
+            (viewport_h - SCRUBBER_TOP - SCRUBBER_INSET).max(1.),
+            &marks,
+        );
+        self.track = Some(track.clone());
         let scrubber =
             (self.max_scroll > 0.).then(|| self.render_scrubber(&layout, track, top, cx));
         let height = layout.height;
@@ -2450,16 +2491,57 @@ impl PhotoGrid {
             .flatten()
             .map(|mark| format!("{} {}", layout::month_name(mark.month), mark.year));
 
-        let years = scrubber::year_labels(&layout.months, track, 20.);
-        let ticks = scrubber::month_ticks(&layout.months, track, 6.);
+        let years = scrubber::year_labels(&layout.months, &track, 20.);
+        let ticks = scrubber::month_ticks(&layout.months, &track, 6.);
         let ink = if active {
             theme::text_muted()
         } else {
             theme::text_meta()
         };
 
+        // While dragging, follow the pointer anywhere in the window: over
+        // the header or the title bar it pins to the top.
+        let dragging = self.scrub.dragging;
+        let weak = cx.weak_entity();
+        let follow = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                if !dragging {
+                    return;
+                }
+                let on_move = weak.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase.capture() {
+                        return;
+                    }
+                    let held = event.pressed_button == Some(MouseButton::Left);
+                    on_move
+                        .update(cx, |this, cx| {
+                            if !this.scrub.dragging {
+                                return;
+                            }
+                            if held {
+                                this.scrub_to(event.position, cx);
+                            } else {
+                                this.end_press(cx);
+                            }
+                        })
+                        .ok();
+                });
+                let on_up = weak.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase.bubble() {
+                        on_up.update(cx, |this, cx| this.end_press(cx)).ok();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
+
         div()
             .id("scrubber")
+            .child(follow)
             .absolute()
             .top_0()
             .bottom_0()
@@ -2475,9 +2557,9 @@ impl PhotoGrid {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if let Some(track) = this.track {
+                if let Some(length) = this.track.as_ref().map(|t| t.length) {
                     let y = f32::from(event.position.y - this.scroll.bounds().top()) - SCRUBBER_TOP;
-                    this.scrub.hover = Some(y.clamp(0., track.length));
+                    this.scrub.hover = Some(y.clamp(0., length));
                     cx.notify();
                 }
             }))
@@ -2547,8 +2629,6 @@ impl PhotoGrid {
                         .items_center()
                         .rounded(px(8.))
                         .bg(theme::popover())
-                        .border_1()
-                        .border_color(theme::line())
                         .shadow_lg()
                         .text_size(px(12.))
                         .font_weight(FontWeight::SEMIBOLD)
@@ -2615,7 +2695,9 @@ fn empty_message(album: &Album) -> &'static str {
         Album::Favorites => "No favorites yet. Favorite a photo on your iPhone to see it here.",
         Album::Videos => "No videos.",
         Album::RecentlyDeleted => "Nothing recently deleted.",
-        Album::User(_) => "This album is empty.",
+        Album::Hidden => "Nothing hidden.",
+        Album::Smart(_) => "None in your library.",
+        Album::User(_) | Album::Shared(_) => "This album is empty.",
     }
 }
 

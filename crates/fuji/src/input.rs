@@ -719,12 +719,11 @@ impl Render for TextInput {
             .px(px(if self.compact_icon.is_some() { 9. } else { 12. }))
             .gap(px(7.))
             .rounded(theme::RADIUS_CONTROL)
-            .bg(theme::field())
-            .border_1()
-            .border_color(if focused {
-                theme::focus_ring()
+            // Flat: focus shows as a lighter fill.
+            .bg(if focused {
+                theme::fill_hover()
             } else {
-                theme::field_border()
+                theme::fill()
             })
             .when(self.disabled, |el| el.opacity(0.5))
             .text_size(px(13.))

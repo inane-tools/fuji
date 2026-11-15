@@ -102,8 +102,8 @@ Notes:
 
 ## Credits
 
-- Icons: [Framework7 Icons](https://framework7.io/icons/) (MIT), plus the Live Photo mark from [Phosphor](https://phosphoricons.com) (MIT), in `crates/fuji/assets/icons`
-- Font: [Hanken Grotesk](https://github.com/marcologous/hanken-grotesk) (SIL Open Font License), in `crates/fuji/assets`
+- Icons: [Framework7 Icons](https://framework7.io/icons/) (MIT), in `crates/fuji/assets/icons`
+- Font: [Gabarito](https://github.com/naipefoundry/gabarito) (SIL Open Font License), letter spacing tightened by `scripts/track_font.py`, in `crates/fuji/assets`
 
 ## Disclaimer
 

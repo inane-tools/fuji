@@ -21,6 +21,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 unicode-segmentation = "1.13.3"
+smallvec = "1"
 
 [target.'cfg(windows)'.dependencies]
 # The same version GPUI uses, for the clipboard and drag-out glue in platform.rs.
@@ -37,6 +38,10 @@ windows = { version = "0.61", features = [
     "Win32_System_Ole",
     # The accent color.
     "Win32_System_Registry",
+    # Video playback (Media Engine) and its frames (WIC).
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
@@ -47,3 +52,4 @@ windows-core = "0.61"
 [target.'cfg(windows)'.build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 embed-resource = "3"
+

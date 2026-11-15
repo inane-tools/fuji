@@ -67,27 +67,36 @@ struct CacheFile {
     items: Vec<IndexItem>,
 }
 
-pub fn cache_path(account_dir: &Path, album: &Album) -> PathBuf {
-    let name = match album {
+fn safe_name(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A short, file-safe name for an album: "library", "type-panoramas".
+pub fn album_slug(album: &Album) -> String {
+    match album {
         Album::All => "library".into(),
         Album::Favorites => "favorites".into(),
         Album::Videos => "videos".into(),
         Album::RecentlyDeleted => "recently-deleted".into(),
-        // Record names are UUIDs, but keep the file name safe whatever they are.
-        Album::User(id) => {
-            let safe: String = id
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            format!("album-{safe}")
-        }
-    };
+        Album::Hidden => "hidden".into(),
+        Album::Smart(smart) => format!("type-{}", smart.slug()),
+        // Record names and GUIDs are UUIDs, but keep the file name safe
+        // whatever they are.
+        Album::User(id) => format!("album-{}", safe_name(id)),
+        Album::Shared(guid) => format!("shared-{}", safe_name(guid)),
+    }
+}
+
+pub fn cache_path(account_dir: &Path, album: &Album) -> PathBuf {
+    let name = album_slug(album);
     account_dir.join(format!("index-{name}.json"))
 }
 

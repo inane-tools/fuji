@@ -163,6 +163,8 @@ mod tests {
             thumbnail: None,
             preview: None,
             original: None,
+            master: None,
+            video: None,
         }
     }
 

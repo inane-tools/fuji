@@ -2,9 +2,9 @@
 //!
 //! Icons are Framework7 Icons (MIT, see assets/icons/LICENSE-framework7),
 //! drawn to match Apple's SF Symbols: outline when idle, fill when active.
-//! The Live Photo mark is Phosphor (MIT, assets/icons/LICENSE-phosphor) and
-//! the spinner is drawn for Fuji. The UI font, Hanken Grotesk, is under the
-//! OFL (assets/OFL-HankenGrotesk.txt), with its letter spacing tightened by
+//! The spinner is drawn for Fuji; the brand marks on Settings' About are
+//! Boxicons' GitHub and Bluesky's own (both MIT). The UI font, Gabarito, is under the
+//! OFL (assets/OFL-Gabarito.txt), with its letter spacing tightened by
 //! 2% of an em (scripts/track_font.py), since GPUI can't set tracking.
 
 use std::borrow::Cow;
@@ -65,6 +65,30 @@ impl AssetSource for Assets {
                 "sync",
                 "info",
                 "info-active",
+                "caret-up",
+                "pause-fill",
+                "speaker",
+                "speaker-off",
+                "collections",
+                "collections-active",
+                "hidden",
+                "shared-albums",
+                "type-live",
+                "type-portrait",
+                "type-long-exposure",
+                "type-panoramas",
+                "type-time-lapse",
+                "type-slo-mo",
+                "type-bursts",
+                "type-screenshots",
+                "type-animated",
+                "globe",
+                // Brand marks (Boxicons GitHub, Bluesky: MIT; X) and the
+                // inane.tools wordmark, for Settings' About.
+                "github",
+                "bluesky",
+                "x",
+                "inane",
             ]
         );
         Ok(bytes.map(Cow::Borrowed))
@@ -75,7 +99,7 @@ impl AssetSource for Assets {
     }
 }
 
-pub const FONT_BYTES: &[u8] = include_bytes!("../assets/HankenGrotesk.ttf");
+pub const FONT_BYTES: &[u8] = include_bytes!("../assets/Gabarito.ttf");
 
 /// An icon by name (see the list above), sized and tinted.
 pub fn icon(name: &str, size: Pixels, color: Hsla) -> Svg {

@@ -12,7 +12,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{anim, theme, ui};
+use crate::{anim, release, theme, ui};
 
 pub const MIN_ROW_HEIGHT: f32 = 72.;
 pub const MAX_ROW_HEIGHT: f32 = 420.;
@@ -20,6 +20,7 @@ pub const DEFAULT_ROW_HEIGHT: f32 = 200.;
 /// One press of the thumbnail size buttons.
 const ROW_HEIGHT_STEP: f32 = 1.2;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPOSITORY: &str = "https://github.com/inane-tools/fuji";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -29,6 +30,29 @@ pub struct Settings {
     pub reduce_motion: bool,
     /// Height of the gallery's rows: the grid zoom.
     pub row_height: f32,
+    /// Light, dark, or as the system is.
+    pub appearance: Appearance,
+    /// The system's accent color, or Apple's blue.
+    pub accent: Accent,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Accent {
+    /// Windows' accent color (the app's mint elsewhere).
+    #[default]
+    System,
+    /// Apple's blue, as on icloud.com.
+    Blue,
 }
 
 impl Default for Settings {
@@ -36,7 +60,22 @@ impl Default for Settings {
         Self {
             reduce_motion: false,
             row_height: DEFAULT_ROW_HEIGHT,
+            appearance: Appearance::default(),
+            accent: Accent::default(),
         }
+    }
+}
+
+impl Settings {
+    /// Set the theme for this frame: light or dark (the system's when
+    /// following it) and the accent.
+    pub fn apply_theme(&self, system_light: bool) {
+        let light = match self.appearance {
+            Appearance::System => system_light,
+            Appearance::Light => true,
+            Appearance::Dark => false,
+        };
+        crate::theme::configure(light, self.accent == Accent::Blue);
     }
 }
 
@@ -94,6 +133,8 @@ impl Settings {
         }
         anim::set_reduced(settings.reduce_motion);
         cx.set_global(settings.clone());
+        // Colors may have changed: redraw everything.
+        cx.refresh_windows();
         cx.background_spawn(async move {
             let (Some(path), Ok(json)) = (path(), serde_json::to_vec_pretty(&settings)) else {
                 return;
@@ -128,6 +169,8 @@ pub struct SettingsView {
     clearing: bool,
     /// The switch flipped last: the one whose knob slides.
     flipped: Option<&'static str>,
+    /// The Open Source list is open.
+    credits_open: bool,
     _settings: Subscription,
 }
 
@@ -148,6 +191,7 @@ impl SettingsView {
             cache_bytes: None,
             clearing: false,
             flipped: None,
+            credits_open: false,
             _settings: cx.observe_global::<Settings>(|_, cx| cx.notify()),
         };
         view.measure_cache(cx);
@@ -213,12 +257,157 @@ impl SettingsView {
     }
 }
 
+/// What Fuji is built on, for the Open Source section: name, what it does,
+/// license, and where it lives.
+const CREDITS: &[(&str, &str, &str, &str)] = &[
+    (
+        "GPUI",
+        "UI framework",
+        "Apache-2.0",
+        "https://github.com/zed-industries/zed",
+    ),
+    (
+        "Gabarito",
+        "typeface",
+        "OFL-1.1",
+        "https://github.com/naipefoundry/gabarito",
+    ),
+    (
+        "Framework7 Icons",
+        "interface icons",
+        "MIT",
+        "https://github.com/framework7io/framework7-icons",
+    ),
+    (
+        "Boxicons",
+        "GitHub mark",
+        "MIT",
+        "https://github.com/box-icons/boxicons",
+    ),
+    (
+        "Bluesky",
+        "Bluesky mark",
+        "MIT",
+        "https://github.com/bluesky-social/social-app",
+    ),
+    (
+        "ureq",
+        "HTTP client",
+        "MIT / Apache-2.0",
+        "https://github.com/algesten/ureq",
+    ),
+    (
+        "rustls",
+        "TLS",
+        "Apache-2.0 / MIT / ISC",
+        "https://github.com/rustls/rustls",
+    ),
+    (
+        "tungstenite",
+        "WebSocket for device search",
+        "MIT / Apache-2.0",
+        "https://github.com/snapview/tungstenite-rs",
+    ),
+    (
+        "RustCrypto",
+        "AES, P-256, HKDF, HMAC, SHA, scrypt, RSA",
+        "MIT / Apache-2.0",
+        "https://github.com/RustCrypto",
+    ),
+    (
+        "serde",
+        "JSON and settings",
+        "MIT / Apache-2.0",
+        "https://github.com/serde-rs/serde",
+    ),
+    (
+        "plist",
+        "Apple property lists",
+        "MIT",
+        "https://github.com/ebarnard/rust-plist",
+    ),
+    (
+        "image",
+        "thumbnail decoding",
+        "MIT / Apache-2.0",
+        "https://github.com/image-rs/image",
+    ),
+    (
+        "jiff",
+        "dates and time zones",
+        "MIT / Unlicense",
+        "https://github.com/BurntSushi/jiff",
+    ),
+    (
+        "keyring",
+        "the system keychain",
+        "MIT / Apache-2.0",
+        "https://github.com/open-source-cooperative/keyring-rs",
+    ),
+    (
+        "flate2",
+        "compressed replies",
+        "MIT / Apache-2.0",
+        "https://github.com/rust-lang/flate2-rs",
+    ),
+    (
+        "windows-rs",
+        "Windows APIs",
+        "MIT / Apache-2.0",
+        "https://github.com/microsoft/windows-rs",
+    ),
+];
+
+const DISCLAIMER: &str = "Fuji is an unofficial client and is not affiliated with, endorsed \
+    by, or associated with Apple Inc. Apple, iCloud, iCloud Photos and iPhone are trademarks \
+    of Apple Inc. Fuji signs in with your own Apple Account and talks to Apple's services the \
+    way icloud.com does. You are responsible for how you use Fuji and for any consequences, \
+    including any effect on your account or your photos. The software is provided as is, \
+    without warranty of any kind.";
+
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = Settings::get(cx).clone();
         let flipped = self.flipped;
 
-        let appearance = group("Appearance")
+        let account = section(Tone::Default).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .child(ui::avatar(self.picture.clone(), &self.name, px(44.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .font_weight(FontWeight::EXTRA_BOLD)
+                                .text_color(theme::text())
+                                .truncate()
+                                .child(self.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::text_meta())
+                                .truncate()
+                                .child(self.apple_id.clone()),
+                        ),
+                )
+                .child(ui::text_button(
+                    "settings-sign-out",
+                    Some("sign-out"),
+                    "Log Out",
+                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::SignOut)),
+                )),
+        );
+
+        let appearance = section(Tone::Default)
+            .child(heading("Appearance", None))
             .child(row(
                 "Thumbnail size",
                 "Ctrl + scroll in the gallery zooms too.",
@@ -247,6 +436,51 @@ impl Render for SettingsView {
                     )),
             ))
             .child(row(
+                "Appearance",
+                "Light, dark, or as Windows is set.",
+                true,
+                ui::segmented(
+                    "appearance",
+                    &["System", "Light", "Dark"],
+                    match settings.appearance {
+                        Appearance::System => 0,
+                        Appearance::Light => 1,
+                        Appearance::Dark => 2,
+                    },
+                    |choice, _, cx| {
+                        Settings::update(cx, |s| {
+                            s.appearance = match choice {
+                                1 => Appearance::Light,
+                                2 => Appearance::Dark,
+                                _ => Appearance::System,
+                            }
+                        })
+                    },
+                ),
+            ))
+            .child(row(
+                "Accent color",
+                "Windows\u{2019} accent color, or Apple\u{2019}s blue as on iCloud.com.",
+                true,
+                ui::segmented(
+                    "accent",
+                    &["System", "Apple Blue"],
+                    match settings.accent {
+                        Accent::System => 0,
+                        Accent::Blue => 1,
+                    },
+                    |choice, _, cx| {
+                        Settings::update(cx, |s| {
+                            s.accent = if choice == 1 {
+                                Accent::Blue
+                            } else {
+                                Accent::System
+                            }
+                        })
+                    },
+                ),
+            ))
+            .child(row(
                 "Reduce motion",
                 "Turn off animations and smooth scrolling.",
                 true,
@@ -265,119 +499,195 @@ impl Render for SettingsView {
             (false, Some(bytes)) => format!("Using {} on this computer.", format_bytes(bytes)),
             (false, None) => "Measuring\u{2026}".to_string(),
         };
-        let storage = group("Storage").child(row(
-            "Cached photos",
-            cache_size,
-            false,
-            ui::text_button(
-                "clear-cache",
-                None,
-                "Clear",
-                cx.listener(|this, _, _, cx| this.clear_cache(cx)),
-            ),
-        ));
+        let storage = section(Tone::Default)
+            .child(heading("Storage", None))
+            .child(row(
+                "Cached photos",
+                cache_size,
+                false,
+                ui::text_button(
+                    "clear-cache",
+                    None,
+                    "Clear",
+                    cx.listener(|this, _, _, cx| this.clear_cache(cx)),
+                ),
+            ));
 
-        let account = group("Account").child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .px(px(16.))
-                .py(px(14.))
-                .child(ui::avatar(self.picture.clone(), &self.name, px(40.)))
-                .child(
+        let open = self.credits_open;
+        let credits = section(Tone::Default)
+            .child(
+                div()
+                    .id("credits-toggle")
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.credits_open = !this.credits_open;
+                        cx.notify();
+                    }))
+                    .child(div().flex_1().child(heading(
+                        "Open Source",
+                        Some("The projects Fuji is built on."),
+                    )))
+                    .child(crate::assets::icon(
+                        if open { "caret-up" } else { "caret-down" },
+                        px(14.),
+                        theme::text_meta(),
+                    )),
+            )
+            .when(open, |el| {
+                el.child(
                     div()
-                        .flex_1()
-                        .min_w_0()
+                        .mt(px(14.))
                         .flex()
-                        .flex_col()
-                        .child(
+                        .flex_wrap()
+                        .gap_x(px(24.))
+                        .children(CREDITS.iter().map(|&(name, purpose, license, url)| {
                             div()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::text())
-                                .truncate()
-                                .child(self.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme::text_meta())
-                                .truncate()
-                                .child(self.apple_id.clone()),
-                        ),
-                )
-                .child(ui::text_button(
-                    "settings-sign-out",
-                    Some("sign-out"),
-                    "Log Out",
-                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::SignOut)),
-                )),
-        );
-
-        let about = group("About").child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.))
-                .px(px(16.))
-                .py(px(16.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .child(
-                            img(ImageSource::Resource(Resource::Embedded(
-                                "icon-96.png".into(),
-                            )))
-                            .size(px(44.))
-                            .flex_none(),
-                        )
-                        .child(
-                            div()
+                                .w(px(280.))
+                                .py(px(5.))
                                 .flex()
-                                .flex_col()
+                                .items_baseline()
+                                .justify_between()
+                                .gap(px(8.))
                                 .child(
                                     div()
-                                        .text_size(px(18.))
-                                        .font_weight(FontWeight::EXTRA_BOLD)
-                                        .text_color(theme::text())
-                                        .child("Fuji"),
+                                        .id(name)
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::text_title())
+                                        .cursor_pointer()
+                                        .hover(|el| el.text_color(theme::text()))
+                                        .tooltip(ui::tooltip(purpose))
+                                        .on_click(move |_, _, cx| cx.open_url(url))
+                                        .child(name),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(12.))
+                                        .text_size(px(11.))
                                         .text_color(theme::text_meta())
-                                        .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
-                                ),
-                        ),
+                                        .truncate()
+                                        .child(license),
+                                )
+                        })),
                 )
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(theme::text_muted())
-                        .child(
-                            "A fast, native iCloud Photos client for Windows and Linux, \
-                             written in Rust with GPUI.",
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme::text_meta())
-                        .child(
-                            "Set in Hanken Grotesk (SIL Open Font License), with Framework7 \
-                             Icons (MIT). Fuji is an independent project and is not affiliated \
-                             with Apple. iCloud is a trademark of Apple Inc.",
-                        ),
-                )
-                .child(div().flex().text_size(px(13.)).child(ui::link(
-                    "about-source",
-                    "Source code on GitHub",
-                    |_, _, cx| cx.open_url(REPOSITORY),
-                ))),
-        );
+            });
+
+        let disclaimer = section(Tone::Warn)
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_color(theme::warn_title())
+                    .child("Disclaimer"),
+            )
+            .child(
+                div()
+                    .mt(px(10.))
+                    .text_size(px(12.))
+                    .line_height(px(19.))
+                    .text_color(theme::warn_text())
+                    .child(DISCLAIMER),
+            );
+
+        // "Fuji 1.0 Great Wave": the version and its codename.
+        let view = release::view(VERSION);
+        let about = section(Tone::Accent)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .child(
+                        img(ImageSource::Resource(Resource::Embedded(
+                            "icon-96.png".into(),
+                        )))
+                        .size(px(44.))
+                        .rounded(px(10.))
+                        .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap(px(8.))
+                                    .text_size(px(20.))
+                                    .font_weight(FontWeight::BLACK)
+                                    .text_color(theme::text())
+                                    .child(format!("Fuji {}", release::major_minor(VERSION)))
+                                    .when_some(view, |el, (codename, _)| {
+                                        el.child(
+                                            div().text_color(theme::accent_text()).child(codename),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_meta())
+                                    .child(match view {
+                                        Some((_, title)) => format!(
+                                            "v{VERSION} \u{00b7} after Hokusai\u{2019}s \u{201c}{title}\u{201d}"
+                                        ),
+                                        None => format!("v{VERSION}"),
+                                    }),
+                            ),
+                    )
+                    .child(ui::text_button(
+                        "about-releases",
+                        Some("github"),
+                        "Releases",
+                        |_, _, cx| cx.open_url(&format!("{REPOSITORY}/releases")),
+                    )),
+            )
+            .child(
+                div()
+                    .mt(px(16.))
+                    .pt(px(16.))
+                    .border_t_1()
+                    .border_color(theme::hover())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(social(
+                        "about-bluesky",
+                        "bluesky",
+                        "@inane.tools on Bluesky",
+                        "https://bsky.app/profile/inane.tools",
+                    ))
+                    .child(social(
+                        "about-x",
+                        "x",
+                        "@inanetools on X",
+                        "https://x.com/inanetools",
+                    ))
+                    .child(social(
+                        "about-web",
+                        "globe",
+                        "inane.tools",
+                        "https://inane.tools",
+                    ))
+                    .child(social(
+                        "about-github",
+                        "github",
+                        "Fuji on GitHub",
+                        REPOSITORY,
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        gpui::svg()
+                            .path("icons/inane.svg")
+                            .w(px(69.))
+                            .h(px(24.))
+                            .text_color(theme::text_muted()),
+                    ),
+            );
 
         div()
             .id("settings")
@@ -396,66 +706,101 @@ impl Render for SettingsView {
                     .pb(px(40.))
                     .flex()
                     .flex_col()
-                    .gap(px(24.))
+                    .gap(px(12.))
                     .child(
                         div()
-                            .text_size(px(26.))
-                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .mb(px(8.))
+                            .text_size(px(28.))
+                            .font_weight(FontWeight::BLACK)
                             .text_color(theme::text())
                             .child("Settings"),
                     )
+                    .child(account)
                     .child(appearance)
                     .child(storage)
-                    .child(account)
+                    .child(credits)
+                    .child(disclaimer)
                     .child(about),
             )
     }
 }
 
-/// A titled card of rows.
-struct Group {
-    title: &'static str,
-    card: gpui::Div,
+enum Tone {
+    Default,
+    /// The disclaimer.
+    Warn,
+    /// The About card.
+    Accent,
 }
 
-fn group(title: &'static str) -> Group {
-    Group {
-        title,
-        card: div()
-            .flex()
-            .flex_col()
-            .rounded(px(12.))
-            .bg(theme::panel())
-            .border_1()
-            .border_color(theme::line()),
+/// A flat card: fills, no outlines.
+fn section(tone: Tone) -> gpui::Div {
+    let card = div()
+        .flex()
+        .flex_col()
+        .rounded(px(14.))
+        .px(px(20.))
+        .py(px(16.));
+    match tone {
+        Tone::Default => card.bg(theme::panel()),
+        Tone::Warn => card.bg(theme::warn_fill()),
+        Tone::Accent => {
+            let mut from = theme::accent();
+            from.a = 0.28;
+            let mut to = theme::accent();
+            to.a = 0.08;
+            card.bg(gpui::linear_gradient(
+                180.,
+                gpui::linear_color_stop(from, 0.),
+                gpui::linear_color_stop(to, 1.),
+            ))
+        }
     }
 }
 
-impl Group {
-    fn child(mut self, child: impl IntoElement) -> Self {
-        self.card = self.card.child(child);
-        self
-    }
-}
-
-impl IntoElement for Group {
-    type Element = gpui::Div;
-
-    fn into_element(self) -> Self::Element {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(
+/// A section's title, and what it's about.
+fn heading(title: &'static str, description: Option<&'static str>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_size(px(18.))
+                .font_weight(FontWeight::EXTRA_BOLD)
+                .text_color(theme::text())
+                .child(title),
+        )
+        .when_some(description, |el, description| {
+            el.child(
                 div()
-                    .px(px(4.))
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(11.))
                     .text_color(theme::text_meta())
-                    .child(self.title),
+                    .child(description),
             )
-            .child(self.card)
-    }
+        })
+}
+
+/// A round button with a brand mark, opening a page.
+fn social(
+    id: &'static str,
+    glyph: &'static str,
+    title: &'static str,
+    url: &'static str,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(32.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme::fill())
+        .cursor_pointer()
+        .hover(|el| el.bg(theme::fill_hover()))
+        .tooltip(ui::tooltip(title))
+        .on_click(move |_, _, cx| cx.open_url(url))
+        .child(crate::assets::icon(glyph, px(15.), theme::text_title()))
 }
 
 /// A setting: what it is on the left, its control on the right.
@@ -469,9 +814,10 @@ fn row(
         .flex()
         .items_center()
         .gap(px(16.))
-        .px(px(16.))
-        .py(px(12.))
-        .when(divided, |el| el.border_t_1().border_color(theme::line()))
+        .pt(px(12.))
+        .when(divided, |el| {
+            el.mt(px(12.)).border_t_1().border_color(theme::hover())
+        })
         .child(
             div()
                 .flex_1()
@@ -482,7 +828,7 @@ fn row(
                 .child(
                     div()
                         .text_size(px(13.))
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::text())
                         .child(title),
                 )
@@ -532,6 +878,15 @@ mod tests {
         let settings = parse(br#"{ "compact_sidebar": true }"#);
         assert!(!settings.reduce_motion);
         assert_eq!(settings.row_height, DEFAULT_ROW_HEIGHT);
+    }
+
+    #[test]
+    fn appearance_is_saved_by_name() {
+        let settings = parse(br#"{ "appearance": "light", "accent": "blue" }"#);
+        assert_eq!(settings.appearance, Appearance::Light);
+        assert_eq!(settings.accent, Accent::Blue);
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(json.contains(r#""appearance":"system""#), "{json}");
     }
 
     #[test]

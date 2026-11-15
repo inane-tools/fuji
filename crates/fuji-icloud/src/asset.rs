@@ -43,6 +43,11 @@ pub struct Asset {
     pub preview: Option<Resource>,
     /// The original file (HEIC, JPEG, RAW, MOV, ...).
     pub original: Option<Resource>,
+    /// The `CPLMaster` record behind it, for looking up its details.
+    pub master: Option<String>,
+    /// For videos, a rendition to play (H.264 at a medium size when iCloud
+    /// made one, else the original).
+    pub video: Option<Resource>,
 }
 
 impl Asset {

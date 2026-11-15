@@ -424,3 +424,57 @@ mod live_skybridge {
         persist(&auth);
     }
 }
+
+#[cfg(test)]
+mod live_collections {
+    use super::*;
+    use fuji_icloud::{Album, PhotosClient, SmartAlbum};
+
+    /// Reads (never writes) the shared albums and a media type with the
+    /// saved session. Counts only. Run with `cargo test -p fuji
+    /// live_collections -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_collections() {
+        let saved = load().expect("saved session");
+        let auth = AuthClient::from_saved(&saved);
+        restore_cookies(&auth);
+        let account = auth.resume().expect("resume");
+        persist(&auth);
+        let client = PhotosClient::new(&auth, &account).expect("photos");
+        let shared = client.shared_albums().expect("shared albums");
+        println!(
+            "{} shared albums ({} owned)",
+            shared.len(),
+            shared.iter().filter(|a| a.owned).count()
+        );
+        for album in &shared {
+            let a = album.album();
+            let count = client.count(&a).expect("count");
+            let items = client.fetch(&a, 0, count.min(5)).expect("fetch");
+            let dated = items.iter().filter(|i| i.created_at_ms > 0).count();
+            let thumbs = items.iter().filter(|i| i.thumbnail.is_some()).count();
+            let newest_first = items
+                .windows(2)
+                .all(|w| w[0].created_at_ms >= w[1].created_at_ms);
+            println!(
+                "  {count} items; fetched {}, {dated} dated, {thumbs} with thumbnails, newest first: {newest_first}",
+                items.len()
+            );
+        }
+        let panoramas = Album::Smart(SmartAlbum::Panoramas);
+        let items = client.scan(&panoramas, 0, 3).expect("scan");
+        println!("panoramas: scanned {}", items.len());
+        let ids: Vec<String> = SmartAlbum::ALL
+            .iter()
+            .filter_map(|s| Album::Smart(*s).count_id())
+            .collect();
+        println!(
+            "media type counts: {:?}",
+            client
+                .index_counts(&ids)
+                .map(|c| c.into_iter().map(|(_, n)| n).collect::<Vec<_>>())
+        );
+        persist(&auth);
+    }
+}
