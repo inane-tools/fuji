@@ -1,30 +1,64 @@
 //! Moving photos in and out of the gallery: copy to the clipboard, download
-//! originals, drag out as files, and paste in to upload.
+//! originals, drag out as files; upload by picking, dropping or pasting
+//! files; and delete, with a moment to undo.
 //!
 //! Copies and drags hand over the full-size JPEG rendition (the original
 //! itself when that is a JPEG or PNG), which every app can open. Videos, and
 //! "Download", use the original file.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fuji_icloud::{Asset, AssetKind, PhotosError};
+use fuji_icloud::{Album, Asset, AssetKind, PhotosError};
+use futures::StreamExt as _;
+use futures::stream::FuturesUnordered;
 use gpui::{
-    AppContext as _, ClipboardEntry, ClipboardItem, Context, Image, ImageFormat, PathPromptOptions,
-    SharedString, Task, Window,
+    AppContext as _, ClipboardEntry, ClipboardItem, Context, Image, ImageFormat, IntoElement,
+    PathPromptOptions, SharedString, Task, Window,
 };
 
 use crate::grid::PhotoGrid;
+use crate::index::IndexItem;
 use crate::platform::{self, ClipboardContent};
-use crate::ui::Status;
+use crate::ui::{self, Status};
 use crate::{export, net, thumbs};
 
 /// How long to wait for a photo's record (its download URLs) to load.
 const RECORD_TIMEOUT: Duration = Duration::from_secs(20);
-/// Larger originals aren't read into memory for an upload.
-const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
-/// iCloud takes a moment to list an upload.
-const REFRESH_AFTER_UPLOAD: Duration = Duration::from_secs(4);
+/// Larger files aren't offered for upload.
+const MAX_UPLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// iCloud takes a moment to list an upload: look again after each of these.
+const CHECKS_AFTER_UPLOAD: [Duration; 3] = [
+    Duration::from_secs(3),
+    Duration::from_secs(8),
+    Duration::from_secs(20),
+];
+/// Uploads sent at once.
+const PARALLEL_UPLOADS: usize = 3;
+/// The most files one drop or pick takes (a whole drive dropped by mistake).
+const MAX_UPLOAD_FILES: usize = 10_000;
+/// How deep into dropped folders to look.
+const MAX_FOLDER_DEPTH: usize = 12;
+/// How long a deletion can be taken back before it's sent to iCloud.
+pub const UNDO_WINDOW: Duration = Duration::from_secs(6);
+
+/// Items taken out of the gallery, to be deleted once the moment to undo
+/// has passed.
+pub struct Trash {
+    serial: u64,
+    pub items: Vec<IndexItem>,
+}
+
+impl Trash {
+    pub fn ids(&self) -> HashSet<String> {
+        self.items.iter().map(|item| item.id.clone()).collect()
+    }
+}
+
+static TRASH_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// The most photos one copy or drag takes: each is fetched in full first.
 const MAX_HANDED_OUT: usize = 100;
@@ -379,48 +413,133 @@ impl PhotoGrid {
         .detach();
     }
 
-    /// Upload what [`Self::paste`] offered.
+    /// Upload what [`Self::paste`] or a drop offered.
     pub fn confirm_upload(&mut self, cx: &mut Context<Self>) {
-        let Some(upload) = self.pending_upload.take() else {
+        if let Some(upload) = self.pending_upload.take() {
+            self.upload(upload.items, cx);
+        }
+    }
+
+    /// Choose files to upload (the top bar's upload button). Picking them
+    /// is the confirmation: they go straight up.
+    pub fn pick_uploads(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
             return;
-        };
-        let client = self.client.clone();
-        let total = upload.items.len();
+        }
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Upload".into()),
+        });
         cx.spawn(async move |this, cx| {
-            let mut failed = None;
-            for (done, item) in upload.items.into_iter().enumerate() {
-                let text = if total == 1 {
-                    "Adding to iCloud Photos\u{2026}".to_string()
-                } else {
-                    format!("Adding {} of {total} to iCloud Photos\u{2026}", done + 1)
-                };
-                this.update(cx, |this, cx| {
-                    this.set_status(Status::Working(text.into()), cx)
-                })
-                .ok();
-                let client = client.clone();
-                let result = net::run(move || {
-                    let bytes = match item.source {
-                        UploadSource::Bytes(bytes) => bytes,
-                        UploadSource::File(path) => read_for_upload(&path)?,
-                    };
-                    client.upload(&item.name, &bytes).map_err(message)
-                })
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let items = cx
+                .background_spawn(async move { upload_items(paths) })
                 .await;
+            this.update(cx, |this, cx| match items {
+                Ok(items) if !items.is_empty() => this.upload(items, cx),
+                Ok(_) => this.set_status(
+                    Status::Failed("Those aren't photos or videos iCloud takes.".into()),
+                    cx,
+                ),
+                Err(error) => this.set_status(Status::Failed(error), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Files or folders dropped on the gallery: offer to upload what's in them.
+    pub(crate) fn dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.pending_upload.is_some() || self.is_busy() {
+            return;
+        }
+        // Photos dragged out of fuji and back in are already in the library.
+        if !paths.is_empty() && paths.iter().all(|p| export::is_export(p)) {
+            let text = "That's already in your library.";
+            self.set_status(Status::Failed(text.into()), cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let items = cx
+                .background_spawn(async move { upload_items(paths) })
+                .await;
+            this.update(cx, |this, cx| match items {
+                Ok(items) if !items.is_empty() => {
+                    this.pending_upload = Some(PendingUpload { items });
+                    cx.notify();
+                }
+                Ok(_) => this.set_status(
+                    Status::Failed("There are no photos or videos in that.".into()),
+                    cx,
+                ),
+                Err(error) => this.set_status(Status::Failed(error), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Send `items` to iCloud, a few at a time, then look for them.
+    fn upload(&mut self, items: Vec<UploadItem>, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let total = items.len();
+        cx.spawn(async move |this, cx| {
+            let progress = |done: usize| -> SharedString {
+                if total == 1 {
+                    "Adding to iCloud Photos\u{2026}".into()
+                } else {
+                    format!(
+                        "Adding {} of {total} to iCloud Photos\u{2026}",
+                        (done + 1).min(total)
+                    )
+                    .into()
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.set_status(Status::Working(progress(0)), cx)
+            })
+            .ok();
+            let mut queue = items.into_iter();
+            let mut running = FuturesUnordered::new();
+            let mut done = 0;
+            let mut failures: Vec<SharedString> = Vec::new();
+            loop {
+                while running.len() < PARALLEL_UPLOADS {
+                    let Some(item) = queue.next() else {
+                        break;
+                    };
+                    let client = client.clone();
+                    running.push(net::run(move || match item.source {
+                        UploadSource::Bytes(bytes) => client
+                            .upload(&item.name, &bytes, jiff::Timestamp::now().as_millisecond())
+                            .map_err(message),
+                        UploadSource::File(path) => {
+                            client.upload_file(&item.name, &path).map_err(message)
+                        }
+                    }));
+                }
+                let Some(result) = running.next().await else {
+                    break;
+                };
+                done += 1;
                 match result {
                     Some(Ok(())) => {}
-                    Some(Err(error)) => {
-                        failed = Some(error);
-                        break;
-                    }
-                    None => {
-                        failed = Some("Upload failed.".into());
-                        break;
-                    }
+                    Some(Err(error)) => failures.push(error),
+                    None => failures.push("Upload failed.".into()),
+                }
+                if done < total {
+                    this.update(cx, |this, cx| {
+                        this.set_status(Status::Working(progress(done)), cx)
+                    })
+                    .ok();
                 }
             }
-            let status = match failed {
-                Some(error) => Status::Failed(error),
+            let added = total - failures.len();
+            let status = match failures.first() {
                 None => Status::Done {
                     message: format!(
                         "Added {} to iCloud Photos",
@@ -429,14 +548,258 @@ impl PhotoGrid {
                     .into(),
                     reveal: None,
                 },
+                Some(error) if total == 1 => Status::Failed(error.clone()),
+                Some(error) => Status::Failed(format!("Added {added} of {total}. {error}").into()),
             };
             this.update(cx, |this, cx| this.set_status(status, cx)).ok();
+            if added == 0 {
+                return;
+            }
             // Show the new arrivals once iCloud has listed them.
-            cx.background_executor().timer(REFRESH_AFTER_UPLOAD).await;
-            this.update(cx, |this, cx| this.refresh(false, cx)).ok();
+            for wait in CHECKS_AFTER_UPLOAD {
+                cx.background_executor().timer(wait).await;
+                if this.update(cx, |this, cx| this.sync_quietly(cx)).is_err() {
+                    return;
+                }
+            }
         })
         .detach();
     }
+
+    // ---- Deleting ---------------------------------------------------------
+
+    /// Whether this album's items can be deleted from here. Shared albums
+    /// belong to someone else; Recently Deleted is where deletions go.
+    pub(crate) fn can_delete(&self) -> bool {
+        !matches!(self.album, Album::Shared(_) | Album::RecentlyDeleted)
+    }
+
+    /// Ask before deleting `indices`.
+    pub(crate) fn ask_delete(&mut self, indices: Vec<usize>, cx: &mut Context<Self>) {
+        if !self.can_delete() {
+            return;
+        }
+        let ids: Vec<String> = indices
+            .iter()
+            .filter_map(|&ix| self.index.get(ix).map(|item| item.id.clone()))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.close_menu();
+        self.pending_delete = Some(ids);
+        cx.notify();
+    }
+
+    pub(crate) fn render_delete_dialog(
+        &self,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let title = if count == 1 {
+            "Delete this item?".to_string()
+        } else {
+            format!("Delete {} items?", crate::grid::group_digits(count))
+        };
+        let from = match self.album {
+            Album::User(_) | Album::Memory(_) => {
+                " They're deleted from your library, not just from this album."
+            }
+            _ => "",
+        };
+        let body = format!(
+            "{} moved to Recently Deleted on all your devices, and removed for good after 30 days.{from}",
+            if count == 1 { "It's" } else { "They're" }
+        );
+        let confirm = cx.weak_entity();
+        let cancel = cx.weak_entity();
+        ui::destructive_dialog(
+            title,
+            body,
+            "Delete",
+            move |window, cx| {
+                confirm
+                    .update(cx, |this, cx| this.confirm_delete(window, cx))
+                    .ok();
+            },
+            move |_, cx| {
+                cancel
+                    .update(cx, |this, cx| {
+                        this.pending_delete = None;
+                        cx.notify();
+                    })
+                    .ok();
+            },
+        )
+    }
+
+    /// Take the items out of the gallery now; delete them in iCloud once
+    /// the moment to undo has passed.
+    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ids) = self.pending_delete.take() else {
+            return;
+        };
+        self.leave_viewer(window);
+        // One deletion waits at a time: an earlier one goes now.
+        self.commit_trash(cx);
+        let ids: HashSet<String> = ids.into_iter().collect();
+        let items: Vec<IndexItem> = self
+            .album_items()
+            .iter()
+            .filter(|item| ids.contains(&item.id))
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.selected.clear();
+        self.select_anchor = None;
+        self.apply_album_changes(Vec::new(), &ids);
+        let count = items.len();
+        let serial = TRASH_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+        self.trash = Some(Trash { serial, items });
+
+        let this = cx.weak_entity();
+        let undo = Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+            this.update(cx, |this, cx| this.undo_trash(serial, window, cx))
+                .ok();
+        });
+        self.set_status(
+            Status::Undoable {
+                message: format!(
+                    "Moved {} to Recently Deleted",
+                    plural(count, "1 item", "items")
+                )
+                .into(),
+                undo,
+            },
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(UNDO_WINDOW).await;
+            this.update(cx, |this, cx| {
+                if this.trash.as_ref().is_some_and(|t| t.serial == serial) {
+                    this.commit_trash(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Put back what [`Self::confirm_delete`] took out, if it's still waiting.
+    fn undo_trash(&mut self, serial: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.trash.as_ref().is_some_and(|t| t.serial == serial) {
+            return;
+        }
+        self.leave_viewer(window);
+        let Some(trash) = self.trash.take() else {
+            return;
+        };
+        let count = trash.items.len();
+        self.apply_album_changes(trash.items, &HashSet::new());
+        self.set_status(
+            Status::Done {
+                message: format!("Restored {}", plural(count, "1 item", "items")).into(),
+                reveal: None,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Delete in iCloud what's waiting in the trash, if anything.
+    pub(crate) fn commit_trash(&mut self, cx: &mut Context<Self>) {
+        let Some(trash) = self.trash.take() else {
+            return;
+        };
+        // The toast's Undo can't take it back now.
+        if matches!(self.toast, Some((_, Status::Undoable { .. }))) {
+            self.toast = None;
+        }
+        self.deleting += 1;
+        let client = self.client.clone();
+        let generation = self.generation;
+        let names: Vec<String> = trash.items.iter().map(|item| item.id.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            let result = net::run(move || client.set_deleted(&names, true)).await;
+            this.update(cx, |this, cx| {
+                this.deleting -= 1;
+                let error = match result {
+                    Some(Ok(())) => return,
+                    Some(Err(PhotosError::SessionExpired)) => {
+                        cx.emit(crate::grid::GridEvent::SessionExpired);
+                        return;
+                    }
+                    Some(Err(err)) => message(err),
+                    None => "Something went wrong.".into(),
+                };
+                // Still on this album: show them again.
+                if this.generation == generation {
+                    this.apply_album_changes(trash.items, &HashSet::new());
+                }
+                this.set_status(
+                    Status::Failed(format!("Couldn't delete: {error}").into()),
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// What's uploadable in `paths`: files as they are, folders searched
+/// through. Sorted by path, so a folder goes up in order.
+fn upload_items(paths: Vec<PathBuf>) -> Result<Vec<UploadItem>, SharedString> {
+    let mut files = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = paths.into_iter().map(|p| (p, 0)).collect();
+    while let Some((path, depth)) = stack.pop() {
+        if files.len() > MAX_UPLOAD_FILES {
+            return Err(format!(
+                "That's more than {} files. Add fewer at a time.",
+                crate::grid::group_digits(MAX_UPLOAD_FILES)
+            )
+            .into());
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if depth >= MAX_FOLDER_DEPTH {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                // Skip hidden and system folders and files (".thumbnails").
+                if name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            }
+        } else if meta.is_file() && platform::is_uploadable(&path) && !export::is_export(&path) {
+            if meta.len() > MAX_UPLOAD_BYTES {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                return Err(format!("{name} is too large to upload.").into());
+            }
+            files.push(path);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files
+        .into_iter()
+        .filter_map(|file| {
+            Some(UploadItem {
+                name: file.file_name()?.to_str()?.to_string(),
+                source: UploadSource::File(file),
+            })
+        })
+        .collect())
 }
 
 /// Fetch (or find in the cache) the file to hand out for `asset`.
@@ -470,17 +833,6 @@ fn export_one(
         &export::rendition_name(asset, rendition),
     )
     .map_err(io)
-}
-
-fn read_for_upload(path: &Path) -> Result<Vec<u8>, SharedString> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let size = std::fs::metadata(path)
-        .map_err(|err| SharedString::from(format!("Couldn't read {name}: {err}")))?
-        .len();
-    if size > MAX_UPLOAD_BYTES {
-        return Err(format!("{name} is too large to upload from here.").into());
-    }
-    std::fs::read(path).map_err(|err| format!("Couldn't read {name}: {err}").into())
 }
 
 fn image_extension(format: ImageFormat) -> Option<&'static str> {

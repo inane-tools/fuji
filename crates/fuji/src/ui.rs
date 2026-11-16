@@ -16,7 +16,7 @@ use crate::anim;
 use crate::assets::icon;
 use crate::theme;
 
-type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
+pub type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 // ---- Buttons ----------------------------------------------------------------
 
@@ -574,6 +574,11 @@ pub enum Status {
         reveal: Option<PathBuf>,
     },
     Failed(SharedString),
+    /// Done, with a moment to take it back.
+    Undoable {
+        message: SharedString,
+        undo: Handler,
+    },
 }
 
 /// A message floating at the bottom of its (relative) parent.
@@ -601,6 +606,16 @@ pub fn toast(serial: u64, status: Status) -> impl IntoElement {
             .gap(px(8.))
             .child(icon("warning", px(15.), theme::danger()))
             .child(div().text_color(theme::danger()).child(text))
+            .into_any_element(),
+        Status::Undoable { message, undo } => div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(icon("check", px(15.), theme::accent_text()))
+            .child(div().text_color(theme::text()).child(message))
+            .child(link("toast-undo", "Undo", move |_, window, cx| {
+                undo(window, cx)
+            }))
             .into_any_element(),
     };
     div()
@@ -637,6 +652,28 @@ pub fn confirm_dialog(
     title: impl Into<SharedString>,
     body: impl Into<SharedString>,
     confirm: impl Into<SharedString>,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    dialog(title, body, confirm, false, on_confirm, on_cancel)
+}
+
+/// [`confirm_dialog`] for something destructive: the button is red.
+pub fn destructive_dialog(
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    confirm: impl Into<SharedString>,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    dialog(title, body, confirm, true, on_confirm, on_cancel)
+}
+
+fn dialog(
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    confirm: impl Into<SharedString>,
+    destructive: bool,
     on_confirm: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -688,11 +725,15 @@ pub fn confirm_dialog(
                             "Cancel",
                             move |_, window, cx| on_cancel(window, cx),
                         ))
-                        .child(primary_button(
-                            "dialog-confirm",
-                            confirm,
-                            move |_, window, cx| on_confirm(window, cx),
-                        )),
+                        .child(
+                            primary_button("dialog-confirm", confirm, move |_, window, cx| {
+                                on_confirm(window, cx)
+                            })
+                            .when(destructive, |el| {
+                                el.bg(theme::danger())
+                                    .hover(|el| el.bg(theme::danger()).opacity(0.9))
+                            }),
+                        ),
                 ),
         )
         .with_animation("dialog-open", anim::ease(anim::FAST), |el, t| el.opacity(t))

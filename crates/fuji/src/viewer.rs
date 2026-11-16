@@ -105,6 +105,8 @@ pub struct Viewer {
     previews_failed: HashSet<AssetId>,
     previews_in_flight: HashSet<AssetId>,
     image_cache: Entity<LruImageCache>,
+    /// The filmstrip's small thumbnails, kept apart from the large images.
+    strip_cache: Entity<LruImageCache>,
     _grid_observer: Subscription,
     /// What's on screen now, and where it's easing to.
     view: View,
@@ -178,7 +180,14 @@ impl Viewer {
             previews_ready: HashMap::new(),
             previews_failed: HashSet::new(),
             previews_in_flight: HashSet::new(),
-            image_cache: cx.new(|cx| LruImageCache::new(PREFETCH * 2 + 4, cx)),
+            // What's on screen (preview and thumbnail) and the photo before:
+            // stepping back is instant, and full-size decodes don't pile up.
+            image_cache: cx.new(|cx| LruImageCache::new(4, cx)),
+            strip_cache: cx.new(|cx| {
+                let mut cache = LruImageCache::new(STRIP_REACH * 2 + 8, cx);
+                cache.set_max_height(128);
+                cache
+            }),
             _grid_observer: observer,
             view: View::FIT,
             target: View::FIT,
@@ -1189,6 +1198,7 @@ impl Viewer {
         strip_to.a = 0.;
         Some(
             div()
+                .image_cache(self.strip_cache.clone())
                 .absolute()
                 .left_0()
                 .right_0()

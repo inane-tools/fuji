@@ -5,6 +5,7 @@
 //! background scan refreshes it from iCloud. Download URLs are not kept here
 //! (they expire); full records are fetched by page when needed.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use fuji_icloud::{Album, Asset, AssetId, AssetKind, UserAlbum};
@@ -65,6 +66,19 @@ const VERSION: u32 = 3;
 struct CacheFile {
     version: u32,
     items: Vec<IndexItem>,
+    /// Where the library's change feed stood when `items` were current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// How many more items iCloud counts than it lists.
+    #[serde(default)]
+    gap: isize,
+}
+
+/// An album's index as cached, with the change-feed token it's current to.
+pub struct Cached {
+    pub items: Vec<IndexItem>,
+    pub token: Option<String>,
+    pub gap: isize,
 }
 
 fn safe_name(id: &str) -> String {
@@ -140,27 +154,33 @@ pub fn save_albums(path: &Path, albums: &[UserAlbum]) {
     }
 }
 
-pub fn load(path: &Path) -> Option<Vec<IndexItem>> {
+pub fn load(path: &Path) -> Option<Cached> {
     let bytes = std::fs::read(path).ok()?;
     let mut file: CacheFile = serde_json::from_slice(&bytes).ok()?;
     match file.version {
-        VERSION | 2 => Some(file.items),
+        VERSION | 2 => {}
         1 => {
             for item in &mut file.items {
                 if let Kind::Video(ms) = &mut item.kind {
                     *ms = ((*ms as f32) / 1000.).round() as u32;
                 }
             }
-            Some(file.items)
         }
-        _ => None,
+        _ => return None,
     }
+    Some(Cached {
+        items: file.items,
+        token: file.token,
+        gap: file.gap,
+    })
 }
 
-pub fn save(path: &Path, items: &[IndexItem]) {
+pub fn save(path: &Path, items: Vec<IndexItem>, token: Option<String>, gap: isize) {
     let file = CacheFile {
         version: VERSION,
-        items: items.to_vec(),
+        items,
+        token,
+        gap,
     };
     let Ok(json) = serde_json::to_vec(&file) else {
         return;
@@ -172,6 +192,39 @@ pub fn save(path: &Path, items: &[IndexItem]) {
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(tmp, path);
     }
+}
+
+/// Bring an index (newest first) up to date: drop `removed`, and put each
+/// of `changed` where its date belongs, replacing any older copy. Returns
+/// whether anything moved.
+pub fn apply(
+    items: &mut Vec<IndexItem>,
+    mut changed: Vec<IndexItem>,
+    removed: &HashSet<String>,
+) -> bool {
+    // An item that's already here as it is needn't move.
+    let current: std::collections::HashMap<&str, &IndexItem> =
+        items.iter().map(|item| (item.id.as_str(), item)).collect();
+    changed.retain(|item| current.get(item.id.as_str()) != Some(&item));
+    let had = items.len();
+    let replaced: HashSet<String> = changed.iter().map(|c| c.id.clone()).collect();
+    items.retain(|item| !removed.contains(&item.id) && !replaced.contains(&item.id));
+    if changed.is_empty() {
+        return items.len() != had;
+    }
+    // Merge, newest first; an arrival goes after items of the same time.
+    changed.sort_by_key(|item| std::cmp::Reverse(item.date));
+    let old = std::mem::take(items);
+    items.reserve(old.len() + changed.len());
+    let mut arrivals = changed.into_iter().peekable();
+    for item in old {
+        while arrivals.peek().is_some_and(|a| a.date > item.date) {
+            items.extend(arrivals.next());
+        }
+        items.push(item);
+    }
+    items.extend(arrivals);
+    true
 }
 
 #[cfg(test)]
@@ -200,10 +253,48 @@ mod tests {
                 name: None,
             },
         ];
-        save(&path, &items);
-        let loaded = load(&path);
+        save(&path, items.clone(), Some("T".into()), 2);
+        let loaded = load(&path).expect("cache reads back");
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(loaded, Some(items));
+        assert_eq!(loaded.items, items);
+        assert_eq!(loaded.token.as_deref(), Some("T"));
+        assert_eq!(loaded.gap, 2);
+    }
+
+    fn item(id: &str, date: i64) -> IndexItem {
+        IndexItem {
+            id: id.into(),
+            date,
+            aspect: 1.,
+            kind: Kind::Photo,
+            favorite: false,
+            name: None,
+        }
+    }
+
+    fn ids(items: &[IndexItem]) -> Vec<&str> {
+        items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    #[test]
+    fn changes_land_by_date() {
+        let mut items = vec![item("a", 50), item("b", 40), item("c", 30), item("d", 10)];
+        let removed: HashSet<String> = ["b".to_string(), "zz".to_string()].into();
+        // New (newest, middle, oldest), and "c" edited to a later date.
+        let changed = vec![item("n", 60), item("m", 35), item("c", 45), item("o", 1)];
+        assert!(apply(&mut items, changed, &removed));
+        assert_eq!(ids(&items), ["n", "a", "c", "m", "d", "o"]);
+    }
+
+    #[test]
+    fn unchanged_items_stay_put() {
+        let mut items = vec![item("a", 50), item("b", 50), item("c", 30)];
+        assert!(!apply(&mut items, vec![item("b", 50)], &HashSet::new()));
+        assert_eq!(ids(&items), ["a", "b", "c"]);
+        let mut fav = item("b", 50);
+        fav.favorite = true;
+        assert!(apply(&mut items, vec![fav], &HashSet::new()));
+        assert!(items.iter().find(|i| i.id == "b").unwrap().favorite);
     }
 
     #[test]
@@ -229,6 +320,6 @@ mod tests {
 
     #[test]
     fn missing_or_bad_cache_is_none() {
-        assert_eq!(load(Path::new("definitely/not/here.json")), None);
+        assert!(load(Path::new("definitely/not/here.json")).is_none());
     }
 }

@@ -28,5 +28,7 @@ pub use bridge::BridgeApproval;
 pub use details::{Location, PhotoDetails};
 pub use memories::Memory;
 pub use passkey::{PairingKey, PasskeyAssertion, PasskeyChallenge};
-pub use photos::{Album, PhotosClient, PhotosError, SharedAlbum, SmartAlbum, UserAlbum};
+pub use photos::{
+    Album, LibraryChanges, PhotosClient, PhotosError, SharedAlbum, SmartAlbum, UserAlbum,
+};
 pub use profile::account_picture;

@@ -18,12 +18,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fuji_icloud::{Album, Asset, AssetId, PhotosClient, PhotosError, Resource};
+use fuji_icloud::{Album, Asset, AssetId, LibraryChanges, PhotosClient, PhotosError, Resource};
 use gpui::{
     AnimationExt as _, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    SharedString, Subscription, Window, actions, canvas, div, img, point, prelude::*, px,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Subscription, Window, actions, canvas, div, img, point,
+    prelude::*, px,
 };
 use jiff::civil::Date;
 
@@ -35,7 +36,7 @@ use crate::layout::{self, Layout, RowKind, Span};
 use crate::scrubber::{self, Track};
 use crate::search::Query;
 use crate::settings::{self, Settings};
-use crate::transfer::PendingUpload;
+use crate::transfer::{PendingUpload, Trash};
 use crate::ui::{self, MenuItem, Status};
 use crate::viewer::{Viewer, ViewerEvent};
 use crate::{net, theme, thumbs};
@@ -46,6 +47,7 @@ actions!(
         CopySelection,
         Paste,
         DownloadSelection,
+        DeleteSelection,
         Cancel,
         SelectAll,
         ZoomIn,
@@ -62,6 +64,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
         KeyBinding::new("ctrl-s", DownloadSelection, Some(CONTEXT)),
         KeyBinding::new("escape", Cancel, Some(CONTEXT)),
+        KeyBinding::new("delete", DeleteSelection, Some(CONTEXT)),
         KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
         KeyBinding::new("ctrl-=", ZoomIn, Some(CONTEXT)),
         KeyBinding::new("ctrl-+", ZoomIn, Some(CONTEXT)),
@@ -113,6 +116,9 @@ const SCRUBBER_LINGER: Duration = Duration::from_millis(900);
 /// How far the pointer moves with the button down before a drag starts.
 const DRAG_THRESHOLD: f32 = 6.;
 const TOAST_TIMEOUT: Duration = Duration::from_secs(4);
+/// How often the library checks iCloud for changes made elsewhere. Each
+/// check is one small request when nothing changed.
+const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 pub enum GridEvent {
     SessionExpired,
@@ -140,6 +146,8 @@ struct Scan {
     fresh: Vec<IndexItem>,
     /// Show results as they arrive (nothing cached to show meanwhile).
     progressive: bool,
+    /// The change feed's position when the scan began.
+    token: Option<String>,
 }
 
 /// The photo to keep still under the pointer while the zoom changes.
@@ -228,15 +236,15 @@ pub struct PhotoGrid {
     account_dir: PathBuf,
     thumb_dir: Arc<PathBuf>,
     pub(crate) preview_dir: Arc<PathBuf>,
-    album: Album,
+    pub(crate) album: Album,
     /// The album's name, shown as the heading.
     title: SharedString,
     /// Opened from Collections: a back button before the title.
     back: bool,
     /// Bumped on album change so results for the old album are ignored.
-    generation: u64,
+    pub(crate) generation: u64,
     state: LoadState,
-    index: Vec<IndexItem>,
+    pub(crate) index: Vec<IndexItem>,
     /// The calendar day of each index item.
     days: Vec<Option<Date>>,
     /// While searching: the whole album, and the album rank of each item
@@ -249,6 +257,16 @@ pub struct PhotoGrid {
     /// A device is searching for `search_text`; its name if known.
     device_pending: Option<SharedString>,
     scan: Option<Scan>,
+    /// Where the index stands in iCloud's change feed: a sync asks only for
+    /// what changed since.
+    token: Option<String>,
+    /// A change-feed check is out; `true` if the user asked for it (show it).
+    syncing: Option<bool>,
+    /// Bumped when ranks shift, so pages asked for before then are dropped.
+    page_epoch: u64,
+    /// How many more items iCloud counted than the last full scan listed
+    /// (records it counts but can't return). A sync expects the same gap.
+    count_gap: isize,
     layout: Option<Layout>,
     layout_dirty: bool,
     // Full records (download URLs), by page of rank.
@@ -284,9 +302,9 @@ pub struct PhotoGrid {
     scrub: Scrub,
     track: Option<Track>,
     // Selection and pointer.
-    selected: BTreeSet<usize>,
+    pub(crate) selected: BTreeSet<usize>,
     /// Where a shift-click range starts.
-    select_anchor: Option<usize>,
+    pub(crate) select_anchor: Option<usize>,
     /// A tile the button went down on, and where: a drag may follow.
     press: Option<(usize, Point<Pixels>)>,
     /// Swallow the click that ends a press which became a drag.
@@ -295,9 +313,16 @@ pub struct PhotoGrid {
     menu: Option<OpenMenu>,
     menu_serial: u64,
     // Feedback.
-    toast: Option<(u64, Status)>,
+    pub(crate) toast: Option<(u64, Status)>,
     toast_serial: u64,
     pub(crate) pending_upload: Option<PendingUpload>,
+    /// Items the user asked to delete, waiting for them to confirm.
+    pub(crate) pending_delete: Option<Vec<String>>,
+    /// Items taken out of the gallery, deleted in iCloud once the moment to
+    /// undo has passed.
+    pub(crate) trash: Option<Trash>,
+    /// Deletions sent and not yet answered.
+    pub(crate) deleting: usize,
     _settings: Subscription,
 }
 
@@ -357,6 +382,10 @@ impl PhotoGrid {
             month_in_view: None,
             device_pending: None,
             scan: None,
+            token: None,
+            syncing: None,
+            page_epoch: 0,
+            count_gap: 0,
             layout: None,
             layout_dirty: true,
             assets: HashMap::new(),
@@ -393,10 +422,23 @@ impl PhotoGrid {
             toast: None,
             toast_serial: 0,
             pending_upload: None,
+            pending_delete: None,
+            trash: None,
+            deleting: 0,
             _settings: settings,
         };
         grid.list_disk_thumbs(cx);
         grid.load_album(cx);
+        // Pick up what changed on other devices, now and then.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SYNC_INTERVAL).await;
+                if this.update(cx, |this, cx| this.sync_quietly(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         grid
     }
 
@@ -598,7 +640,14 @@ impl PhotoGrid {
     // ---- Album index ------------------------------------------------------
 
     fn load_album(&mut self, cx: &mut Context<Self>) {
+        // Leaving the album ends the chance to undo a deletion.
+        self.commit_trash(cx);
+        self.pending_delete = None;
         self.generation += 1;
+        self.token = None;
+        self.syncing = None;
+        self.page_epoch += 1;
+        self.count_gap = 0;
         self.state = LoadState::Loading;
         self.index.clear();
         self.days.clear();
@@ -635,17 +684,19 @@ impl PhotoGrid {
             // Cached index first, so the gallery shows right away.
             let cached = cx
                 .background_spawn(async move {
-                    let items = index::load(&path)?;
-                    let days = layout::days(&items, &jiff::tz::TimeZone::system());
-                    Some((items, days))
+                    let cached = index::load(&path)?;
+                    let days = layout::days(&cached.items, &jiff::tz::TimeZone::system());
+                    Some((cached, days))
                 })
                 .await;
             let had_cache = cached.is_some();
             this.update(cx, |this, cx| {
                 if this.generation == generation
-                    && let Some((items, days)) = cached
+                    && let Some((cached, days)) = cached
                 {
-                    this.show_album_items(items, days);
+                    this.token = cached.token.filter(|_| this.follows_changes());
+                    this.count_gap = cached.gap;
+                    this.show_album_items(cached.items, days);
                     this.state = LoadState::Ready;
                     cx.notify();
                 }
@@ -659,18 +710,99 @@ impl PhotoGrid {
         .detach();
     }
 
-    /// Ask iCloud how many items the album has and rescan it.
+    /// Albums kept current from the change feed rather than rescanned:
+    /// those whose membership shows in an item's own fields.
+    fn follows_changes(&self) -> bool {
+        matches!(self.album, Album::All | Album::Favorites | Album::Videos)
+    }
+
+    /// Whether a library item belongs in this album.
+    fn album_keeps(&self, item: &IndexItem) -> bool {
+        match self.album {
+            Album::Favorites => item.favorite,
+            Album::Videos => matches!(item.kind, Kind::Video(_)),
+            _ => true,
+        }
+    }
+
+    /// The whole album (not just what a search shows).
+    pub(crate) fn album_items(&self) -> &[IndexItem] {
+        match &self.search {
+            Some(search) => &search.all,
+            None => &self.index,
+        }
+    }
+
+    /// Bring the album up to date: drop `removed`, place `changed` by date.
+    /// Returns whether anything moved.
+    pub(crate) fn apply_album_changes(
+        &mut self,
+        changed: Vec<IndexItem>,
+        removed: &HashSet<String>,
+    ) -> bool {
+        let mut items = self.album_items().to_vec();
+        if !index::apply(&mut items, changed, removed) {
+            return false;
+        }
+        let days = layout::days(&items, &jiff::tz::TimeZone::system());
+        self.show_album_items(items, days);
+        self.forget_pages();
+        true
+    }
+
+    /// Ranks moved: full records loaded by rank no longer line up.
+    fn forget_pages(&mut self) {
+        self.page_epoch += 1;
+        self.assets.clear();
+        self.page_ids.clear();
+        self.page_lru.clear();
+        self.pages_requested.clear();
+        self.page_queue.clear();
+        self.pages_in_flight = 0;
+    }
+
+    /// Check for changes in the background, if nothing else is going on.
+    pub(crate) fn sync_quietly(&mut self, cx: &mut Context<Self>) {
+        if self.viewer.is_some()
+            || self.scan.is_some()
+            || self.syncing.is_some()
+            || self.trash.is_some()
+            || self.deleting > 0
+            || self.error.is_some()
+            || !matches!(self.state, LoadState::Ready)
+        {
+            return;
+        }
+        if let Some(token) = self.token.clone() {
+            self.sync_changes(token, false, cx);
+        }
+    }
+
+    /// Bring the album up to date: from the change feed when it can,
+    /// otherwise by asking how many items it has and rescanning it.
     pub(crate) fn refresh(&mut self, progressive: bool, cx: &mut Context<Self>) {
-        if self.scan.is_some() {
+        if self.scan.is_some() || self.syncing.is_some() {
+            return;
+        }
+        if self.album_len() > 0
+            && self.trash.is_none()
+            && self.deleting == 0
+            && let Some(token) = self.token.clone()
+        {
+            self.sync_changes(token, true, cx);
             return;
         }
         let generation = self.generation;
         let client = self.client.clone();
         let album = self.album.clone();
+        let want_token = self.follows_changes();
         cx.spawn(async move |this, cx| {
             let count = net::run(move || {
                 client.check_ready()?;
-                client.count(&album)
+                // Taken before the scan, so changes made during it are
+                // picked up after.
+                let token = want_token.then(|| client.sync_token().ok()).flatten();
+                Ok::<_, PhotosError>((client.count(&album)?, token))
             })
             .await;
             this.update(cx, |this, cx| {
@@ -678,7 +810,7 @@ impl PhotoGrid {
                     return;
                 }
                 match count {
-                    Some(Ok(count)) => this.start_scan(count, progressive, cx),
+                    Some(Ok((count, token))) => this.start_scan(count, token, progressive, cx),
                     Some(Err(PhotosError::SessionExpired)) => cx.emit(GridEvent::SessionExpired),
                     Some(Err(err)) => this.fail(err.to_string(), cx),
                     None => this.fail("Something went wrong loading the library.".into(), cx),
@@ -689,11 +821,89 @@ impl PhotoGrid {
         .detach();
     }
 
-    fn start_scan(&mut self, count: usize, progressive: bool, cx: &mut Context<Self>) {
+    /// Ask the change feed what changed since `token` and apply it.
+    fn sync_changes(&mut self, token: String, shown: bool, cx: &mut Context<Self>) {
+        self.syncing = Some(shown);
+        if shown {
+            cx.notify();
+        }
+        let generation = self.generation;
+        let client = self.client.clone();
+        let album = self.album.clone();
+        cx.spawn(async move |this, cx| {
+            let result = net::run(move || {
+                let changes = client.changes(&token)?;
+                Ok::<_, PhotosError>((changes, client.count(&album)?))
+            })
+            .await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.syncing = None;
+                match result {
+                    Some(Ok((changes, count))) => this.changes_arrived(changes, count, cx),
+                    Some(Err(PhotosError::SessionExpired)) => cx.emit(GridEvent::SessionExpired),
+                    // Offline for a moment: keep the token for the next try.
+                    Some(Err(PhotosError::Network(err))) => {
+                        if shown {
+                            this.set_status(
+                                Status::Failed(format!("Couldn't check for changes: {err}").into()),
+                                cx,
+                            );
+                        }
+                    }
+                    None if !shown => {}
+                    // The token expired, or something else: rescan.
+                    _ => {
+                        this.token = None;
+                        this.refresh(false, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn changes_arrived(&mut self, changes: LibraryChanges, count: usize, cx: &mut Context<Self>) {
+        let mut removed: HashSet<String> = changes.removed.into_iter().collect();
+        let mut changed = Vec::new();
+        for asset in &changes.assets {
+            let item = IndexItem::from(asset);
+            if self.album_keeps(&item) {
+                changed.push(item);
+            } else {
+                removed.insert(item.id);
+            }
+        }
+        let moved = self.apply_album_changes(changed, &removed);
+        let token_moved = self.token.as_deref() != Some(changes.token.as_str());
+        self.token = Some(changes.token);
+        if count as isize - self.album_len() as isize != self.count_gap {
+            // Out of step (an edge the feed doesn't show): rescan.
+            self.token = None;
+            self.refresh(false, cx);
+            return;
+        }
+        if moved || token_moved {
+            self.save_index(cx);
+        }
+    }
+
+    fn start_scan(
+        &mut self,
+        count: usize,
+        token: Option<String>,
+        progressive: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.scan.is_some() {
             return;
         }
         if count == 0 {
+            self.token = token;
             self.set_index(Vec::new());
             self.state = LoadState::Ready;
             self.save_index(cx);
@@ -710,6 +920,7 @@ impl PhotoGrid {
             joined: 0,
             fresh: Vec::new(),
             progressive,
+            token,
         });
         self.pump_scan(cx);
         cx.notify();
@@ -788,9 +999,18 @@ impl PhotoGrid {
             scan.fresh.extend(arrived);
         }
         if done {
-            let scan = self.scan.take();
-            if !progressive && let Some(scan) = scan {
-                self.set_index(scan.fresh);
+            if let Some(scan) = self.scan.take() {
+                self.token = scan.token;
+                if !progressive {
+                    self.set_index(scan.fresh);
+                }
+                self.count_gap = scan.count as isize - self.album_len() as isize;
+                self.forget_pages();
+            }
+            // Items deleted while the scan ran stay out.
+            if let Some(trash) = &self.trash {
+                let ids = trash.ids();
+                self.apply_album_changes(Vec::new(), &ids);
             }
             self.state = LoadState::Ready;
             self.save_index(cx);
@@ -807,11 +1027,14 @@ impl PhotoGrid {
 
     fn save_index(&self, cx: &mut Context<Self>) {
         let path = index::cache_path(&self.account_dir, &self.album);
-        let items = match &self.search {
-            Some(search) => search.all.clone(),
-            None => self.index.clone(),
-        };
-        cx.background_spawn(async move { index::save(&path, &items) })
+        let mut items = self.album_items().to_vec();
+        // Not yet deleted in iCloud: if fuji closes now, they come back.
+        if let Some(trash) = &self.trash {
+            index::apply(&mut items, trash.items.clone(), &HashSet::new());
+        }
+        let token = self.token.clone();
+        let gap = self.count_gap;
+        cx.background_spawn(async move { index::save(&path, items, token, gap) })
             .detach();
     }
 
@@ -839,12 +1062,14 @@ impl PhotoGrid {
         let client = self.client.clone();
         let album = self.album.clone();
         let generation = self.generation;
+        let epoch = self.page_epoch;
         self.pages_in_flight += 1;
 
         cx.spawn(async move |this, cx| {
             let result = net::run(move || client.fetch(&album, start, limit)).await;
             this.update(cx, |this, cx| {
-                if this.generation != generation {
+                if this.generation != generation || this.page_epoch != epoch {
+                    this.pump(cx);
                     return;
                 }
                 this.pages_in_flight -= 1;
@@ -1277,11 +1502,32 @@ impl PhotoGrid {
         if self.viewer.is_some() {
             return;
         }
-        if self.menu.take().is_none() && self.pending_upload.take().is_none() {
+        if self.menu.take().is_none()
+            && self.pending_upload.take().is_none()
+            && self.pending_delete.take().is_none()
+        {
             self.selected.clear();
             self.select_anchor = None;
         }
         cx.notify();
+    }
+
+    pub(crate) fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// Close the viewer without keeping its photo in view: the items are
+    /// about to move (a deletion, or one undone).
+    pub(crate) fn leave_viewer(&mut self, window: &mut Window) {
+        if self.viewer.take().is_some() {
+            self.focus_handle.focus(window);
+        }
+    }
+
+    fn delete_selection(&mut self, _: &DeleteSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_none() && !self.selected.is_empty() {
+            self.ask_delete(self.selected.iter().copied().collect(), cx);
+        }
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -1378,12 +1624,16 @@ impl PhotoGrid {
         self.toast_serial += 1;
         let serial = self.toast_serial;
         let finished = !matches!(status, Status::Working(_));
+        let linger = match status {
+            Status::Undoable { .. } => crate::transfer::UNDO_WINDOW,
+            _ => TOAST_TIMEOUT,
+        };
         self.toast = Some((serial, status));
         cx.notify();
         if finished {
             // Clear the message after a moment, unless something newer replaced it.
             cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(TOAST_TIMEOUT).await;
+                cx.background_executor().timer(linger).await;
                 this.update(cx, |this, cx| {
                     if this.toast.as_ref().is_some_and(|(s, _)| *s == serial) {
                         this.toast = None;
@@ -1456,6 +1706,7 @@ impl PhotoGrid {
                 .into(),
             ),
             (Some(_), _) => Some("Updating\u{2026}".into()),
+            _ if self.syncing == Some(true) => Some("Checking for changes\u{2026}".into()),
             _ => None,
         };
         // A device's search in progress says so in words.
@@ -1550,6 +1801,18 @@ impl PhotoGrid {
                     )
                     .tooltip(ui::tooltip("Download (Ctrl+S)")),
                 )
+                .when(self.can_delete(), |el| {
+                    el.child(
+                        ui::icon_button(
+                            "selection-delete",
+                            "deleted",
+                            cx.listener(|this, _, window, cx| {
+                                this.delete_selection(&DeleteSelection, window, cx)
+                            }),
+                        )
+                        .tooltip(ui::tooltip("Delete (Del)")),
+                    )
+                })
                 .child(
                     ui::icon_button(
                         "selection-clear",
@@ -1790,11 +2053,37 @@ impl PhotoGrid {
                         run(|this, _, _, cx| this.clear_selection(cx), Vec::new()),
                     ));
                 }
+                if self.can_delete() {
+                    items.push(
+                        MenuItem::new(
+                            "deleted",
+                            if many {
+                                format!("Delete {} items\u{2026}", targets.len())
+                            } else {
+                                "Delete\u{2026}".into()
+                            },
+                            run(
+                                |this, t, _, cx| this.ask_delete(t.to_vec(), cx),
+                                targets.clone(),
+                            ),
+                        )
+                        .hint("Del")
+                        .separated(),
+                    );
+                }
             }
             MenuKind::Background => {
+                items.push(MenuItem::new(
+                    "upload",
+                    "Upload photos and videos\u{2026}",
+                    run(
+                        |this, _, window, cx| this.pick_uploads(window, cx),
+                        Vec::new(),
+                    ),
+                ));
                 items.push(
                     MenuItem::new(
-                        "upload",
+                        "copy",
                         "Paste to add to iCloud",
                         run(|this, _, _, cx| this.paste(cx), Vec::new()),
                     )
@@ -1891,10 +2180,23 @@ impl PhotoGrid {
                     MenuItem::new(
                         "download",
                         "Download original\u{2026}",
-                        run(|this, t, _, cx| this.download(t.to_vec(), cx), target),
+                        run(
+                            |this, t, _, cx| this.download(t.to_vec(), cx),
+                            target.clone(),
+                        ),
                     )
                     .hint("Ctrl+S"),
                 );
+                if self.can_delete() {
+                    items.push(
+                        MenuItem::new(
+                            "deleted",
+                            "Delete\u{2026}",
+                            run(|this, t, _, cx| this.ask_delete(t.to_vec(), cx), target),
+                        )
+                        .separated(),
+                    );
+                }
             }
         }
         let this = cx.weak_entity();
@@ -2028,10 +2330,11 @@ impl Render for PhotoGrid {
             );
 
         let menu = self.menu.as_ref().map(|menu| self.render_menu(menu, cx));
-        let dialog = self
-            .pending_upload
-            .as_ref()
-            .map(|upload| self.render_upload_dialog(upload, cx));
+        let dialog = match (&self.pending_upload, &self.pending_delete) {
+            (Some(upload), _) => Some(self.render_upload_dialog(upload, cx).into_any_element()),
+            (None, Some(ids)) => Some(self.render_delete_dialog(ids.len(), cx).into_any_element()),
+            _ => None,
+        };
 
         div()
             .id("gallery-root")
@@ -2040,6 +2343,7 @@ impl Render for PhotoGrid {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_action))
             .on_action(cx.listener(Self::download_selection))
+            .on_action(cx.listener(Self::delete_selection))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::zoom_in))
@@ -2050,8 +2354,13 @@ impl Render for PhotoGrid {
             .flex()
             .flex_col()
             .bg(theme::surface())
+            // Files and folders dropped in are offered for upload.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.dropped(paths.paths().to_vec(), cx)
+            }))
             .child(body)
             .child(header)
+            .when(cx.has_active_drag(), |el| el.child(drop_hint()))
             .when_some(self.viewer.as_ref(), |el, (viewer, _)| {
                 el.child(viewer.clone())
             })
@@ -2213,6 +2522,14 @@ impl PhotoGrid {
             self.image_cache
                 .update(cx, |cache, _| cache.set_capacity(wanted));
         }
+        // Decode thumbnails no bigger than the tiles show them (once the
+        // zoom settles, so it doesn't redo them on the way).
+        if !zooming {
+            let height =
+                crate::image_cache::height_for(self.row_height.target(), window.scale_factor());
+            self.image_cache
+                .update(cx, |cache, _| cache.set_max_height(height));
+        }
 
         let marks: Vec<f32> = layout.months.iter().map(|m| m.y).collect();
         let track = Track::new(
@@ -2222,8 +2539,9 @@ impl PhotoGrid {
             &marks,
         );
         self.track = Some(track.clone());
+        let scale = window.scale_factor();
         let scrubber =
-            (self.max_scroll > 0.).then(|| self.render_scrubber(&layout, track, top, cx));
+            (self.max_scroll > 0.).then(|| self.render_scrubber(&layout, track, top, scale, cx));
         let height = layout.height;
         self.layout = Some(layout);
 
@@ -2478,9 +2796,13 @@ impl PhotoGrid {
         layout: &Layout,
         track: Track,
         top: f32,
+        scale: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let thumb = track.position(top);
+        // Hairlines on whole device pixels, so none blur away to nothing.
+        let snap = move |y: f32| (y * scale).round() / scale;
+        let hairline = scale.round().max(1.) / scale;
         let active = self.scrub.dragging || self.scrub.hover.is_some();
         // The date follows the pointer when it's over the track, and the
         // scroll position otherwise.
@@ -2569,13 +2891,13 @@ impl PhotoGrid {
                     cx.notify();
                 }
             }))
-            .children(ticks.into_iter().map(|y| {
+            .children(ticks.into_iter().map(move |y| {
                 div()
                     .absolute()
                     .right(px(10.))
-                    .top(px(SCRUBBER_TOP + y))
+                    .top(px(snap(SCRUBBER_TOP + y)))
                     .w(px(4.))
-                    .h(px(1.))
+                    .h(px(hairline))
                     .bg(theme::line())
             }))
             .children(years.into_iter().map(|(y, year)| {
@@ -2653,6 +2975,25 @@ struct TileLook {
 }
 
 /// A small label on a tile, readable on any photo.
+/// Shown over the gallery while files are dragged over the window.
+fn drop_hint() -> impl IntoElement {
+    div()
+        .absolute()
+        .inset(px(8.))
+        .rounded(px(16.))
+        .border_2()
+        .border_dashed()
+        .border_color(theme::accent())
+        .bg(theme::accent_soft())
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(15.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::accent_text())
+        .child("Drop to add to iCloud Photos")
+}
+
 fn badge() -> gpui::Div {
     div()
         .absolute()

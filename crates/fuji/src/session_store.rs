@@ -495,4 +495,106 @@ mod live_collections {
         );
         persist(&auth);
     }
+    /// Reads (never writes) the library's change feed with the saved
+    /// session. Prints counts only. Run with `cargo test -p fuji
+    /// live_changes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_changes() {
+        let saved = load().expect("a saved session");
+        let auth = AuthClient::from_saved(&saved);
+        restore_cookies(&auth);
+        let account = auth.resume().expect("session resumes");
+        persist(&auth);
+        let client = fuji_icloud::PhotosClient::new(&auth, &account).expect("photos service");
+        let started = std::time::Instant::now();
+        let token = client.sync_token().expect("sync token");
+        let changes = client.changes(&token).expect("changes since now");
+        println!(
+            "changes since now: {} assets, {} removed, {} other, token moved: {}, {:?}",
+            changes.assets.len(),
+            changes.removed.len(),
+            changes.other,
+            changes.token != token,
+            started.elapsed()
+        );
+        let count = client.count(&fuji_icloud::Album::All).expect("count");
+        println!("library count read ({} digits)", count.to_string().len());
+    }
+
+    /// Uploads one small generated image, waits for it in the change feed,
+    /// then moves it to Recently Deleted. Changes the library: run only when
+    /// asked to. Prints counts and timings only. Run with `cargo test -p fuji
+    /// live_upload_delete -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_upload_delete() {
+        use std::time::{Duration, Instant};
+        let saved = load().expect("a saved session");
+        let auth = AuthClient::from_saved(&saved);
+        restore_cookies(&auth);
+        let account = auth.resume().expect("session resumes");
+        persist(&auth);
+        let client = fuji_icloud::PhotosClient::new(&auth, &account).expect("photos service");
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name = format!("fuji-upload-test-{stamp}.png");
+        let path = std::env::temp_dir().join(&name);
+        image::RgbaImage::from_fn(96, 64, |x, y| {
+            image::Rgba([(x * 2) as u8, (y * 3) as u8, 160, 255])
+        })
+        .save(&path)
+        .unwrap();
+
+        let mut token = client.sync_token().expect("sync token");
+        let before = client.count(&fuji_icloud::Album::All).expect("count");
+        let started = Instant::now();
+        client.upload_file(&name, &path).expect("upload");
+        std::fs::remove_file(&path).ok();
+        println!("uploaded in {:?}", started.elapsed());
+
+        // Find it in the change feed by its file name.
+        let mut found = None;
+        while found.is_none() && started.elapsed() < Duration::from_secs(120) {
+            std::thread::sleep(Duration::from_secs(3));
+            let changes = client.changes(&token).expect("changes");
+            token = changes.token;
+            found = changes
+                .assets
+                .into_iter()
+                .find(|a| a.filename.as_deref() == Some(name.as_str()));
+        }
+        let asset = found.expect("the upload shows in the change feed");
+        let after = client.count(&fuji_icloud::Album::All).expect("count");
+        println!(
+            "in the feed after {:?}: aspect {:.2}, dated {}, count +{}",
+            started.elapsed(),
+            asset.aspect,
+            asset.created_at_ms > 0,
+            after as i64 - before as i64
+        );
+
+        let deleting = Instant::now();
+        client
+            .set_deleted(std::slice::from_ref(&asset.id.0), true)
+            .expect("delete");
+        println!("deleted in {:?}", deleting.elapsed());
+        let mut gone = false;
+        while !gone && deleting.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_secs(2));
+            let changes = client.changes(&token).expect("changes");
+            token = changes.token;
+            gone = changes.removed.contains(&asset.id.0);
+        }
+        let last = client.count(&fuji_icloud::Album::All).expect("count");
+        println!(
+            "removal in the feed: {gone} after {:?}; count back to before: {}",
+            deleting.elapsed(),
+            last == before
+        );
+        assert!(gone);
+    }
 }

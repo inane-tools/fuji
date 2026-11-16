@@ -177,6 +177,8 @@ pub struct FujiApp {
     counts: HashMap<String, usize>,
     /// Cover thumbnails for the Collections page, by album slug.
     covers: HashMap<String, Arc<Path>>,
+    /// Their decoded images, bounded (GPUI's own cache never lets go).
+    cover_cache: Entity<crate::image_cache::LruImageCache>,
     /// The library client and thumbnail folder, for loading Collections.
     photos: Option<(Arc<PhotosClient>, Arc<Path>)>,
     _collections_load: Option<Task<()>>,
@@ -223,6 +225,12 @@ impl FujiApp {
             memories_expanded: false,
             counts: HashMap::new(),
             covers: HashMap::new(),
+            // Covers are 168 px squares: decoded no bigger than that needs.
+            cover_cache: cx.new(|cx| {
+                let mut cache = crate::image_cache::LruImageCache::new(160, cx);
+                cache.set_max_height(512);
+                cache
+            }),
             photos: None,
             _collections_load: None,
             avatar: None,
@@ -732,6 +740,20 @@ impl FujiApp {
         cx.notify();
     }
 
+    /// The top bar's upload button: pick files, and watch them arrive in
+    /// the gallery (from a page without one, the library).
+    fn upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.section, Section::Collections | Section::Settings) {
+            self.select(Section::Library, window, cx);
+        }
+        if let Screen::Main {
+            grid: Some(grid), ..
+        } = &self.screen
+        {
+            grid.update(cx, |grid, cx| grid.pick_uploads(window, cx));
+        }
+    }
+
     fn sign_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Screen::Main { account, .. } = &self.screen else {
             return;
@@ -1134,6 +1156,16 @@ impl FujiApp {
                         .child(self.search.clone()),
                 )
                 .child(
+                    div().occlude().child(
+                        ui::icon_button(
+                            "upload",
+                            "upload",
+                            cx.listener(|this, _, window, cx| this.upload(window, cx)),
+                        )
+                        .tooltip(ui::tooltip("Upload photos and videos")),
+                    ),
+                )
+                .child(
                     div()
                         .id("account")
                         .relative()
@@ -1217,7 +1249,9 @@ impl Render for FujiApp {
         let is_gallery = self.section_album(self.section).is_some();
         let content = match (self.section, is_gallery, grid) {
             (Section::Settings, _, _) => div().size_full().child(settings),
-            (Section::Collections, _, _) => self.render_collections(cx),
+            (Section::Collections, _, _) => self
+                .render_collections(cx)
+                .image_cache(self.cover_cache.clone()),
             (_, true, Some(grid)) => div().size_full().child(grid),
             (_, true, None) => message(PhotosError::NotAvailable.to_string()),
             (_, false, _) => message(format!(

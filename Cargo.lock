@@ -2118,6 +2118,7 @@ dependencies = [
  "flate2",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "jiff",
  "num-bigint 0.5.1",
  "p256",
  "pbkdf2 0.13.0",

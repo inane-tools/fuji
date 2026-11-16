@@ -71,6 +71,20 @@ pub enum Album {
     Memory(Arc<str>),
 }
 
+/// What changed in the library since a sync token: see
+/// [`PhotosClient::changes`].
+#[derive(Debug, Default)]
+pub struct LibraryChanges {
+    /// Where the feed stands now.
+    pub token: String,
+    /// Items new to the library or changed (layout fields only).
+    pub assets: Vec<Asset>,
+    /// Record names of items no longer in the library.
+    pub removed: Vec<String>,
+    /// Other records that changed (albums, memories, people).
+    pub other: usize,
+}
+
 /// The media types Photos collects on its own, as icloud.com lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SmartAlbum {
@@ -230,7 +244,8 @@ pub struct PhotosClient {
     agent: Agent,
     cookies: CookieLog,
     endpoint: String,
-    /// Where new photos are sent, if the account has the upload service.
+    /// The `photosupload` service, where new photos are sent, if the
+    /// account has it. (The older `uploadimagews` upload answers 410 Gone.)
     upload_endpoint: Option<String>,
     /// Shared albums' service, if the account has it.
     shared_endpoint: Option<String>,
@@ -256,8 +271,8 @@ impl PhotosClient {
             ),
             upload_endpoint: account
                 .webservices
-                .get("uploadimagews")
-                .map(|root| format!("{}/upload", root.trim_end_matches('/'))),
+                .get("photosupload")
+                .map(|root| root.trim_end_matches('/').to_string()),
             shared_endpoint: account.webservices.get("sharedstreams").map(|root| {
                 format!(
                     "{}/{}/sharedstreams",
@@ -472,6 +487,186 @@ impl PhotosClient {
             .into_iter()
             .next()
             .filter(|a| a.thumbnail.is_some()))
+    }
+
+    /// Where the library's change feed stands now: hand it to
+    /// [`Self::changes`] later to hear only what changed since. One small
+    /// query (CloudKit returns the zone's token with any query).
+    pub fn sync_token(&self) -> Result<String, PhotosError> {
+        let data = self.post(
+            "records/query",
+            &list_query(&Album::All, 0, MIN_RESULTS, &["recordName"]),
+        )?;
+        data["syncToken"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| PhotosError::Unexpected {
+                status: 200,
+                message: "no sync token".into(),
+            })
+    }
+
+    /// What changed in the library since `token`: items added or edited
+    /// (still in the library), and items gone from it (deleted, hidden or
+    /// expunged). Masters a changed item points at but that didn't change
+    /// themselves are looked up, so each item comes back complete.
+    pub fn changes(&self, token: &str) -> Result<LibraryChanges, PhotosError> {
+        let mut token = token.to_string();
+        let mut assets: HashMap<String, Value> = HashMap::new();
+        let mut masters: HashMap<String, Value> = HashMap::new();
+        let mut removed = Vec::new();
+        let mut other = 0;
+        let mut seen = 0;
+        loop {
+            let data = self.post(
+                "changes/zone",
+                &json!({
+                    "zones": [{
+                        "zoneID": { "zoneName": "PrimarySync" },
+                        "syncToken": token,
+                        "resultsLimit": CHANGES_PAGE,
+                        "desiredKeys": CHANGE_KEYS,
+                    }]
+                }),
+            )?;
+            let zone = &data["zones"][0];
+            if let Some(code) = zone["serverErrorCode"].as_str() {
+                return Err(cloudkit_error(
+                    200,
+                    code,
+                    zone["reason"].as_str().unwrap_or(""),
+                ));
+            }
+            let records = zone["records"].as_array().cloned().unwrap_or_default();
+            seen += records.len();
+            for record in records {
+                let Some(name) = record["recordName"].as_str().map(str::to_string) else {
+                    continue;
+                };
+                if record["deleted"].as_bool() == Some(true) {
+                    // Expunged. If it was an asset, it goes; anything else
+                    // just isn't found.
+                    assets.remove(&name);
+                    masters.remove(&name);
+                    removed.push(name);
+                    continue;
+                }
+                match record["recordType"].as_str() {
+                    Some("CPLAsset") => {
+                        let flag = |f: &str| field(&record, f).and_then(Value::as_i64) == Some(1);
+                        if flag("isDeleted") || flag("isHidden") {
+                            assets.remove(&name);
+                            removed.push(name);
+                        } else {
+                            assets.insert(name, record);
+                        }
+                    }
+                    Some("CPLMaster") => {
+                        masters.insert(name, record);
+                    }
+                    _ => other += 1,
+                }
+            }
+            if let Some(next) = zone["syncToken"].as_str() {
+                token = next.to_string();
+            }
+            if zone["moreComing"].as_bool() != Some(true) {
+                break;
+            }
+            if seen > MAX_CHANGES {
+                return Err(PhotosError::Unexpected {
+                    status: 200,
+                    message: "too many changes to apply one by one".into(),
+                });
+            }
+        }
+        // Items whose master didn't change (unhidden, edited, favorited).
+        let missing: Vec<String> = assets
+            .values()
+            .filter_map(master_name)
+            .filter(|m| !masters.contains_key(*m))
+            .map(str::to_string)
+            .collect();
+        if !missing.is_empty() {
+            for master in self.lookup(&missing, SCAN_KEYS)? {
+                if let Some(name) = master["recordName"].as_str() {
+                    masters.insert(name.to_string(), master.clone());
+                }
+            }
+        }
+        let assets = assets
+            .values()
+            .filter_map(|asset| parse_asset(asset, masters.get(master_name(asset)?)?))
+            .collect();
+        Ok(LibraryChanges {
+            token,
+            assets,
+            removed,
+            other,
+        })
+    }
+
+    /// Move items to Recently Deleted (`deleted`), or bring them back from
+    /// it, the way icloud.com does: by setting `isDeleted` on each asset.
+    pub fn set_deleted(&self, names: &[String], deleted: bool) -> Result<(), PhotosError> {
+        for chunk in names.chunks(MAX_PAGE) {
+            let mut pending: Vec<String> = chunk.to_vec();
+            // A record changed elsewhere between the lookup and the update
+            // has a new tag: look it up again, once.
+            for attempt in 0..2 {
+                let current = self.lookup(&pending, &["isDeleted"])?;
+                let operations: Vec<Value> = current
+                    .iter()
+                    .filter(|r| r["serverErrorCode"].is_null())
+                    .filter_map(|r| {
+                        Some(json!({
+                            "operationType": "update",
+                            "record": {
+                                "recordName": r["recordName"].as_str()?,
+                                "recordType": "CPLAsset",
+                                "recordChangeTag": r["recordChangeTag"].as_str()?,
+                                "fields": { "isDeleted": { "value": i64::from(deleted) } },
+                            },
+                        }))
+                    })
+                    .collect();
+                if operations.is_empty() {
+                    break;
+                }
+                let data = self.post(
+                    "records/modify",
+                    &json!({
+                        "operations": operations,
+                        "zoneID": { "zoneName": "PrimarySync" },
+                        "atomic": false,
+                        "desiredKeys": ["isDeleted"],
+                    }),
+                )?;
+                let failed: Vec<&Value> = data["records"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r["serverErrorCode"].is_string())
+                    .collect();
+                let Some(first) = failed.first() else {
+                    break;
+                };
+                let conflicts: Vec<String> = failed
+                    .iter()
+                    .filter(|r| r["serverErrorCode"] == "CONFLICT")
+                    .filter_map(|r| r["recordName"].as_str().map(str::to_string))
+                    .collect();
+                if attempt == 1 || conflicts.len() != failed.len() {
+                    return Err(cloudkit_error(
+                        200,
+                        first["serverErrorCode"].as_str().unwrap_or(""),
+                        first["reason"].as_str().unwrap_or(""),
+                    ));
+                }
+                pending = conflicts;
+            }
+        }
+        Ok(())
     }
 
     /// Item counts for several of iCloud's count indexes in one request:
@@ -733,32 +928,150 @@ impl PhotosClient {
         result.map_err(io_error)
     }
 
-    /// Add a photo or video file to the library, the way icloud.com's
-    /// upload button does. `filename` decides the type (by its extension).
-    pub fn upload(&self, filename: &str, bytes: &[u8]) -> Result<(), PhotosError> {
-        let endpoint = self
+    /// Add a photo or video to the library, the way icloud.com's upload
+    /// button does. `filename` decides the type (by its extension);
+    /// `modified_ms` is the file's modification time.
+    pub fn upload(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+        modified_ms: i64,
+    ) -> Result<(), PhotosError> {
+        self.send_upload(filename, bytes.len() as u64, modified_ms, bytes)
+    }
+
+    /// [`Self::upload`] straight from a file, without reading it into memory.
+    pub fn upload_file(&self, filename: &str, path: &Path) -> Result<(), PhotosError> {
+        let unreadable = |err: std::io::Error| PhotosError::Unexpected {
+            status: 0,
+            message: format!("couldn't read {filename}: {err}"),
+        };
+        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let meta = file.metadata().map_err(unreadable)?;
+        let modified_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as i64);
+        self.send_upload(filename, meta.len(), modified_ms, &file)
+    }
+
+    /// icloud.com's upload, in four steps on the `photosupload` service: ask
+    /// for a place to put the file, send it there, add it to the library,
+    /// and wait while iCloud makes its renditions.
+    fn send_upload(
+        &self,
+        filename: &str,
+        size: u64,
+        modified_ms: i64,
+        body: impl ureq::AsSendBody,
+    ) -> Result<(), PhotosError> {
+        let unexpected = |message: &str| PhotosError::Unexpected {
+            status: 200,
+            message: message.into(),
+        };
+        let key = uuid::Uuid::new_v4().to_string();
+        let urls = self.upload_post(
+            "createUploadUrl",
+            &json!({ "zoneName": "PrimarySync", "assets": { &key: size } }),
+        )?;
+        let url = urls["uploadUrls"][&key]
+            .as_str()
+            .ok_or_else(|| unexpected("no upload address"))?;
+
+        let mut resp = self
+            .agent
+            .post(url)
+            .header("Origin", "https://www.icloud.com")
+            .header("Referer", "https://www.icloud.com/")
+            .content_type("text/plain")
+            .send(body)?;
+        self.cookies.record(&resp);
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        if !(200..300).contains(&status) {
+            if text.contains("QUOTA_EXCEEDED") {
+                return Err(unexpected("Your iCloud storage is full."));
+            }
+            return Err(error_for(status, &text));
+        }
+        let sent: Value =
+            serde_json::from_str(&text).map_err(|_| unexpected("upload response wasn't JSON"))?;
+        if sent["isDuplicate"].as_bool() == Some(true) {
+            return Err(unexpected("That's already in your library."));
+        }
+        let receipt = sent
+            .get("singleFile")
+            .cloned()
+            .ok_or_else(|| unexpected("no upload receipt"))?;
+
+        let now = jiff::Zoned::now();
+        let added = self.upload_post(
+            "putAsset",
+            &json!({
+                "zoneName": "PrimarySync",
+                "localTimeZoneId": now.time_zone().iana_name().unwrap_or("UTC"),
+                "importGroup": uuid::Uuid::new_v4().to_string(),
+                "files": [{
+                    "fileName": filename,
+                    "lastModDate": modified_ms,
+                    // As JavaScript's getTimezoneOffset: minutes behind UTC.
+                    "timeZoneOffset": -(now.offset().seconds() / 60),
+                    "singleFileUploadRequest": receipt,
+                }],
+            }),
+        )?;
+        let result = &added[0];
+        let Some(job) = result["uploadJobId"].as_str() else {
+            let message = result["response"]["errorMessage"]
+                .as_str()
+                .unwrap_or("iCloud didn't accept the file");
+            return Err(unexpected(message));
+        };
+
+        // Wait for iCloud to finish with it (renditions, a video's transcode).
+        for attempt in 0..UPLOAD_POLLS {
+            std::thread::sleep(Duration::from_millis(if attempt < 5 { 600 } else { 2_000 }));
+            let status = self.upload_post("uploadStatus", &json!({ "uploadJobIds": [job] }))?;
+            let job = &status[job];
+            if let Some(code) = job["errorCode"].as_i64() {
+                return Err(PhotosError::Unexpected {
+                    status: code as u16,
+                    message: "iCloud couldn't process the file".into(),
+                });
+            }
+            if job["progress"].as_f64().is_some_and(|p| p >= 100.) {
+                return Ok(());
+            }
+        }
+        // Still processing: it's in, and will show when done.
+        Ok(())
+    }
+
+    /// A request to the `photosupload` service.
+    fn upload_post(&self, endpoint: &str, body: &Value) -> Result<Value, PhotosError> {
+        let root = self
             .upload_endpoint
             .as_deref()
             .ok_or(PhotosError::NotAvailable)?;
         let mut resp = self
             .agent
-            .post(endpoint)
-            .query("filename", filename)
+            .post(format!("{root}/photosupload/{endpoint}"))
             .query("dsid", &self.dsid)
             .header("Origin", "https://www.icloud.com")
             .header("Referer", "https://www.icloud.com/")
-            .content_type("application/octet-stream")
-            .send(bytes)?;
+            .content_type("text/plain;charset=UTF-8")
+            .send(serde_json::to_vec(body).expect("serializable request"))?;
         self.cookies.record(&resp);
         let status = resp.status().as_u16();
         let text = resp.body_mut().read_to_string().unwrap_or_default();
         if !(200..300).contains(&status) {
             return Err(error_for(status, &text));
         }
-        match upload_error(&text) {
-            Some(message) => Err(PhotosError::Unexpected { status, message }),
-            None => Ok(()),
-        }
+        serde_json::from_str(&text).map_err(|_| PhotosError::Unexpected {
+            status,
+            message: format!("{endpoint} response wasn't JSON"),
+        })
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value, PhotosError> {
@@ -792,21 +1105,6 @@ impl PhotosClient {
         }
         Ok(data)
     }
-}
-
-/// The upload service reports failures in a 200 response's `errors` list.
-fn upload_error(body: &str) -> Option<String> {
-    let data: Value = serde_json::from_str(body).ok()?;
-    let errors = data.get("errors")?.as_array()?;
-    let first = errors.first()?;
-    Some(
-        first
-            .get("message")
-            .or_else(|| first.get("reason"))
-            .and_then(Value::as_str)
-            .unwrap_or("iCloud didn't accept the file")
-            .to_string(),
-    )
 }
 
 fn error_for(status: u16, body: &str) -> PhotosError {
@@ -872,6 +1170,39 @@ fn list_query(album: &Album, start_rank: usize, limit: usize, keys: &[&str]) -> 
         "desiredKeys": keys,
         "zoneID": { "zoneName": "PrimarySync" },
     })
+}
+
+/// How many times to ask whether an upload is processed (about 2 min).
+const UPLOAD_POLLS: usize = 65;
+
+/// Change records asked for at a time.
+const CHANGES_PAGE: usize = 400;
+/// Past this many changes, a full rescan is quicker.
+const MAX_CHANGES: usize = 40_000;
+
+/// What the change feed is asked for: what the index needs, and whether
+/// each item is still in the library.
+const CHANGE_KEYS: &[&str] = &[
+    "recordName",
+    "recordType",
+    "masterRef",
+    "assetDate",
+    "isFavorite",
+    "isDeleted",
+    "isHidden",
+    "duration",
+    "itemType",
+    "resOriginalWidth",
+    "resOriginalHeight",
+    "resJPEGThumbWidth",
+    "resJPEGThumbHeight",
+    "resOriginalVidComplFileType",
+    "filenameEnc",
+];
+
+/// The master record an asset points at.
+fn master_name(asset: &Value) -> Option<&str> {
+    asset["fields"]["masterRef"]["value"]["recordName"].as_str()
 }
 
 /// Just enough to index and lay out the library.
@@ -1326,16 +1657,6 @@ mod tests {
         assert!(parse_album(&deleted).is_none());
         let blank = parse_album(&record("U", " ", json!({}))).unwrap();
         assert_eq!(blank.name, "Untitled Album");
-    }
-
-    #[test]
-    fn upload_errors_are_read() {
-        assert_eq!(upload_error(r#"{"records":[]}"#), None);
-        assert_eq!(upload_error(r#"{"errors":[]}"#), None);
-        assert_eq!(
-            upload_error(r#"{"errors":[{"message":"Unsupported type"}]}"#).as_deref(),
-            Some("Unsupported type")
-        );
     }
 
     #[test]
