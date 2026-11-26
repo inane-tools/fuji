@@ -59,10 +59,15 @@ web), and the iCloud Shared Library.
 
 1. Download Fuji for your system from the
    [latest release](https://github.com/inane-tools/fuji/releases/latest):
-   `fuji-windows-x86_64.exe` or `fuji-linux-x86_64`. It's a single program;
-   put it where you keep apps and run it. Fuji tells you when there's a
-   new version (a ring on your account picture) and installs it when you
-   choose (Settings → About).
+   - **Windows:** `fuji-windows-x86_64-setup.exe`, an installer for your
+     account only (no administrator rights needed).
+   - **Linux:** `fuji-linux-x86_64.AppImage` (make it executable and run
+     it), or `fuji-linux-x86_64.flatpak`
+     (`flatpak install --user fuji-linux-x86_64.flatpak`).
+
+   Fuji tells you when there's a new version (a ring on your account
+   picture) and installs it when you choose (Settings → About). The
+   Flatpak is updated by downloading the next one.
 2. Sign in with your Apple Account. Fuji asks your devices to approve the
    sign-in, the same way a new browser does; enter the code shown on your
    iPhone. Approving this way also pairs Fuji with the iPhone for search.

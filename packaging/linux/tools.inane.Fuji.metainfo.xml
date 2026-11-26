@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>tools.inane.Fuji</id>
+  <name>Fuji</name>
+  <summary>Browse, view and upload your iCloud Photos</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="tools.inane">
+    <name>inane.tools</name>
+  </developer>
+  <description>
+    <p>
+      A fast, native iCloud Photos client. Browse, search, view, play,
+      download and upload your iCloud library, without a Mac.
+    </p>
+  </description>
+  <launchable type="desktop-id">tools.inane.Fuji.desktop</launchable>
+  <url type="homepage">https://inane.tools</url>
+  <url type="vcs-browser">https://github.com/inane-tools/fuji</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.0" date="2026-11-27"/>
+  </releases>
+</component>

@@ -1,12 +1,15 @@
-# Builds, signs and publishes a release when a version tag (v1.2.3) is
-# pushed. Fuji's updater downloads `fuji-<system>-<arch>[.exe]` and checks
-# it against `<file>.sig`, signed here with the UPDATE_SIGNING_KEY secret
-# (see docs/releasing.md).
+# Builds, packages, signs and publishes a release when a version tag
+# (v1.2.3) is pushed: a Windows installer, a Linux AppImage and a Linux
+# Flatpak, each with a signature (`<file>.sig`, made with the
+# UPDATE_SIGNING_KEY secret; see docs/releasing.md) that Fuji's updater
+# checks. Run by hand (Actions, Release, Run workflow), it does everything
+# but publish, and keeps the files as the run's "release-preview" artifact.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,66 +18,128 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build (${{ matrix.name }})
-    strategy:
-      matrix:
-        include:
-          - name: Windows
-            os: windows-latest
-            binary: target/release/fuji.exe
-            asset: fuji-windows-x86_64.exe
-          - name: Linux
-            # The oldest supported runner, so the binary runs on older glibc.
-            os: ubuntu-22.04
-            binary: target/release/fuji
-            asset: fuji-linux-x86_64
-    runs-on: ${{ matrix.os }}
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Tag matches the version
-        shell: bash
+      - id: version
+        name: Read the version (and match it to the tag)
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "Tag $GITHUB_REF_NAME doesn't match the workspace version $version" >&2
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  windows:
+    name: Windows installer
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --release
+      - name: Build
+        run: cargo build --release -p fuji
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DVersion=${{ needs.version.outputs.version }}" packaging\windows\fuji.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/fuji-windows-x86_64-setup.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux build and AppImage
+    needs: version
+    # The oldest supported runner, so the binary runs on older glibc.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
       - name: Linux libraries
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxi-dev libxcursor-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev libdbus-1-dev \
-            libssl-dev libzstd-dev pkg-config
-
+            libssl-dev libzstd-dev pkg-config file desktop-file-utils
       - uses: Swatinem/rust-cache@v2
-
       - name: Test
         run: cargo test --workspace --release
-
       - name: Build
-        run: cargo build --release -p fuji
-
-      - name: Name the file
-        shell: bash
         run: |
+          cargo build --release -p fuji
           mkdir -p dist
-          cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
-
+          cp target/release/fuji dist/fuji
+      # The bare program, for the Flatpak job (not published).
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: linux-binary
+          path: dist/fuji
+          if-no-files-found: error
+      - name: AppImage
+        run: |
+          app=AppDir
+          install -Dm755 target/release/fuji "$app/usr/bin/fuji"
+          install -Dm644 packaging/linux/tools.inane.Fuji.desktop "$app/usr/share/applications/tools.inane.Fuji.desktop"
+          install -Dm644 packaging/linux/tools.inane.Fuji.png "$app/usr/share/icons/hicolor/256x256/apps/tools.inane.Fuji.png"
+          cp packaging/linux/tools.inane.Fuji.desktop packaging/linux/tools.inane.Fuji.png "$app/"
+          ln -s usr/bin/fuji "$app/AppRun"
+          desktop-file-validate packaging/linux/tools.inane.Fuji.desktop
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$app" dist/fuji-linux-x86_64.AppImage
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-appimage
+          path: dist/fuji-linux-x86_64.AppImage
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak
+    needs: linux
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-binary
+          path: dist
+      - run: chmod +x dist/fuji
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: packaging/linux/tools.inane.Fuji.yml
+          bundle: fuji-linux-x86_64.flatpak
+          upload-artifact: false
+          cache: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-flatpak
+          path: fuji-linux-x86_64.flatpak
           if-no-files-found: error
 
   publish:
     name: Sign and publish
-    needs: build
+    needs: [version, windows, linux, flatpak]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -83,6 +148,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: dist
           merge-multiple: true
 
@@ -107,12 +173,19 @@ jobs:
           sha256sum fuji-* > SHA256SUMS
           ls -l
 
+      - name: Keep the files (a run by hand)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-preview
+          path: dist/*
+
       - name: Publish
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "Fuji $version" \
+            --title "Fuji ${{ needs.version.outputs.version }}" \
             --generate-notes \
             --verify-tag

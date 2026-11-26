@@ -1,0 +1,37 @@
+# The Flatpak, built in CI around the release binary (built on an older
+# Ubuntu, so it runs on this runtime's newer libraries). Fuji's updater
+# doesn't replace a Flatpak; it points to the releases page instead.
+app-id: tools.inane.Fuji
+runtime: org.freedesktop.Platform
+runtime-version: "26.08"
+sdk: org.freedesktop.Sdk
+command: fuji
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=pulseaudio
+  # The saved sign-in's key, in the system keyring.
+  - --talk-name=org.freedesktop.secrets
+  # Downloads and exports.
+  - --filesystem=xdg-download
+  - --filesystem=xdg-pictures
+modules:
+  - name: fuji
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 fuji /app/bin/fuji
+      - install -Dm644 tools.inane.Fuji.desktop /app/share/applications/tools.inane.Fuji.desktop
+      - install -Dm644 tools.inane.Fuji.png /app/share/icons/hicolor/256x256/apps/tools.inane.Fuji.png
+      - install -Dm644 tools.inane.Fuji.metainfo.xml /app/share/metainfo/tools.inane.Fuji.metainfo.xml
+    sources:
+      - type: file
+        path: ../../dist/fuji
+      - type: file
+        path: tools.inane.Fuji.desktop
+      - type: file
+        path: tools.inane.Fuji.png
+      - type: file
+        path: tools.inane.Fuji.metainfo.xml

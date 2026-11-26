@@ -6,17 +6,19 @@
 //! happens until the user chooses: Download fetches the build for this
 //! system and checks it against its signature (made in CI with a key whose
 //! public half is below, so a file swapped on GitHub isn't taken); Install
-//! and restart sets the running program aside, puts the new one in its
-//! place and starts it.
+//! and restart runs the new installer silently on Windows (it closes Fuji
+//! and starts the new version), and on Linux puts the new AppImage in
+//! place of the running one and starts it. A Flatpak, or a Fuji built from
+//! source, is pointed to the releases page instead.
 //!
 //! `FUJI_FAKE_UPDATE=1.2.3` pretends that version is out, to try all this
 //! without a release: its download is made up, and installing only
 //! restarts Fuji as it is. `FUJI_FAKE_UPDATE=1.2.3:fail` fails the download.
 //!
-//! A release carries, for each system, the program as a single file and
-//! its signature (`<file>.sig`: ECDSA P-256 over SHA-256, DER, as `openssl
-//! dgst -sha256 -sign` writes it). Development builds look for updates but
-//! never install them.
+//! A release carries the Windows installer, the Linux AppImage and the
+//! Linux Flatpak, each with its signature (`<file>.sig`: ECDSA P-256 over
+//! SHA-256, DER, as `openssl dgst -sha256 -sign` writes it). Development
+//! builds look for updates but never install them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -289,13 +291,28 @@ pub fn install(cx: &mut App) {
 fn install_now(file: &Path) -> Result<(), String> {
     let target = install_target()?;
     // A made-up update only restarts.
-    if fake().is_none() {
-        replace(file, &target)?;
+    if fake().is_some() {
+        return start(&target, &[]);
     }
-    std::process::Command::new(&target)
+    if cfg!(windows) {
+        // The installer replaces this one (once it has quit) and starts
+        // the new version.
+        start(
+            file,
+            &["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"],
+        )
+    } else {
+        replace(file, &target)?;
+        start(&target, &[])
+    }
+}
+
+fn start(program: &Path, args: &[&str]) -> Result<(), String> {
+    std::process::Command::new(program)
+        .args(args)
         .spawn()
-        .map_err(|e| format!("the new version didn't start ({e})"))?;
-    Ok(())
+        .map(|_| ())
+        .map_err(|e| format!("the new version didn't start ({e})"))
 }
 
 pub fn releases_page() -> String {
@@ -337,13 +354,13 @@ struct GithubAsset {
     size: u64,
 }
 
-/// This system's file in a release, if Fuji is built for it.
+/// The release file that updates this copy of Fuji, if one does: the
+/// installer on Windows, the AppImage when running as one on Linux.
 fn asset_name() -> Option<&'static str> {
+    let appimage = std::env::var_os("APPIMAGE").is_some();
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Some("fuji-windows-x86_64.exe"),
-        ("windows", "aarch64") => Some("fuji-windows-aarch64.exe"),
-        ("linux", "x86_64") => Some("fuji-linux-x86_64"),
-        ("linux", "aarch64") => Some("fuji-linux-aarch64"),
+        ("windows", "x86_64") => Some("fuji-windows-x86_64-setup.exe"),
+        ("linux", "x86_64") if appimage => Some("fuji-linux-x86_64.AppImage"),
         _ => None,
     }
 }
@@ -544,8 +561,8 @@ fn hex_bytes(text: &str) -> Option<Vec<u8>> {
 // ---- Install ---------------------------------------------------------------------
 
 /// Whether this build installs updates itself. Development builds don't
-/// (they'd replace `target/debug`); nor does a system package's binary,
-/// which its package manager updates.
+/// (they'd replace `target/debug`); nor does a Flatpak or a system
+/// package, which their package manager updates.
 fn can_install() -> bool {
     if fake().is_some() {
         return true;
@@ -597,10 +614,14 @@ fn replace(new: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove what the last update set aside.
+/// Remove what the last update left: the old program it set aside, and
+/// the download (nothing is waiting on it at launch).
 fn clean_up() {
     if let Ok(target) = install_target() {
         let _ = std::fs::remove_file(set_aside(&target));
+    }
+    if let Some(dir) = updates_dir() {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -626,8 +647,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn releases_pick_this_systems_file() {
         let name = asset_name().unwrap();
+        assert_eq!(name, "fuji-windows-x86_64-setup.exe");
         let asset = |n: &str| GithubAsset {
             name: n.into(),
             browser_download_url: format!("https://example.invalid/{n}"),

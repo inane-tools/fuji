@@ -67,6 +67,8 @@ fn main() {
                         ..Default::default()
                     }),
                     window_min_size: Some(size(px(640.), px(420.))),
+                    // Matches the desktop entry on Linux (its icon and name).
+                    app_id: Some("tools.inane.Fuji".into()),
                     ..Default::default()
                 },
                 |window, cx| {

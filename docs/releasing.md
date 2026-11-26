@@ -42,16 +42,23 @@ The second line prints the public half for `PUBLIC_KEY`.
    ```
 
 3. CI checks that the tag matches the version, runs the tests, builds
-   Windows and Linux, signs each file, and publishes the release with
-   generated notes. Edit the notes on GitHub afterwards if you like.
+   and packages Windows and Linux, signs each file, and publishes the
+   release with generated notes. Edit the notes on GitHub afterwards if
+   you like.
 
-Each release has, for every system:
+To try the packaging without publishing, run the Release workflow by hand
+(Actions → Release → Run workflow): it does everything but publish, and
+keeps the signed files as the run's `release-preview` artifact.
+
+Each release has:
 
 | File | What it is |
 | --- | --- |
-| `fuji-windows-x86_64.exe`, `fuji-linux-x86_64` | The program |
-| `<file>.sig` | Its signature: ECDSA P-256 over SHA-256, DER |
-| `SHA256SUMS` | Checksums of the programs and signatures |
+| `fuji-windows-x86_64-setup.exe` | The Windows installer (Inno Setup, `packaging/windows/fuji.iss`), for the current user |
+| `fuji-linux-x86_64.AppImage` | Linux, as an AppImage |
+| `fuji-linux-x86_64.flatpak` | Linux, as a Flatpak bundle (`packaging/linux/tools.inane.Fuji.yml`) |
+| `<file>.sig` | Each file's signature: ECDSA P-256 over SHA-256, DER |
+| `SHA256SUMS` | Checksums of the files and signatures |
 
 The updater looks for exactly these names, so keep them. It ignores drafts
 and pre-releases, and only works while the repository is public (GitHub
@@ -65,9 +72,15 @@ and badge on the account picture, "Update available" at the top of the
 account menu, and the updates block in Settings' About card. Nothing is
 downloaded until the user clicks Download; Fuji then fetches the file for
 its system, shows the progress and checks the signature. Install and
-restart moves the running program aside (`fuji.exe.old`, removed on the
-next launch), puts the new one in its place and starts it. On Linux, an
-AppImage is replaced as a whole.
+restart then:
+
+- on Windows, runs the new installer silently; it closes Fuji, installs
+  over it and starts the new version;
+- in an AppImage, moves the running AppImage aside (removed on the next
+  launch), puts the new one in its place and starts it.
+
+A Flatpak, or a Fuji built from source, isn't replaced: Settings offers
+the releases page instead.
 
 Development builds (`cargo run`) look for updates but never install them,
 and `FUJI_NO_UPDATE=1` turns installing off for any build (for packagers).

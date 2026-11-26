@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fuji
+GenericName=Photo Library
+Comment=Browse, view and upload your iCloud Photos
+Exec=fuji
+Icon=tools.inane.Fuji
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=iCloud;Photos;Apple;Pictures;
+StartupWMClass=tools.inane.Fuji
