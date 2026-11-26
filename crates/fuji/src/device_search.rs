@@ -9,7 +9,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fuji_icloud::AuthClient;
-use fuji_icloud::ids::IdsIdentity;
 use fuji_icloud::skybridge::Skybridge;
 use futures::channel::oneshot;
 use serde_json::{Value, json};
@@ -126,15 +125,38 @@ fn connect(
     } else {
         format!("tel:{apple_id}")
     };
-    let identity = IdsIdentity::generate().map_err(|e| e.to_string())?;
-    let mut sky = Skybridge::connect(auth, identity, dsid, &handle).map_err(|e| e.to_string())?;
-    debug(&format!("{} devices", sky.device_count()));
+    // Go on as the connection of an earlier run, so Apple doesn't get a
+    // new registration every launch.
+    let saved = crate::session_store::load_bridge();
+    let mut sky =
+        Skybridge::connect(auth, saved.as_ref(), dsid, &handle).map_err(|e| e.to_string())?;
+    debug(&format!(
+        "{} devices ({})",
+        sky.device_count(),
+        if sky.reused() {
+            "kept registration"
+        } else {
+            "registered"
+        }
+    ));
     let token = token
         .join()
         .map_err(|_| "session token fetch failed".to_string())?
         .map_err(|e| e.to_string())?;
-    let (device, name) = sky.verify_key(key, &token).map_err(|e| e.to_string())?;
+    let (device, name) = match sky.verify_key(key, &token) {
+        Ok(found) => found,
+        // The kept connection didn't work out: start fresh, once.
+        Err(err) if saved.is_some() => {
+            debug(&format!("kept connection failed ({err}); starting fresh"));
+            sky.close();
+            crate::session_store::clear_bridge();
+            sky = Skybridge::connect(auth, None, dsid, &handle).map_err(|e| e.to_string())?;
+            sky.verify_key(key, &token).map_err(|e| e.to_string())?
+        }
+        Err(err) => return Err(err.to_string()),
+    };
     debug(&format!("paired device answered: {name}"));
+    crate::session_store::save_bridge(&sky.saved());
     Ok(Connected {
         sky,
         device,
@@ -264,11 +286,15 @@ fn worker(
         let started = std::time::Instant::now();
         let result = search(c, auth, &text);
         match &result {
-            Ok(found) => debug(&format!(
-                "{} results in {:?}",
-                found.ids.len(),
-                started.elapsed()
-            )),
+            Ok(found) => {
+                debug(&format!(
+                    "{} results in {:?}",
+                    found.ids.len(),
+                    started.elapsed()
+                ));
+                // Its message counter moved on.
+                crate::session_store::save_bridge(&c.sky.saved());
+            }
             Err(err) => {
                 debug(&format!("search failed: {err}"));
                 // Start over next time: the connection may be gone.

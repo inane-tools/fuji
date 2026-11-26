@@ -9,7 +9,7 @@
 //! Keeping them lets a restart continue the same iCloud session instead of
 //! signing in again (which makes Apple email the account holder).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, Generate, Key, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -90,6 +90,7 @@ pub fn save(session: &SavedSession) {
 pub fn sign_out() {
     write(SESSION_TOKEN, None);
     write(PAIRING_KEY, None);
+    clear_bridge();
     clear_cookies();
 }
 
@@ -148,6 +149,30 @@ fn cookie_file() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("fuji").join("session.bin"))
 }
 
+/// The device search connection, kept between runs (private keys, so
+/// encrypted like the cookies).
+fn bridge_file() -> Option<PathBuf> {
+    Some(dirs::data_local_dir()?.join("fuji").join("device.bin"))
+}
+
+/// Keep the device search connection for the next run. Blocking.
+pub fn save_bridge(saved: &fuji_icloud::skybridge::SavedBridge) {
+    if let (Some(path), Ok(json)) = (bridge_file(), serde_json::to_string(saved)) {
+        write_sealed(&path, &json);
+    }
+}
+
+/// The device search connection from an earlier run, if any. Blocking.
+pub fn load_bridge() -> Option<fuji_icloud::skybridge::SavedBridge> {
+    serde_json::from_str(&read_sealed(&bridge_file()?)?).ok()
+}
+
+pub fn clear_bridge() {
+    if let Some(path) = bridge_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn cookie_cipher(create: bool) -> Option<Aes256Gcm> {
     let stored = read(COOKIE_KEY).and_then(|b64| BASE64.decode(b64).ok());
     let bytes = match stored {
@@ -163,11 +188,18 @@ fn cookie_cipher(create: bool) -> Option<Aes256Gcm> {
 }
 
 fn save_cookies(json: &str) {
-    let (Some(path), Some(cipher)) = (cookie_file(), cookie_cipher(true)) else {
+    if let Some(path) = cookie_file() {
+        write_sealed(&path, json);
+    }
+}
+
+/// Write `text` to `path`, encrypted with the key kept in the keychain.
+fn write_sealed(path: &Path, text: &str) {
+    let Some(cipher) = cookie_cipher(true) else {
         return;
     };
     let nonce = Nonce::generate();
-    let Ok(ciphertext) = cipher.encrypt(&nonce, json.as_bytes()) else {
+    let Ok(ciphertext) = cipher.encrypt(&nonce, text.as_bytes()) else {
         return;
     };
     let mut data = nonce.to_vec();
@@ -177,12 +209,16 @@ fn save_cookies(json: &str) {
     }
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, &data).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
 fn load_cookies() -> Option<String> {
-    let data = std::fs::read(cookie_file()?).ok()?;
+    read_sealed(&cookie_file()?)
+}
+
+fn read_sealed(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
     if data.len() <= NONCE_LEN {
         return None;
     }
@@ -299,7 +335,6 @@ mod live_ids {
 #[cfg(test)]
 mod live_skybridge {
     use super::*;
-    use fuji_icloud::ids::IdsIdentity;
     use fuji_icloud::skybridge::Skybridge;
 
     fn kind(v: &serde_json::Value) -> &'static str {
@@ -316,6 +351,41 @@ mod live_skybridge {
     /// Key verification with the paired device, using the saved session and
     /// pairing key. Run with `cargo test -p fuji live_skybridge_verify --
     /// --ignored --nocapture`.
+    /// Connects twice, as two launches would, through the saved connection
+    /// (`device.bin`). Prints only whether the registration was kept and
+    /// the device verified the key. Run with `cargo test -p fuji
+    /// live_bridge_kept -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_bridge_kept() {
+        let saved = load().expect("a saved session");
+        let pairing = load_pairing().expect("a pairing key");
+        let key = BASE64.decode(&pairing.key).expect("pairing key is base64");
+        let auth = AuthClient::from_saved(&saved);
+        restore_cookies(&auth);
+        let account = auth.resume().expect("session resumes");
+        persist(&auth);
+        let token = auth.session_id_token().expect("session id token");
+        let handle = format!("mailto:{}", account.apple_id);
+        for run in 1..=2 {
+            let started = std::time::Instant::now();
+            let kept = load_bridge();
+            let mut sky =
+                Skybridge::connect(&auth, kept.as_ref(), &account.dsid, &handle).expect("connect");
+            let connected = started.elapsed();
+            let verified = sky.verify_key(&key, &token).is_ok();
+            println!(
+                "run {run}: had saved {}, kept registration {}, devices {}, verified {verified},                  connected in {connected:?}, total {:?}",
+                kept.is_some(),
+                sky.reused(),
+                sky.device_count(),
+                started.elapsed()
+            );
+            save_bridge(&sky.saved());
+            sky.close();
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_skybridge_verify() {
@@ -328,7 +398,6 @@ mod live_skybridge {
         persist(&auth);
         let token = auth.session_id_token().expect("session id token");
         let handle = format!("mailto:{}", account.apple_id);
-        let identity = IdsIdentity::generate().expect("keys");
         let index_path = crate::thumbs::account_dir(&account.dsid).join("index-library.json");
         let index_ids: std::collections::HashSet<String> = std::fs::read(&index_path)
             .ok()
@@ -342,7 +411,7 @@ mod live_skybridge {
             })
             .unwrap_or_default();
         println!("fuji's index: {} ids", index_ids.len());
-        let mut sky = Skybridge::connect(&auth, identity, &account.dsid, &handle).expect("connect");
+        let mut sky = Skybridge::connect(&auth, None, &account.dsid, &handle).expect("connect");
         println!("devices: {}", sky.device_count());
         match sky.verify_key(&key, &token) {
             Ok((device, name)) => {

@@ -128,6 +128,12 @@ pub fn accent_soft() -> Hsla {
 pub fn danger() -> Hsla {
     pick(0xf87171, 0xd70015)
 }
+/// A red button under the pointer, as [`accent_hover`] is for the accent.
+pub fn danger_hover() -> Hsla {
+    let mut color = danger();
+    color.l += if is_light() { -0.05 } else { 0.06 };
+    color
+}
 /// The disclaimer's amber: its title, its text and its card.
 pub fn warn_title() -> Hsla {
     pick(0xfde68a, 0x92400e)

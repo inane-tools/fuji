@@ -1492,6 +1492,7 @@ impl Render for Viewer {
                     "previous",
                     true,
                     cx.listener(|this, _, window, cx| this.previous(&Previous, window, cx)),
+                    cx.listener(Self::open_menu),
                 ))
             })
             .when(has_next, |el| {
@@ -1500,6 +1501,7 @@ impl Render for Viewer {
                     "next",
                     false,
                     cx.listener(|this, _, window, cx| this.next(&Next, window, cx)),
+                    cx.listener(Self::open_menu),
                 ))
             });
 
@@ -1686,17 +1688,22 @@ fn pill(text: impl Into<gpui::SharedString>) -> gpui::Div {
 
 type ClickHandler = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>;
 
-/// A tall, invisible hit area along one edge, with a chevron that shows on hover.
+/// A tall, invisible hit area along one edge, with a chevron that shows on
+/// hover. Presses on it don't reach the photo behind (two quick clicks
+/// would zoom it), except the right button's, for the menu.
 fn edge_button(
     id: &'static str,
     glyph: &'static str,
     left: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    on_menu: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let on_click: ClickHandler = Box::new(on_click);
     div()
         .id(id)
         .group(id)
+        .block_mouse_except_scroll()
+        .on_mouse_down(MouseButton::Right, on_menu)
         .absolute()
         .top_0()
         .bottom_0()

@@ -69,12 +69,19 @@ pub fn text_button(
         .child(label.into())
 }
 
-/// The one filled button of a dialog.
-pub fn primary_button(
+/// The one filled button of a dialog: accent, or red for something destructive. (Its hover
+/// is set here once: GPUI panics if an element's hover is set twice.)
+fn filled_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
+    destructive: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let (bg, hover) = if destructive {
+        (theme::danger(), theme::danger_hover())
+    } else {
+        (theme::accent(), theme::accent_hover())
+    };
     div()
         .id(id)
         .h(theme::CONTROL_HEIGHT)
@@ -84,11 +91,11 @@ pub fn primary_button(
         .items_center()
         .rounded(theme::RADIUS_CONTROL)
         .cursor_pointer()
-        .bg(theme::accent())
+        .bg(bg)
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(gpui::white())
-        .hover(|el| el.bg(theme::accent_hover()))
+        .hover(move |el| el.bg(hover))
         .on_click(on_click)
         .child(label.into())
 }
@@ -579,6 +586,11 @@ pub enum Status {
         message: SharedString,
         undo: Handler,
     },
+    /// New items are in the gallery, with a way to go to them.
+    Listed {
+        message: SharedString,
+        show: Handler,
+    },
 }
 
 /// A message floating at the bottom of its (relative) parent.
@@ -615,6 +627,16 @@ pub fn toast(serial: u64, status: Status) -> impl IntoElement {
             .child(div().text_color(theme::text()).child(message))
             .child(link("toast-undo", "Undo", move |_, window, cx| {
                 undo(window, cx)
+            }))
+            .into_any_element(),
+        Status::Listed { message, show } => div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(icon("check", px(15.), theme::accent_text()))
+            .child(div().text_color(theme::text()).child(message))
+            .child(link("toast-show", "Show", move |_, window, cx| {
+                show(window, cx)
             }))
             .into_any_element(),
     };
@@ -725,15 +747,12 @@ fn dialog(
                             "Cancel",
                             move |_, window, cx| on_cancel(window, cx),
                         ))
-                        .child(
-                            primary_button("dialog-confirm", confirm, move |_, window, cx| {
-                                on_confirm(window, cx)
-                            })
-                            .when(destructive, |el| {
-                                el.bg(theme::danger())
-                                    .hover(|el| el.bg(theme::danger()).opacity(0.9))
-                            }),
-                        ),
+                        .child(filled_button(
+                            "dialog-confirm",
+                            confirm,
+                            destructive,
+                            move |_, window, cx| on_confirm(window, cx),
+                        )),
                 ),
         )
         .with_animation("dialog-open", anim::ease(anim::FAST), |el, t| el.opacity(t))

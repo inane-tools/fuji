@@ -30,12 +30,17 @@ use crate::{export, net, thumbs};
 const RECORD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Larger files aren't offered for upload.
 const MAX_UPLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-/// iCloud takes a moment to list an upload: look again after each of these.
-const CHECKS_AFTER_UPLOAD: [Duration; 3] = [
+/// iCloud takes a moment to list an upload: look again after each of
+/// these (the regular check, every 30 s, goes on after).
+const CHECKS_AFTER_UPLOAD: [Duration; 5] = [
+    Duration::from_secs(2),
     Duration::from_secs(3),
-    Duration::from_secs(8),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
     Duration::from_secs(20),
 ];
+/// How long to watch for uploads to be listed, to point them out.
+const AWAIT_UPLOADS_FOR: Duration = Duration::from_secs(5 * 60);
 /// Uploads sent at once.
 const PARALLEL_UPLOADS: usize = 3;
 /// The most files one drop or pick takes (a whole drive dropped by mistake).
@@ -44,6 +49,23 @@ const MAX_UPLOAD_FILES: usize = 10_000;
 const MAX_FOLDER_DEPTH: usize = 12;
 /// How long a deletion can be taken back before it's sent to iCloud.
 pub const UNDO_WINDOW: Duration = Duration::from_secs(6);
+
+/// Uploads iCloud hasn't listed yet, by file name (several files may
+/// share a name). When they're listed, a message offers to show them.
+pub struct Awaiting {
+    names: Vec<String>,
+    listed: Vec<String>,
+    since: std::time::Instant,
+}
+
+/// Whether `paths` hold something to upload: a photo or video file, or a
+/// folder. Fuji's own exports (photos dragged out of it) don't count.
+pub fn can_upload(paths: &[PathBuf]) -> bool {
+    paths
+        .iter()
+        .take(100)
+        .any(|path| !export::is_export(path) && (platform::is_uploadable(path) || path.is_dir()))
+}
 
 /// Items taken out of the gallery, to be deleted once the moment to undo
 /// has passed.
@@ -507,19 +529,24 @@ impl PhotoGrid {
             let mut running = FuturesUnordered::new();
             let mut done = 0;
             let mut failures: Vec<SharedString> = Vec::new();
+            let mut sent: Vec<String> = Vec::new();
             loop {
                 while running.len() < PARALLEL_UPLOADS {
                     let Some(item) = queue.next() else {
                         break;
                     };
                     let client = client.clone();
-                    running.push(net::run(move || match item.source {
-                        UploadSource::Bytes(bytes) => client
-                            .upload(&item.name, &bytes, jiff::Timestamp::now().as_millisecond())
-                            .map_err(message),
-                        UploadSource::File(path) => {
-                            client.upload_file(&item.name, &path).map_err(message)
+                    running.push(net::run(move || {
+                        match item.source {
+                            UploadSource::Bytes(bytes) => client.upload(
+                                &item.name,
+                                &bytes,
+                                jiff::Timestamp::now().as_millisecond(),
+                            ),
+                            UploadSource::File(path) => client.upload_file(&item.name, &path),
                         }
+                        .map(|()| item.name)
+                        .map_err(message)
                     }));
                 }
                 let Some(result) = running.next().await else {
@@ -527,7 +554,7 @@ impl PhotoGrid {
                 };
                 done += 1;
                 match result {
-                    Some(Ok(())) => {}
+                    Some(Ok(name)) => sent.push(name),
                     Some(Err(error)) => failures.push(error),
                     None => failures.push("Upload failed.".into()),
                 }
@@ -551,7 +578,17 @@ impl PhotoGrid {
                 Some(error) if total == 1 => Status::Failed(error.clone()),
                 Some(error) => Status::Failed(format!("Added {added} of {total}. {error}").into()),
             };
-            this.update(cx, |this, cx| this.set_status(status, cx)).ok();
+            this.update(cx, |this, cx| {
+                this.set_status(status, cx);
+                if !sent.is_empty() {
+                    this.awaiting = Some(Awaiting {
+                        names: sent,
+                        listed: Vec::new(),
+                        since: std::time::Instant::now(),
+                    });
+                }
+            })
+            .ok();
             if added == 0 {
                 return;
             }
@@ -564,6 +601,52 @@ impl PhotoGrid {
             }
         })
         .detach();
+    }
+
+    /// `items` were just listed by iCloud: if they're uploads being waited
+    /// for, and all of them are now in, offer to show them.
+    pub(crate) fn uploads_listed(&mut self, items: &[IndexItem], cx: &mut Context<Self>) {
+        let Some(awaiting) = self.awaiting.as_mut() else {
+            return;
+        };
+        if awaiting.since.elapsed() > AWAIT_UPLOADS_FOR {
+            self.awaiting = None;
+            return;
+        }
+        for item in items {
+            let Some(name) = item.name.as_deref() else {
+                continue;
+            };
+            if let Some(at) = awaiting.names.iter().position(|n| n == name)
+                && !awaiting.listed.contains(&item.id)
+            {
+                awaiting.names.swap_remove(at);
+                awaiting.listed.push(item.id.clone());
+            }
+        }
+        if !awaiting.names.is_empty() {
+            return;
+        }
+        let Some(awaiting) = self.awaiting.take() else {
+            return;
+        };
+        let ids = awaiting.listed;
+        let count = ids.len();
+        let this = cx.weak_entity();
+        let show = Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+            this.update(cx, |this, cx| this.show_items(&ids, cx)).ok();
+        });
+        self.set_status(
+            Status::Listed {
+                message: format!(
+                    "{} in your library",
+                    plural(count, "The new item is", "new items are")
+                )
+                .into(),
+                show,
+            },
+            cx,
+        );
     }
 
     // ---- Deleting ---------------------------------------------------------
@@ -868,6 +951,20 @@ fn free_name(dir: &Path, name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_photos_videos_and_folders_are_taken() {
+        let photo = PathBuf::from("C:/Pictures/beach.HEIC");
+        let text = PathBuf::from("C:/Pictures/notes.txt");
+        let own = export::dir().join("abc").join("IMG_0001.JPG");
+        assert!(can_upload(std::slice::from_ref(&photo)));
+        assert!(can_upload(&[text.clone(), photo]));
+        assert!(!can_upload(&[text]));
+        // Photos dragged out of Fuji, passing back over its window.
+        assert!(!can_upload(&[own]));
+        assert!(can_upload(&[std::env::temp_dir()]));
+        assert!(!can_upload(&[]));
+    }
 
     #[test]
     fn taken_names_get_a_number() {

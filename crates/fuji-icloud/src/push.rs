@@ -214,16 +214,28 @@ fn sign_nonce(key: &SigningKey, timestamp_ms: u64, kind: NonceKind) -> SignedNon
     }
 }
 
-/// The connection's signed hello, asking for a new token.
-fn connect_message(key: &SigningKey, timestamp_ms: u64) -> Vec<u8> {
+/// The connection's signed hello, asking for a new token, or to go on
+/// with `token` (an earlier connection's, with the same key).
+fn connect_message(key: &SigningKey, timestamp_ms: u64, token: Option<&[u8]>) -> Vec<u8> {
+    use base64::Engine as _;
     let signed = sign_nonce(key, timestamp_ms, NonceKind::Connection);
-    let mut new_connection = Vec::new();
-    pb::varint_field(&mut new_connection, 1, TOKEN_SECONDS);
     let mut v1 = Vec::new();
     pb::bytes_field(&mut v1, 1, &signed.public_key);
     pb::bytes_field(&mut v1, 2, &signed.nonce);
     pb::bytes_field(&mut v1, 3, &signed.signature);
-    pb::bytes_field(&mut v1, 5, &new_connection);
+    match token {
+        Some(token) => {
+            let mut again = Vec::new();
+            let text = base64::engine::general_purpose::STANDARD.encode(token);
+            pb::bytes_field(&mut again, 1, text.as_bytes());
+            pb::bytes_field(&mut v1, 4, &again);
+        }
+        None => {
+            let mut new_connection = Vec::new();
+            pb::varint_field(&mut new_connection, 1, TOKEN_SECONDS);
+            pb::bytes_field(&mut v1, 5, &new_connection);
+        }
+    }
     let mut message = Vec::new();
     pb::bytes_field(&mut message, 1, &v1);
     message
@@ -267,7 +279,7 @@ fn set_read_timeout(socket: &WebSocket<MaybeTlsStream<TcpStream>>, timeout: Opti
 }
 
 impl PushConnection {
-    /// Connect to `host` and subscribe to `topics`.
+    /// Connect to `host` and subscribe to `topics`, with a new key.
     pub fn connect(host: &str, topics: &[&str]) -> Result<Self, PushError> {
         let key = loop {
             let mut bytes = [0u8; 32];
@@ -276,10 +288,40 @@ impl PushConnection {
                 break key;
             }
         };
+        Self::open(host, topics, key, None)
+    }
+
+    /// Connect again as an earlier connection: its key
+    /// ([`Self::key_bytes`]) and token. The token stays the same, so what
+    /// was registered with it still reaches us. If Apple won't take it
+    /// back (it expired), this is a new connection with a new token.
+    pub fn reconnect(
+        host: &str,
+        topics: &[&str],
+        key: &[u8],
+        token: &[u8],
+    ) -> Result<Self, PushError> {
+        if let Ok(key) = SigningKey::from_slice(key)
+            && let Ok(conn) = Self::open(host, topics, key, Some(token))
+        {
+            return Ok(conn);
+        }
+        Self::connect(host, topics)
+    }
+
+    fn open(
+        host: &str,
+        topics: &[&str],
+        key: SigningKey,
+        token: Option<&[u8]>,
+    ) -> Result<Self, PushError> {
         let mut timestamp = now_ms();
         // The widget tries three times; a wrong clock gets the server's time.
         for _ in 0..3 {
-            let url = format!("wss://{host}/v2/{}", hex(&connect_message(&key, timestamp)));
+            let url = format!(
+                "wss://{host}/v2/{}",
+                hex(&connect_message(&key, timestamp, token))
+            );
             let mut request = url
                 .into_client_request()
                 .map_err(|e| PushError::Connect(e.to_string()))?;
@@ -323,6 +365,11 @@ impl PushConnection {
             }
         }
         Err(PushError::Refused(2))
+    }
+
+    /// The connection's private key, to connect again as the same client.
+    pub fn key_bytes(&self) -> Vec<u8> {
+        self.key.to_bytes().to_vec()
     }
 
     /// The token as the sign-in widget sends it (`ptkn`): hex.
@@ -503,7 +550,7 @@ mod tests {
     #[test]
     fn connect_message_is_signed() {
         let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let msg = connect_message(&key, 0x0102_0304_0506_0708);
+        let msg = connect_message(&key, 0x0102_0304_0506_0708, None);
         let outer = pb::fields(&msg).unwrap();
         let v1 = pb::fields(pb::get_bytes(&outer, 1).unwrap()).unwrap();
         let public = pb::get_bytes(&v1, 1).unwrap();
@@ -552,5 +599,27 @@ mod tests {
         let jwt = conn.jwt().unwrap();
         println!("jwt: {} chars, {} parts", jwt.len(), jwt.split('.').count());
         conn.close();
+    }
+
+    /// Live (no account involved): does reconnecting with the same key give
+    /// the same token? Prints only whether the tokens match.
+    #[test]
+    #[ignore]
+    fn live_same_key_same_token() {
+        let topic = crate::ids::ICLOUD_WEB_TOPIC;
+        let first = PushConnection::connect(PROD_HOST, &[topic]).unwrap();
+        let key = first.key_bytes();
+        let token = first.token.clone();
+        first.close();
+        let again = PushConnection::open(
+            PROD_HOST,
+            &[topic],
+            SigningKey::from_slice(&key).unwrap(),
+            Some(&token),
+        );
+        println!("reconnect accepted: {}", again.is_ok());
+        if let Ok(again) = again {
+            println!("same token: {}", again.token == token);
+        }
     }
 }

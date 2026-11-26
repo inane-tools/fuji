@@ -52,8 +52,37 @@ pub struct Skybridge {
     push: PushConnection,
     identity: IdsIdentity,
     registration: IdsRegistration,
+    registered_at: u64,
     devices: Vec<Device>,
     counter: u32,
+    dsid: String,
+    reused: bool,
+}
+
+/// A connection kept between runs (see [`Skybridge::saved`]): the same push
+/// token, IDS identity and registration, so a new run doesn't register a
+/// new endpoint with Apple each time. Holds private keys: store it safely.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SavedBridge {
+    dsid: String,
+    push_key: String,
+    push_token: String,
+    identity: String,
+    registration: IdsRegistration,
+    /// Seconds since the Unix epoch.
+    registered_at: u64,
+    /// The last message counter used, so the device sees them go on rising.
+    counter: u32,
+}
+
+/// How long a registration is used again before registering anew (the
+/// device lookup still checks it every run).
+const REGISTRATION_KEPT: u64 = 7 * 24 * 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn uuid_bytes(id: &str) -> Vec<u8> {
@@ -135,11 +164,13 @@ impl AuthClient {
 }
 
 impl Skybridge {
-    /// Connect push, register with IDS (as `identity`) and find the account's
-    /// devices under `handle` (e.g. "mailto:<apple id>").
+    /// Connect push, register with IDS and find the account's devices under
+    /// `handle` (e.g. "mailto:<apple id>"). With `saved` (from an earlier
+    /// run on this account), it goes on as that connection: same push
+    /// token, identity and, while it's good, registration.
     pub fn connect(
         auth: &AuthClient,
-        identity: IdsIdentity,
+        saved: Option<&SavedBridge>,
         dsid: &str,
         handle: &str,
     ) -> Result<Self, AuthError> {
@@ -149,11 +180,49 @@ impl Skybridge {
                 eprintln!("skybridge: {what} at {:?}", timer.elapsed());
             }
         };
-        let mut push = PushConnection::connect(PROD_HOST, &[ICLOUD_WEB_TOPIC])?;
+        let saved = saved.filter(|s| s.dsid == dsid);
+        let old = saved.and_then(|s| {
+            Some((
+                s,
+                BASE64.decode(&s.push_key).ok()?,
+                BASE64.decode(&s.push_token).ok()?,
+                IdsIdentity::from_json(&s.identity)?,
+            ))
+        });
+        let (mut push, identity, kept, counter) = match old {
+            Some((s, key, token, identity)) => {
+                let push = PushConnection::reconnect(PROD_HOST, &[ICLOUD_WEB_TOPIC], &key, &token)?;
+                let fresh = now_secs().saturating_sub(s.registered_at) < REGISTRATION_KEPT;
+                let kept = (push.token == token && fresh)
+                    .then(|| (s.registration.clone(), s.registered_at));
+                (push, identity, kept, s.counter)
+            }
+            None => (
+                PushConnection::connect(PROD_HOST, &[ICLOUD_WEB_TOPIC])?,
+                IdsIdentity::generate()?,
+                None,
+                0,
+            ),
+        };
         lap("push connected");
-        let registration = auth.ids_register(&mut push, &identity, dsid)?;
-        lap("registered");
-        let endpoints = auth.ids_query(&push, &registration, handle, ICLOUD_WEB_TOPIC)?;
+        let reused = kept.is_some();
+        let found = match kept {
+            Some((registration, at)) => auth
+                .ids_query(&push, &registration, handle, ICLOUD_WEB_TOPIC)
+                .map(|endpoints| (registration, at, endpoints))
+                .ok(),
+            None => None,
+        };
+        let (registration, registered_at, endpoints) = match found {
+            Some(found) => found,
+            // New, or what was kept no longer works: register (again).
+            None => {
+                let registration = auth.ids_register(&mut push, &identity, dsid)?;
+                lap("registered");
+                let endpoints = auth.ids_query(&push, &registration, handle, ICLOUD_WEB_TOPIC)?;
+                (registration, now_secs(), endpoints)
+            }
+        };
         lap("devices found");
         let devices = endpoints
             .into_iter()
@@ -168,9 +237,30 @@ impl Skybridge {
             push,
             identity,
             registration,
+            registered_at,
             devices,
-            counter: 0,
+            counter,
+            dsid: dsid.to_string(),
+            reused,
         })
+    }
+
+    /// Whether this went on with a registration kept from an earlier run.
+    pub fn reused(&self) -> bool {
+        self.reused
+    }
+
+    /// What to keep to connect again as this connection next run.
+    pub fn saved(&self) -> SavedBridge {
+        SavedBridge {
+            dsid: self.dsid.clone(),
+            push_key: BASE64.encode(self.push.key_bytes()),
+            push_token: BASE64.encode(&self.push.token),
+            identity: self.identity.to_json(),
+            registration: self.registration.clone(),
+            registered_at: self.registered_at,
+            counter: self.counter,
+        }
     }
 
     pub fn device_count(&self) -> usize {

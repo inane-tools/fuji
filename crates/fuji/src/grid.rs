@@ -36,7 +36,7 @@ use crate::layout::{self, Layout, RowKind, Span};
 use crate::scrubber::{self, Track};
 use crate::search::Query;
 use crate::settings::{self, Settings};
-use crate::transfer::{PendingUpload, Trash};
+use crate::transfer::{Awaiting, PendingUpload, Trash};
 use crate::ui::{self, MenuItem, Status};
 use crate::viewer::{Viewer, ViewerEvent};
 use crate::{net, theme, thumbs};
@@ -119,6 +119,9 @@ const TOAST_TIMEOUT: Duration = Duration::from_secs(4);
 /// How often the library checks iCloud for changes made elsewhere. Each
 /// check is one small request when nothing changed.
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+/// How long changes from the feed are remembered, to lay over a rescan:
+/// iCloud's listing can lag the feed by a while.
+const RECENT_FOR: Duration = Duration::from_secs(10 * 60);
 
 pub enum GridEvent {
     SessionExpired,
@@ -267,6 +270,12 @@ pub struct PhotoGrid {
     /// How many more items iCloud counted than the last full scan listed
     /// (records it counts but can't return). A sync expects the same gap.
     count_gap: isize,
+    /// Quiet syncs in a row whose count didn't fit `count_gap`.
+    gap_misses: u8,
+    /// What the change feed brought lately (`None`: removed), newest last.
+    recent: Vec<(Instant, String, Option<IndexItem>)>,
+    /// Uploads iCloud hasn't listed yet.
+    pub(crate) awaiting: Option<Awaiting>,
     layout: Option<Layout>,
     layout_dirty: bool,
     // Full records (download URLs), by page of rank.
@@ -386,6 +395,9 @@ impl PhotoGrid {
             syncing: None,
             page_epoch: 0,
             count_gap: 0,
+            gap_misses: 0,
+            recent: Vec::new(),
+            awaiting: None,
             layout: None,
             layout_dirty: true,
             assets: HashMap::new(),
@@ -648,6 +660,8 @@ impl PhotoGrid {
         self.syncing = None;
         self.page_epoch += 1;
         self.count_gap = 0;
+        self.gap_misses = 0;
+        self.recent.clear();
         self.state = LoadState::Loading;
         self.index.clear();
         self.days.clear();
@@ -842,7 +856,7 @@ impl PhotoGrid {
                 }
                 this.syncing = None;
                 match result {
-                    Some(Ok((changes, count))) => this.changes_arrived(changes, count, cx),
+                    Some(Ok((changes, count))) => this.changes_arrived(changes, count, shown, cx),
                     Some(Err(PhotosError::SessionExpired)) => cx.emit(GridEvent::SessionExpired),
                     // Offline for a moment: keep the token for the next try.
                     Some(Err(PhotosError::Network(err))) => {
@@ -867,7 +881,14 @@ impl PhotoGrid {
         .detach();
     }
 
-    fn changes_arrived(&mut self, changes: LibraryChanges, count: usize, cx: &mut Context<Self>) {
+    fn changes_arrived(
+        &mut self,
+        changes: LibraryChanges,
+        count: usize,
+        shown: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let quiet = changes.assets.is_empty() && changes.removed.is_empty();
         let mut removed: HashSet<String> = changes.removed.into_iter().collect();
         let mut changed = Vec::new();
         for asset in &changes.assets {
@@ -878,17 +899,57 @@ impl PhotoGrid {
                 removed.insert(item.id);
             }
         }
+        let now = Instant::now();
+        self.recent
+            .retain(|(at, ..)| now.duration_since(*at) < RECENT_FOR);
+        for id in &removed {
+            self.recent.push((now, id.clone(), None));
+        }
+        for item in &changed {
+            self.recent.push((now, item.id.clone(), Some(item.clone())));
+        }
+        self.uploads_listed(&changed, cx);
         let moved = self.apply_album_changes(changed, &removed);
         let token_moved = self.token.as_deref() != Some(changes.token.as_str());
         self.token = Some(changes.token);
-        if count as isize - self.album_len() as isize != self.count_gap {
-            // Out of step (an edge the feed doesn't show): rescan.
-            self.token = None;
-            self.refresh(false, cx);
-            return;
+        if count as isize - self.album_len() as isize == self.count_gap {
+            self.gap_misses = 0;
+        } else if quiet {
+            // iCloud's count lags the feed for a while after a change, so
+            // only a count that stays out of step means something was
+            // missed (an edge the feed doesn't show): then rescan.
+            self.gap_misses += 1;
+            if shown || self.gap_misses >= 2 {
+                self.gap_misses = 0;
+                self.token = None;
+                self.refresh(false, cx);
+                return;
+            }
         }
         if moved || token_moved {
             self.save_index(cx);
+        }
+    }
+
+    /// Lay what the feed brought lately over a fresh scan, which may have
+    /// been listed from before iCloud caught up with it.
+    fn reapply_recent(&mut self) {
+        let mut latest: HashMap<String, Option<IndexItem>> = HashMap::new();
+        for (_, id, item) in &self.recent {
+            latest.insert(id.clone(), item.clone());
+        }
+        let mut removed = HashSet::new();
+        let mut changed = Vec::new();
+        for (id, item) in latest {
+            match item {
+                Some(item) if self.album_keeps(&item) => changed.push(item),
+                _ => {
+                    removed.insert(id);
+                }
+            }
+        }
+        if !changed.is_empty() || !removed.is_empty() {
+            self.apply_album_changes(changed, &removed);
         }
     }
 
@@ -1005,7 +1066,13 @@ impl PhotoGrid {
                     self.set_index(scan.fresh);
                 }
                 self.count_gap = scan.count as isize - self.album_len() as isize;
+                self.gap_misses = 0;
                 self.forget_pages();
+                self.reapply_recent();
+                if !progressive {
+                    let listed = self.album_items().to_vec();
+                    self.uploads_listed(&listed, cx);
+                }
             }
             // Items deleted while the scan ran stay out.
             if let Some(trash) = &self.trash {
@@ -1272,6 +1339,30 @@ impl PhotoGrid {
         self.viewer = Some((viewer, subscription));
         self.menu = None;
         self.press = None;
+        cx.notify();
+    }
+
+    /// Select the items with these ids and scroll the first into view.
+    pub(crate) fn show_items(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        if self.viewer.is_some() {
+            return;
+        }
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        self.selected = self
+            .index
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| wanted.contains(item.id.as_str()))
+            .map(|(ix, _)| ix)
+            .collect();
+        self.select_anchor = None;
+        self.toast = None;
+        if let Some(&first) = self.selected.iter().next()
+            && let Some(row) = self.layout.as_ref().and_then(|l| l.row_of_item(first))
+        {
+            let viewport = f32::from(self.scroll.bounds().size.height);
+            self.scroll_toward(row.y + row.height / 2. - viewport / 2., cx);
+        }
         cx.notify();
     }
 
@@ -1625,7 +1716,7 @@ impl PhotoGrid {
         let serial = self.toast_serial;
         let finished = !matches!(status, Status::Working(_));
         let linger = match status {
-            Status::Undoable { .. } => crate::transfer::UNDO_WINDOW,
+            Status::Undoable { .. } | Status::Listed { .. } => crate::transfer::UNDO_WINDOW,
             _ => TOAST_TIMEOUT,
         };
         self.toast = Some((serial, status));
@@ -2354,7 +2445,13 @@ impl Render for PhotoGrid {
             .flex()
             .flex_col()
             .bg(theme::surface())
-            // Files and folders dropped in are offered for upload.
+            // Files and folders dropped in are offered for upload; anything
+            // else (photos dragged out of Fuji passing back over it) isn't.
+            .can_drop(|value, _, _| {
+                value
+                    .downcast_ref::<ExternalPaths>()
+                    .is_some_and(|paths| crate::transfer::can_upload(paths.paths()))
+            })
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.dropped(paths.paths().to_vec(), cx)
             }))
@@ -2975,9 +3072,19 @@ struct TileLook {
 }
 
 /// A small label on a tile, readable on any photo.
-/// Shown over the gallery while files are dragged over the window.
+/// Shown over the gallery while files it can upload are dragged over
+/// the window (hidden for anything else).
 fn drop_hint() -> impl IntoElement {
     div()
+        .id("drop-hint")
+        .opacity(0.)
+        .drag_over::<ExternalPaths>(|style, paths, _, _| {
+            if crate::transfer::can_upload(paths.paths()) {
+                style.opacity(1.)
+            } else {
+                style
+            }
+        })
         .absolute()
         .inset(px(8.))
         .rounded(px(16.))
