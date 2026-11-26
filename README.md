@@ -34,7 +34,12 @@ iCloud library, without a Mac.
   icloud.com does, so searches like “dog” or “beach” find what the phone's
   on-device index knows.
 - **Getting photos out and in:** copy (images and files), download originals,
-  drag photos out to other apps, and paste to upload.
+  drag photos out to other apps, and upload with the button, by dropping
+  files or folders on the gallery, or by pasting.
+- **Keeping it tidy:** favorite, and delete with a few seconds to undo.
+  Changes made on other devices show up within seconds.
+- **Live Photos** play their motion: point at LIVE by the name, or press and
+  hold the photo.
 - **Looks like it belongs:** light and dark mode, Windows' accent color or
   Apple's blue, and a custom title bar that still snaps and drags like any
   window.
@@ -47,23 +52,27 @@ iCloud library, without a Mac.
 The screenshots show a made-up library; its photos are public domain or CC0
 ([credits](docs/screenshots/CREDITS.md)).
 
-Not yet: Live Photo motion, editing (favorite, hide, delete, add to album),
-People and Trips (not available on the web), and the iCloud Shared Library.
+Not yet: hiding, adding to albums, People and Trips (not available on the
+web), and the iCloud Shared Library.
 
 ## Getting started
 
-Fuji is built from source for now.
-
-1. Install [Rust](https://rustup.rs) (stable; see `rust-toolchain.toml`).
-2. Clone this repository and run:
-
-   ```sh
-   cargo run --release -p fuji
-   ```
-
-3. Sign in with your Apple Account. Fuji asks your devices to approve the
+1. Download Fuji for your system from the
+   [latest release](https://github.com/inane-tools/fuji/releases/latest):
+   `fuji-windows-x86_64.exe` or `fuji-linux-x86_64`. It's a single program;
+   put it where you keep apps and run it. Fuji tells you when there's a
+   new version (a ring on your account picture) and installs it when you
+   choose (Settings → About).
+2. Sign in with your Apple Account. Fuji asks your devices to approve the
    sign-in, the same way a new browser does; enter the code shown on your
    iPhone. Approving this way also pairs Fuji with the iPhone for search.
+
+To build it yourself instead, install [Rust](https://rustup.rs) (stable; see
+`rust-toolchain.toml`), clone this repository and run:
+
+```sh
+cargo run --release -p fuji
+```
 
 **Windows** needs the MSVC build tools. Keep the checkout at a short path:
 build files nest deeply and fail to link past Windows' 260-character path
@@ -88,20 +97,24 @@ for now.
 | Where | Keys |
 | --- | --- |
 | Anywhere | Ctrl+F search, Esc to clear it |
-| Gallery | Ctrl+A select all, Ctrl+C copy, Ctrl+S download, Ctrl+V paste to upload, Esc clear the selection |
+| Gallery | Ctrl+A select all, Ctrl+C copy, Ctrl+S download, Ctrl+V paste to upload, . favorite, Del delete, Esc clear the selection |
 | Gallery zoom | Ctrl+scroll, Ctrl+= and Ctrl+-, Ctrl+0 to reset |
-| Viewer | ← → previous and next, Esc close, + − 0 zoom (or double-click), Ctrl+C copy, Ctrl+S download, Space play or pause |
+| Viewer | ← → previous and next, Esc close, + − 0 zoom (or double-click), Ctrl+C copy, Ctrl+S download, . favorite, Space play or pause |
 
 ## Privacy
 
 - Fuji talks only to Apple's iCloud services. There's no telemetry and no
-  server of its own. The one exception is “Show on map” in a photo's info,
-  which opens OpenStreetMap in your browser when you click it.
+  server of its own. Two exceptions: it asks GitHub for new releases of
+  Fuji (at startup and a few times a day; turn it off in Settings → About), and “Show on
+  map” in a photo's info opens OpenStreetMap in your browser when you click
+  it.
 - Your session tokens, the key that encrypts your saved cookies, and the
   iPhone pairing key are kept in the system's credential store (Windows
   Credential Manager, or the Secret Service on Linux), never in plain files.
 - Thumbnails, previews and the library index are cached in your local
   app-data folder, and Settings shows how much space they use and can clear it.
+- If Fuji crashes, what happened is written to `crash.log` in the same
+  folder, for you to look at or share; nothing is sent anywhere.
 
 ## Development
 
@@ -117,12 +130,17 @@ cargo fmt                     # formatting
 ```
 
 A few tests are marked `#[ignore]` because they talk to Apple. Some use a
-made-up address; others read (never change) the library of the account you
-signed in to Fuji with, and print only counts:
+made-up address; others read the library of the account you signed in to
+Fuji with, and print only counts. `live_upload_delete` changes the library
+(it uploads a small test image and deletes it again), so run it only on
+purpose:
 
 ```sh
 cargo test -p fuji live_collections -- --ignored --nocapture
 ```
+
+Releases are built, signed and published by CI when a version tag is pushed;
+see [docs/releasing.md](docs/releasing.md).
 
 GPUI is pre-1.0, so it's pinned to an exact version in the workspace
 `Cargo.toml`; upgrade it on purpose. Run with `FUJI_DEBUG=1` to log the sign-in

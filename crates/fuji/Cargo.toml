@@ -16,12 +16,14 @@ futures = "0.3.34"
 gpui.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jiff = "0.2.43"
+p256 = { version = "0.14.0", features = ["arithmetic", "ecdsa"] }
 keyring = { version = "3.6", features = ["windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 raw-window-handle = "0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 unicode-segmentation = "1.13.3"
+ureq = { version = "3.5.2", features = ["json"] }
 smallvec = "1"
 
 [target.'cfg(windows)'.dependencies]

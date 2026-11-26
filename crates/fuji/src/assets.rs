@@ -2,7 +2,7 @@
 //!
 //! Icons are Framework7 Icons (MIT, see assets/icons/LICENSE-framework7),
 //! drawn to match Apple's SF Symbols: outline when idle, fill when active.
-//! The spinner is drawn for Fuji; the brand marks on Settings' About are
+//! The spinner and the update mark are drawn for Fuji; the brand marks on Settings' About are
 //! Boxicons' GitHub and Bluesky's own (both MIT). The UI font, Gabarito, is under the
 //! OFL (assets/OFL-Gabarito.txt), with its letter spacing tightened by
 //! 2% of an em (scripts/track_font.py), since GPUI can't set tracking.
@@ -30,6 +30,7 @@ impl AssetSource for Assets {
             [
                 "library",
                 "library-active",
+                "update",
                 "favorites",
                 "favorites-active",
                 "videos",
@@ -126,6 +127,7 @@ mod tests {
             "check",
             "settings-active",
             "upload",
+            "update",
         ] {
             let bytes = Assets.load(&format!("icons/{name}.svg")).unwrap().unwrap();
             assert!(bytes.starts_with(b"<svg"));

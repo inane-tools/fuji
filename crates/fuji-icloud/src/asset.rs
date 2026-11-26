@@ -46,7 +46,7 @@ pub struct Asset {
     /// The `CPLMaster` record behind it, for looking up its details.
     pub master: Option<String>,
     /// For videos, a rendition to play (H.264 at a medium size when iCloud
-    /// made one, else the original).
+    /// made one, else the original); for Live Photos, their motion.
     pub video: Option<Resource>,
 }
 

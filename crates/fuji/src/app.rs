@@ -362,6 +362,17 @@ impl FujiApp {
                 ),
             );
             grid.focus_handle(cx).focus(window);
+            if crate::crash::crashed_last_time() {
+                grid.update(cx, |grid, cx| {
+                    let message =
+                        "Fuji closed unexpectedly last time. What happened is in crash.log.";
+                    let status = crate::ui::Status::Done {
+                        message: message.into(),
+                        reveal: crate::crash::log_path(),
+                    };
+                    grid.set_status(status, cx)
+                });
+            }
         }
 
         let name = display_name(&account);
@@ -916,7 +927,16 @@ impl FujiApp {
         cx.notify();
     }
 
-    /// The account's picture and name, then Settings and Log Out.
+    /// Settings, scrolled to the updates in its About card.
+    fn show_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Section::Settings, window, cx);
+        if let Screen::Main { settings, .. } = &self.screen {
+            settings.read(cx).show_updates();
+        }
+    }
+
+    /// The account's picture and name (then any update waiting), Settings
+    /// and Log Out.
     fn render_account_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let (serial, at) = self.account_menu?;
         let Screen::Main { account, .. } = &self.screen else {
@@ -958,8 +978,20 @@ impl FujiApp {
             )
             .into_any_element();
         let this = cx.entity().downgrade();
-        let (to_settings, to_sign_out, on_dismiss) = (this.clone(), this.clone(), this);
-        let items = vec![
+        let (to_updates, to_settings, to_sign_out, on_dismiss) =
+            (this.clone(), this.clone(), this.clone(), this);
+        let mut items = Vec::new();
+        if let Some(label) = crate::updater::pending_label(cx) {
+            items.push(
+                ui::MenuItem::new("update", label, move |window, cx| {
+                    to_updates
+                        .update(cx, |this, cx| this.show_updates(window, cx))
+                        .ok();
+                })
+                .tint(theme::update()),
+            );
+        }
+        items.extend([
             ui::MenuItem::new("settings", "Settings", move |window, cx| {
                 to_settings
                     .update(cx, |this, cx| this.select(Section::Settings, window, cx))
@@ -970,7 +1002,7 @@ impl FujiApp {
                     .update(cx, |this, cx| this.sign_out(window, cx))
                     .ok();
             }),
-        ];
+        ]);
         Some(ui::popup_menu(
             serial,
             at,
@@ -1137,6 +1169,8 @@ impl FujiApp {
             tabs
         });
 
+        // A newer version waiting: a ring and a badge on the account picture.
+        let update = crate::updater::pending_label(cx);
         let right = main.then(|| {
             let (name, avatar) = match &self.screen {
                 Screen::Main { account, .. } => (display_name(account), self.avatar.clone()),
@@ -1180,8 +1214,38 @@ impl FujiApp {
                         .hover(|el| el.bg(theme::hover()))
                         .when(self.account_menu.is_some(), |el| el.bg(theme::hover()))
                         .on_click(cx.listener(|this, _, _, cx| this.open_account_menu(cx)))
+                        .tooltip(ui::tooltip(match &update {
+                            Some(label) => format!("{name} \u{00b7} {label}"),
+                            None => name.clone(),
+                        }))
                         .child(self.measured(Section::Settings.tab_key()))
-                        .child(ui::avatar(avatar, &name, px(22.))),
+                        .child(
+                            div()
+                                .rounded_full()
+                                .when(update.is_some(), |el| {
+                                    el.border_2().border_color(theme::update())
+                                })
+                                .child(ui::avatar(
+                                    avatar,
+                                    &name,
+                                    px(if update.is_some() { 20. } else { 22. }),
+                                )),
+                        )
+                        .when(update.is_some(), |el| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .right(px(-2.))
+                                    .bottom(px(-2.))
+                                    .size(px(13.))
+                                    .rounded_full()
+                                    .bg(theme::surface())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(crate::assets::icon("update", px(11.), theme::update())),
+                            )
+                        }),
                 )
         });
 

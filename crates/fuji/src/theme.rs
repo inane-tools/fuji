@@ -145,6 +145,11 @@ pub fn warn_fill() -> Hsla {
     pick_alpha(0xf59e0b0d, 0xf59e0b1f)
 }
 
+/// An update waiting: the ring on the account picture and its badge.
+pub fn update() -> Hsla {
+    pick(0xfbbf24, 0xd97706)
+}
+
 // Rounding by role
 /// Buttons, fields and tabs are pills (GPUI clamps this to half the height).
 pub const RADIUS_CONTROL: Pixels = px(999.);

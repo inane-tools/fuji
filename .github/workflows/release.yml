@@ -1,0 +1,118 @@
+# Builds, signs and publishes a release when a version tag (v1.2.3) is
+# pushed. Fuji's updater downloads `fuji-<system>-<arch>[.exe]` and checks
+# it against `<file>.sig`, signed here with the UPDATE_SIGNING_KEY secret
+# (see docs/releasing.md).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            binary: target/release/fuji.exe
+            asset: fuji-windows-x86_64.exe
+          - name: Linux
+            # The oldest supported runner, so the binary runs on older glibc.
+            os: ubuntu-22.04
+            binary: target/release/fuji
+            asset: fuji-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match the workspace version $version" >&2
+            exit 1
+          fi
+
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxi-dev libxcursor-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev libdbus-1-dev \
+            libssl-dev libzstd-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release -p fuji
+
+      - name: Name the file
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Sign and publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Sign
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "The UPDATE_SIGNING_KEY secret isn't set" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl ec -in "$RUNNER_TEMP/key.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          cd dist
+          for file in fuji-*; do
+            openssl dgst -sha256 -sign "$RUNNER_TEMP/key.pem" -out "$file.sig" "$file"
+            # Check each signature as Fuji will.
+            openssl dgst -sha256 -verify "$RUNNER_TEMP/public.pem" -signature "$file.sig" "$file"
+          done
+          rm -f "$RUNNER_TEMP/key.pem"
+          sha256sum fuji-* > SHA256SUMS
+          ls -l
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Fuji $version" \
+            --generate-notes \
+            --verify-tag

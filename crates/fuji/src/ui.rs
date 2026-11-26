@@ -71,7 +71,7 @@ pub fn text_button(
 
 /// The one filled button of a dialog: accent, or red for something destructive. (Its hover
 /// is set here once: GPUI panics if an element's hover is set twice.)
-fn filled_button(
+pub fn filled_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     destructive: bool,
@@ -448,6 +448,8 @@ pub struct MenuItem {
     icon: &'static str,
     label: SharedString,
     hint: Option<&'static str>,
+    /// The icon's color, when it isn't the usual one.
+    tint: Option<Hsla>,
     separated: bool,
     run: Handler,
 }
@@ -462,6 +464,7 @@ impl MenuItem {
             icon,
             label: label.into(),
             hint: None,
+            tint: None,
             separated: false,
             run: Rc::new(run),
         }
@@ -470,6 +473,12 @@ impl MenuItem {
     /// The keyboard shortcut, shown on the right.
     pub fn hint(mut self, hint: &'static str) -> Self {
         self.hint = Some(hint);
+        self
+    }
+
+    /// Color the icon.
+    pub fn tint(mut self, color: Hsla) -> Self {
+        self.tint = Some(color);
         self
     }
 
@@ -529,7 +538,11 @@ pub fn popup_menu(
                         dismiss(window, cx);
                         run(window, cx);
                     })
-                    .child(icon(item.icon, px(16.), theme::text_muted()))
+                    .child(icon(
+                        item.icon,
+                        px(16.),
+                        item.tint.unwrap_or_else(theme::text_muted),
+                    ))
                     .child(div().flex_1().child(item.label))
                     .when_some(item.hint, |el, hint| {
                         el.child(

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, EventEmitter, FontWeight, Global, ImageSource, Resource, SharedString,
-    Subscription, Window, div, img, prelude::*, px,
+    App, Context, EventEmitter, FontWeight, Global, ImageSource, Resource, ScrollHandle,
+    SharedString, Subscription, Window, div, img, prelude::*, px,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,8 @@ pub struct Settings {
     pub appearance: Appearance,
     /// The system's accent color, or Apple's blue.
     pub accent: Accent,
+    /// Look for new versions on GitHub, and get them ready to install.
+    pub auto_update: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,7 @@ impl Default for Settings {
             row_height: DEFAULT_ROW_HEIGHT,
             appearance: Appearance::default(),
             accent: Accent::default(),
+            auto_update: true,
         }
     }
 }
@@ -132,6 +135,7 @@ impl Settings {
             return;
         }
         anim::set_reduced(settings.reduce_motion);
+        crate::updater::set_automatic(settings.auto_update, cx);
         cx.set_global(settings.clone());
         // Colors may have changed: redraw everything.
         cx.refresh_windows();
@@ -171,6 +175,7 @@ pub struct SettingsView {
     flipped: Option<&'static str>,
     /// The Open Source list is open.
     credits_open: bool,
+    scroll: ScrollHandle,
     _settings: Subscription,
 }
 
@@ -192,6 +197,7 @@ impl SettingsView {
             clearing: false,
             flipped: None,
             credits_open: false,
+            scroll: ScrollHandle::new(),
             _settings: cx.observe_global::<Settings>(|_, cx| cx.notify()),
         };
         view.measure_cache(cx);
@@ -243,6 +249,180 @@ impl SettingsView {
             .ok();
         })
         .detach();
+    }
+
+    /// The About card's updates: where updating stands, what can be done
+    /// about it, and whether Fuji looks by itself.
+    fn render_updates(
+        &self,
+        settings: &Settings,
+        flipped: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        use crate::updater::{self, State};
+        let state = updater::state(cx);
+        let busy = matches!(
+            state,
+            State::Checking | State::Downloading { .. } | State::Installing
+        );
+        let (status, error): (SharedString, bool) = match &state {
+            State::Idle if settings.auto_update => (
+                "Checks at startup. Downloads and installation start when you choose.".into(),
+                false,
+            ),
+            State::Idle => (
+                "Checking by itself is off. Downloads and installation start when you choose."
+                    .into(),
+                false,
+            ),
+            State::Checking => ("Checking for updates\u{2026}".into(), false),
+            State::UpToDate => ("You\u{2019}re up to date.".into(), false),
+            State::Available {
+                version,
+                asset: Some(_),
+            } => (format!("Fuji {version} is available.").into(), false),
+            State::Available {
+                version,
+                asset: None,
+            } => (
+                format!("Fuji {version} is available on the releases page.").into(),
+                false,
+            ),
+            State::Downloading { percent, .. } => {
+                (format!("Downloading \u{00b7} {percent}%").into(), false)
+            }
+            State::Ready { version, .. } => (
+                format!("Fuji {version} is ready. Installing will close and restart Fuji.").into(),
+                false,
+            ),
+            State::Installing => ("Installing and restarting\u{2026}".into(), false),
+            State::Failed(message) => (message.clone(), true),
+        };
+
+        let main_action = match &state {
+            State::Ready { .. } => Some(ui::filled_button(
+                "update-install",
+                "Install and restart",
+                false,
+                |_, _, cx| updater::install(cx),
+            )),
+            State::Available { asset: Some(_), .. } => Some(ui::filled_button(
+                "update-download",
+                "Download",
+                false,
+                |_, _, cx| updater::download(cx),
+            )),
+            State::Available { asset: None, .. } => Some(ui::filled_button(
+                "update-page",
+                "Releases page",
+                false,
+                |_, _, cx| cx.open_url(&updater::releases_page()),
+            )),
+            _ => None,
+        };
+        let check = ui::text_button(
+            "update-check",
+            None,
+            if busy {
+                "Please wait\u{2026}"
+            } else {
+                "Check for updates"
+            },
+            move |_, _, cx| {
+                if !busy {
+                    updater::check(true, cx)
+                }
+            },
+        )
+        .when(busy, |el| el.opacity(0.5).cursor_default());
+
+        let progress = match &state {
+            State::Downloading { percent, .. } => Some(*percent),
+            _ => None,
+        };
+
+        div()
+            .mt(px(16.))
+            .pt(px(16.))
+            .border_t_1()
+            .border_color(theme::hover())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("Updates"),
+                    )
+                    .when(updater::pending(cx).is_some(), |el| {
+                        el.child(crate::assets::icon("update", px(14.), theme::update()))
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(if error {
+                        theme::danger()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .child(status),
+            )
+            .when_some(progress, |el, percent| {
+                el.child(
+                    div()
+                        .h(px(6.))
+                        .w_full()
+                        .flex()
+                        .rounded_full()
+                        .overflow_hidden()
+                        .bg(theme::fill_hover())
+                        .child(
+                            div()
+                                .flex_none()
+                                .h(px(6.))
+                                .w(gpui::relative(f32::from(percent.max(2)) / 100.))
+                                .rounded_full()
+                                .bg(theme::accent_text()),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(main_action)
+                    .child(check)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_meta())
+                            .child("Check automatically"),
+                    )
+                    .child(ui::switch(
+                        "auto-update",
+                        settings.auto_update,
+                        flipped == Some("auto-update"),
+                        cx.listener(|this, _, _, cx| {
+                            this.flip("auto-update", cx, |s| s.auto_update = !s.auto_update)
+                        }),
+                    )),
+            )
+    }
+
+    /// Bring the updates (at the bottom, in About) into view.
+    pub fn show_updates(&self) {
+        self.scroll.scroll_to_bottom();
     }
 
     fn flip(&mut self, id: &'static str, cx: &mut Context<Self>, change: fn(&mut Settings)) {
@@ -499,6 +679,8 @@ impl Render for SettingsView {
             (false, Some(bytes)) => format!("Using {} on this computer.", format_bytes(bytes)),
             (false, None) => "Measuring\u{2026}".to_string(),
         };
+        let updates = self.render_updates(&settings, flipped, cx);
+
         let storage = section(Tone::Default)
             .child(heading("Storage", None))
             .child(row(
@@ -646,6 +828,7 @@ impl Render for SettingsView {
                         |_, _, cx| cx.open_url(&format!("{REPOSITORY}/releases")),
                     )),
             )
+            .child(updates)
             .child(
                 div()
                     .mt(px(16.))
@@ -693,6 +876,7 @@ impl Render for SettingsView {
             .id("settings")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .bg(theme::surface())
             .flex()
             .flex_col()

@@ -49,6 +49,14 @@ impl VideoPlayer {
         true
     }
 
+    /// Played to the end.
+    pub fn is_ended(&self) -> bool {
+        #[cfg(windows)]
+        return self.inner.is_ended();
+        #[cfg(not(windows))]
+        true
+    }
+
     /// Seconds played and in all (0 until known).
     pub fn position(&self) -> (f64, f64) {
         #[cfg(windows)]
@@ -279,6 +287,11 @@ mod imp {
         pub fn is_paused(&self) -> bool {
             // SAFETY: as above.
             unsafe { self.engine.IsPaused().as_bool() || self.engine.IsEnded().as_bool() }
+        }
+
+        pub fn is_ended(&self) -> bool {
+            // SAFETY: as above.
+            unsafe { self.engine.IsEnded().as_bool() }
         }
 
         pub fn position(&self) -> (f64, f64) {

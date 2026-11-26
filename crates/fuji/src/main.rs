@@ -1,11 +1,17 @@
 //! fuji: an iCloud Photos client for Windows and Linux.
 
+// Release builds are a window app on Windows (no console beside it); panics
+// still reach crash.log.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod anim;
 mod app;
 mod assets;
 mod collections;
+mod crash;
 mod device_search;
 mod export;
+mod favorite;
 mod grid;
 mod image_cache;
 mod index;
@@ -25,6 +31,7 @@ mod thumbs;
 mod titlebar;
 mod transfer;
 mod ui;
+mod updater;
 mod video;
 mod viewer;
 mod zoom;
@@ -34,6 +41,7 @@ use gpui::{
 };
 
 fn main() {
+    crash::install();
     Application::new()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
@@ -41,6 +49,7 @@ fn main() {
                 .add_fonts(vec![std::borrow::Cow::Borrowed(assets::FONT_BYTES)])
                 .expect("load the UI font");
             settings::Settings::init(cx);
+            updater::init(settings::Settings::get(cx).auto_update, cx);
             let saved = session_store::load();
             input::bind_keys(cx);
             grid::bind_keys(cx);

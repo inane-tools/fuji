@@ -37,7 +37,16 @@ use crate::{net, theme, thumbs, ui};
 actions!(
     viewer,
     [
-        Close, Previous, Next, CopyImage, Download, ZoomIn, ZoomOut, ZoomFit, PlayPause
+        Close,
+        Previous,
+        Next,
+        CopyImage,
+        Download,
+        ZoomIn,
+        ZoomOut,
+        ZoomFit,
+        PlayPause,
+        ToggleFavorite
     ]
 );
 
@@ -51,6 +60,8 @@ const CLOSE_MS: u64 = 130;
 const SLIDE: f32 = 56.;
 /// How far the pointer moves with the button down before a drag-out starts.
 const DRAG_THRESHOLD: f32 = 6.;
+/// How long a Live Photo is held still before its motion plays.
+const HOLD_TO_PLAY: Duration = Duration::from_millis(300);
 /// Space around the image when it fits.
 const MARGIN: f32 = 16.;
 /// The viewer's own bar, under the app's title bar.
@@ -86,6 +97,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl--", ZoomOut, Some(CONTEXT)),
         KeyBinding::new("0", ZoomFit, Some(CONTEXT)),
         KeyBinding::new("space", PlayPause, Some(CONTEXT)),
+        KeyBinding::new(".", ToggleFavorite, Some(CONTEXT)),
         KeyBinding::new("ctrl-0", ZoomFit, Some(CONTEXT)),
     ]);
 }
@@ -117,6 +129,10 @@ pub struct Viewer {
     drag: Option<Drag>,
     /// Where the button went down on a photo that fits: it may be dragged out.
     press: Option<Point<Pixels>>,
+    /// Waits out a press on a Live Photo, to play its motion while held.
+    _hold_timer: Option<gpui::Task<()>>,
+    /// The motion is playing because the photo is held.
+    held: bool,
     /// 0 to 1 as the viewer opens: the photo settles into place.
     appear: Eased,
     /// 1 or -1 down to 0 after stepping to the next or previous photo.
@@ -135,6 +151,8 @@ pub struct Viewer {
     video_frame: Option<Arc<gpui::RenderImage>>,
     /// Why the current video can't play.
     video_error: Option<(usize, String)>,
+    /// The player is a Live Photo's motion, playing once over the still.
+    live: bool,
     /// The bar shows while the pointer moves, and hides when it rests.
     chrome_shown: bool,
     /// Bumped on each show and hide, so each one fades.
@@ -195,6 +213,8 @@ impl Viewer {
             stage_bounds: Rc::new(Cell::new(None)),
             drag: None,
             press: None,
+            _hold_timer: None,
+            held: false,
             appear: {
                 let mut appear = Eased::new(0.);
                 appear.set(1.);
@@ -208,6 +228,7 @@ impl Viewer {
             strip_shown: false,
             player: None,
             video_frame: None,
+            live: false,
             video_error: None,
             chrome_shown: true,
             chrome_serial: 0,
@@ -341,6 +362,10 @@ impl Viewer {
             return;
         }
         self.stop_video(cx);
+        // A Live Photo moves only when asked (its LIVE badge).
+        if !asset.is_some_and(|a| matches!(a.kind, AssetKind::Video { .. })) {
+            return;
+        }
         let Some(url) = asset.and_then(|a| a.video.as_ref()).map(|v| v.url.clone()) else {
             return;
         };
@@ -350,11 +375,50 @@ impl Viewer {
         }
     }
 
+    /// Play the current Live Photo's motion once, from the start.
+    fn play_live(&mut self, cx: &mut Context<Self>) {
+        let index = self.index;
+        if self.live && self.player.as_ref().is_some_and(|(i, _)| *i == index) {
+            return;
+        }
+        let Some(url) = self
+            .asset(index, cx)
+            .filter(|a| a.kind == AssetKind::LivePhoto)
+            .and_then(|a| a.video.map(|v| v.url))
+        else {
+            return;
+        };
+        self.stop_video(cx);
+        if let Ok(player) = VideoPlayer::open(&url, true) {
+            self.player = Some((index, player));
+            self.live = true;
+            cx.notify();
+        }
+    }
+
+    /// Back to the still, if the motion is playing.
+    fn stop_live(&mut self, cx: &mut Context<Self>) {
+        if self.live {
+            self.stop_video(cx);
+            cx.notify();
+        }
+    }
+
     fn stop_video(&mut self, cx: &mut Context<Self>) {
+        self.live = false;
         self.player = None;
         if let Some(frame) = self.video_frame.take() {
             cx.drop_image(frame, None);
         }
+    }
+
+    fn toggle_favorite(&mut self, _: &ToggleFavorite, _: &mut Window, cx: &mut Context<Self>) {
+        let index = self.index;
+        if let Some(grid) = self.grid.upgrade() {
+            grid.update(cx, |grid, cx| grid.toggle_favorite(vec![index], cx));
+        }
+        self.show_chrome(cx);
+        cx.notify();
     }
 
     fn play_pause(&mut self, _: &PlayPause, _: &mut Window, cx: &mut Context<Self>) {
@@ -363,6 +427,47 @@ impl Viewer {
             self.show_chrome(cx);
             cx.notify();
         }
+    }
+
+    /// "LIVE" by the file name: the pointer on it plays the motion.
+    fn render_live_badge(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let playing = self.live;
+        let ink = if playing {
+            theme::accent_text()
+        } else {
+            theme::text_muted()
+        };
+        div()
+            .id("live-badge")
+            .flex_none()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .h(px(18.))
+            .px(px(5.))
+            .rounded(px(5.))
+            .bg(if playing {
+                theme::accent_soft()
+            } else {
+                theme::hover()
+            })
+            .text_size(px(10.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(ink)
+            .child(icon("live", px(12.), ink))
+            .child("LIVE")
+            .tooltip(ui::tooltip(
+                "Point here, or press and hold the photo, to play",
+            ))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.play_live(cx);
+                } else {
+                    this.stop_live(cx);
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.play_live(cx)))
     }
 
     /// Play, pause, where it is (drag to seek), and sound on or off.
@@ -644,6 +749,24 @@ impl Viewer {
             cx.notify();
         } else {
             self.press = Some(event.position);
+            // Held still a moment on a Live Photo: play its motion until let go.
+            let index = self.index;
+            if self
+                .asset(index, cx)
+                .is_some_and(|a| a.kind == AssetKind::LivePhoto && a.video.is_some())
+            {
+                self._hold_timer = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(HOLD_TO_PLAY).await;
+                    this.update(cx, |this, cx| {
+                        if this.press.is_some() && this.index == index {
+                            this.press = None;
+                            this.held = true;
+                            this.play_live(cx);
+                        }
+                    })
+                    .ok();
+                }));
+            }
         }
     }
 
@@ -690,6 +813,10 @@ impl Viewer {
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
         self.press = None;
+        self._hold_timer = None;
+        if std::mem::take(&mut self.held) {
+            self.stop_live(cx);
+        }
         if self.drag.take().is_some() {
             cx.notify();
         }
@@ -796,6 +923,7 @@ impl Viewer {
         let title = asset
             .and_then(|a| a.filename.clone())
             .unwrap_or_else(|| "Photo".into());
+        let live = asset.is_some_and(|a| a.kind == AssetKind::LivePhoto && a.video.is_some());
         let date = asset.and_then(|a| format_date(a.created_at_ms));
         let position = format!(
             "{} of {}",
@@ -804,6 +932,11 @@ impl Viewer {
         );
 
         let info_open = self.info_open;
+        let can_favorite = self
+            .grid
+            .upgrade()
+            .is_some_and(|grid| grid.read(cx).can_favorite());
+        let favorite = asset.is_some_and(|a| a.favorite);
         let subtitle = match date {
             Some(date) => format!("{date} \u{00b7} {position}"),
             None => position,
@@ -836,6 +969,22 @@ impl Viewer {
                         .tooltip(ui::tooltip("Fit to window"))
                         .on_click(cx.listener(|this, _, _, cx| this.set_target(View::FIT, cx)))
                         .child(format!("{percent}%")),
+                )
+            })
+            .when(can_favorite, |el| {
+                el.child(
+                    ui::icon_button(
+                        "favorite",
+                        if favorite { "heart-fill" } else { "favorites" },
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_favorite(&ToggleFavorite, window, cx)
+                        }),
+                    )
+                    .tooltip(ui::tooltip(if favorite {
+                        "Unfavorite (.)"
+                    } else {
+                        "Favorite (.)"
+                    })),
                 )
             })
             .child(
@@ -896,11 +1045,20 @@ impl Viewer {
                     .child(
                         div()
                             .max_w_full()
-                            .truncate()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child(title),
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child(title),
+                            )
+                            .when(live, |el| el.child(self.render_live_badge(cx))),
                     )
                     .child(
                         div()
@@ -1270,7 +1428,14 @@ impl Render for Viewer {
             if let Some(err) = player.error() {
                 self.video_error = Some((index_now, err));
             }
-            playing = !player.is_paused();
+            // A Live Photo's motion keeps drawing from the moment it's
+            // asked for (the engine may not say it's playing yet), plays
+            // once, then the still returns.
+            playing = !player.is_paused() || self.live;
+            if self.live && player.is_ended() {
+                self.stop_video(cx);
+                playing = false;
+            }
         }
         if self
             .video_error
@@ -1287,7 +1452,9 @@ impl Render for Viewer {
         let video_controls = self
             .player
             .as_ref()
-            .filter(|(i, player)| *i == index_now && (self.chrome_shown || player.is_paused()))
+            .filter(|(i, player)| {
+                *i == index_now && !self.live && (self.chrome_shown || player.is_paused())
+            })
             .map(|(_, player)| self.render_video_controls(player, cx));
         let note: Option<gpui::SharedString> = self
             .video_error
@@ -1518,6 +1685,7 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_fit))
             .on_action(cx.listener(Self::play_pause))
+            .on_action(cx.listener(Self::toggle_favorite))
             .occlude()
             .absolute()
             .inset_0()

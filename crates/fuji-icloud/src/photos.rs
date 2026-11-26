@@ -609,12 +609,22 @@ impl PhotosClient {
     /// Move items to Recently Deleted (`deleted`), or bring them back from
     /// it, the way icloud.com does: by setting `isDeleted` on each asset.
     pub fn set_deleted(&self, names: &[String], deleted: bool) -> Result<(), PhotosError> {
+        self.set_flag(names, "isDeleted", deleted)
+    }
+
+    /// Mark items as favorites, or not, as icloud.com's heart does.
+    pub fn set_favorite(&self, names: &[String], favorite: bool) -> Result<(), PhotosError> {
+        self.set_flag(names, "isFavorite", favorite)
+    }
+
+    /// Set a 0/1 field on each asset.
+    fn set_flag(&self, names: &[String], flag: &str, on: bool) -> Result<(), PhotosError> {
         for chunk in names.chunks(MAX_PAGE) {
             let mut pending: Vec<String> = chunk.to_vec();
             // A record changed elsewhere between the lookup and the update
             // has a new tag: look it up again, once.
             for attempt in 0..2 {
-                let current = self.lookup(&pending, &["isDeleted"])?;
+                let current = self.lookup(&pending, &[flag])?;
                 let operations: Vec<Value> = current
                     .iter()
                     .filter(|r| r["serverErrorCode"].is_null())
@@ -625,7 +635,7 @@ impl PhotosClient {
                                 "recordName": r["recordName"].as_str()?,
                                 "recordType": "CPLAsset",
                                 "recordChangeTag": r["recordChangeTag"].as_str()?,
-                                "fields": { "isDeleted": { "value": i64::from(deleted) } },
+                                "fields": { flag: { "value": i64::from(on) } },
                             },
                         }))
                     })
@@ -639,7 +649,7 @@ impl PhotosClient {
                         "operations": operations,
                         "zoneID": { "zoneName": "PrimarySync" },
                         "atomic": false,
-                        "desiredKeys": ["isDeleted"],
+                        "desiredKeys": [flag],
                     }),
                 )?;
                 let failed: Vec<&Value> = data["records"]
@@ -1348,13 +1358,15 @@ fn parse_asset(asset: &Value, master: &Value) -> Option<Asset> {
     };
 
     let filename = text_field(master, "filenameEnc");
-    let video = matches!(kind, AssetKind::Video { .. })
-        .then(|| {
-            resource_either(asset, master, "resVidMed")
-                .or_else(|| resource_either(asset, master, "resVidSmall"))
-                .or_else(|| resource(master, "resOriginal"))
-        })
-        .flatten();
+    let video = match kind {
+        AssetKind::Video { .. } => resource_either(asset, master, "resVidMed")
+            .or_else(|| resource_either(asset, master, "resVidSmall"))
+            .or_else(|| resource(master, "resOriginal")),
+        // The motion of a Live Photo, as iCloud renders it (H.264).
+        AssetKind::LivePhoto => resource_either(asset, master, "resVidMed")
+            .or_else(|| resource_either(asset, master, "resVidSmall")),
+        AssetKind::Photo => None,
+    };
 
     let dim = |name: &str| field(master, name).and_then(Value::as_u64).unwrap_or(0) as u32;
     let thumbnail = resource_either(asset, master, "resJPEGThumb");
@@ -1559,10 +1571,20 @@ mod tests {
             "resOriginalVidComplRes": res("https://x/live.mov"),
         }});
         let live = json!({ "recordName": "L", "fields": {} });
-        assert_eq!(
-            parse_asset(&live, &live_master).unwrap().kind,
-            AssetKind::LivePhoto
-        );
+        let parsed = parse_asset(&live, &live_master).unwrap();
+        assert_eq!(parsed.kind, AssetKind::LivePhoto);
+        // No rendition of the motion: nothing to play (not the HEVC original).
+        assert!(parsed.video.is_none());
+
+        let live_master = json!({ "fields": {
+            "itemType": { "value": "public.heic" },
+            "resOriginalRes": res("https://x/photo.heic"),
+            "resOriginalVidComplRes": res("https://x/live.mov"),
+            "resVidSmallRes": res("https://x/small.mp4"),
+            "resVidMedRes": res("https://x/med.mp4"),
+        }});
+        let parsed = parse_asset(&live, &live_master).unwrap();
+        assert_eq!(parsed.video.unwrap().url, "https://x/med.mp4");
     }
 
     #[test]
