@@ -6,7 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// What to put on the clipboard for a copy.
+/// What to put on the clipboard for a copy. (Only Windows reads it yet.)
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct ClipboardContent {
     /// Files, for pasting into a folder, a chat or a mail.
     pub files: Vec<PathBuf>,
@@ -464,8 +465,13 @@ mod tests {
             ReleaseStgMedium(&mut medium);
             names
         };
+        // The same file, however its folders are spelled (a temp folder
+        // may come back with its short 8.3 name, or its long one).
+        let same =
+            |name: &String| std::fs::canonicalize(name).ok() == std::fs::canonicalize(&file).ok();
+        let all_same = names.len() == 1 && same(&names[0]);
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(names, vec![file.to_string_lossy().into_owned()]);
+        assert!(all_same, "{names:?} isn't {file:?}");
     }
 
     #[test]
