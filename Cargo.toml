@@ -26,3 +26,8 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# gpui 0.2.2 pins xattr 0.2.3, which doesn't build on Linux with current
+# libc (ENOATTR is gone there); this copy uses ENODATA, its other name.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
