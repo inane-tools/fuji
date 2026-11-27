@@ -773,7 +773,7 @@ impl PhotoGrid {
 
     /// Put back what [`Self::confirm_delete`] took out, if it's still waiting.
     fn undo_trash(&mut self, serial: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.trash.as_ref().is_some_and(|t| t.serial == serial) {
+        if self.trash.as_ref().is_none_or(|t| t.serial != serial) {
             return;
         }
         self.leave_viewer(window);
