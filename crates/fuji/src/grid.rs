@@ -245,7 +245,7 @@ struct Search {
 pub struct PhotoGrid {
     pub(crate) client: Arc<PhotosClient>,
     account_dir: PathBuf,
-    thumb_dir: Arc<PathBuf>,
+    pub(crate) thumb_dir: Arc<PathBuf>,
     pub(crate) preview_dir: Arc<PathBuf>,
     pub(crate) album: Album,
     /// The album's name, shown as the heading.
@@ -307,7 +307,7 @@ pub struct PhotoGrid {
     image_cache: Entity<LruImageCache>,
     image_cache_size: usize,
     viewer: Option<(Entity<Viewer>, Subscription)>,
-    focus_handle: FocusHandle,
+    pub(crate) focus_handle: FocusHandle,
     // Motion.
     scroll: ScrollHandle,
     /// The scroll position (content top), easing to where the wheel or the
@@ -340,6 +340,8 @@ pub struct PhotoGrid {
     pub(crate) trash: Option<Trash>,
     /// Deletions sent and not yet answered.
     pub(crate) deleting: usize,
+    /// Adding to albums: the list, covers, the open picker.
+    pub(crate) albums: crate::album_picker::Albums,
     _settings: Subscription,
 }
 
@@ -445,6 +447,7 @@ impl PhotoGrid {
             pending_delete: None,
             trash: None,
             deleting: 0,
+            albums: Default::default(),
             _settings: settings,
         };
         grid.list_disk_thumbs(cx);
@@ -854,6 +857,7 @@ impl Render for PhotoGrid {
             );
 
         let menu = self.menu.as_ref().map(|menu| self.render_menu(menu, cx));
+        let album_picker = self.render_album_picker(cx);
         let dialog = match (&self.pending_upload, &self.pending_delete) {
             (Some(upload), _) => Some(self.render_upload_dialog(upload, cx).into_any_element()),
             (None, Some(ids)) => Some(self.render_delete_dialog(ids.len(), cx).into_any_element()),
@@ -869,6 +873,7 @@ impl Render for PhotoGrid {
             .on_action(cx.listener(Self::download_selection))
             .on_action(cx.listener(Self::delete_selection))
             .on_action(cx.listener(Self::favorite_selection))
+            .on_action(cx.listener(Self::add_selection_to_last_album))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::zoom_in))
@@ -900,6 +905,7 @@ impl Render for PhotoGrid {
                 el.child(ui::toast(serial, status))
             })
             .children(menu)
+            .children(album_picker)
     }
 }
 

@@ -421,6 +421,50 @@ impl Viewer {
         cx.notify();
     }
 
+    /// The list of albums to add the photo to, under the top bar's right
+    /// end, where Info opens.
+    fn add_to_album(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.index;
+        let position = gpui::point(window.viewport_size().width - px(14.), px(BAR_ROW + 8.));
+        self.info_open = false;
+        if let Some(grid) = self.grid.upgrade() {
+            grid.update(cx, |grid, cx| {
+                grid.open_album_picker(vec![index], position, gpui::Corner::TopRight, window, cx)
+            });
+        }
+        self.show_chrome(cx);
+        cx.notify();
+    }
+
+    /// The key: add the photo to the album used last (or pick one).
+    fn add_to_last_album(
+        &mut self,
+        _: &crate::album_picker::AddToLastAlbum,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.index;
+        let position = gpui::point(window.viewport_size().width - px(14.), px(BAR_ROW + 8.));
+        if let Some(grid) = self.grid.upgrade() {
+            grid.update(cx, |grid, cx| {
+                grid.add_to_last_album(
+                    vec![index],
+                    Some((position, gpui::Corner::TopRight)),
+                    window,
+                    cx,
+                )
+            });
+        }
+        self.show_chrome(cx);
+        cx.notify();
+    }
+
+    fn album_picker_open(&self, cx: &App) -> bool {
+        self.grid
+            .upgrade()
+            .is_some_and(|grid| grid.read(cx).albums.is_open())
+    }
+
     fn play_pause(&mut self, _: &PlayPause, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((_, player)) = &self.player {
             player.toggle();
@@ -610,7 +654,7 @@ impl Viewer {
     }
 
     fn rest_chrome(&mut self, cx: &mut Context<Self>) {
-        if self.info_open || self.pointer_near_top {
+        if self.info_open || self.pointer_near_top || self.album_picker_open(cx) {
             self.show_chrome(cx);
             return;
         }
@@ -936,6 +980,10 @@ impl Viewer {
             .grid
             .upgrade()
             .is_some_and(|grid| grid.read(cx).can_favorite());
+        let can_add_to_album = self
+            .grid
+            .upgrade()
+            .is_some_and(|grid| grid.read(cx).can_add_to_album());
         let favorite = asset.is_some_and(|a| a.favorite);
         let subtitle = match date {
             Some(date) => format!("{date} \u{00b7} {position}"),
@@ -1003,6 +1051,16 @@ impl Viewer {
                 )
                 .tooltip(ui::tooltip("Download (Ctrl+S)")),
             )
+            .when(can_add_to_album, |el| {
+                el.child(
+                    ui::icon_button(
+                        "add-to-album",
+                        "album-add",
+                        cx.listener(|this, _, window, cx| this.add_to_album(window, cx)),
+                    )
+                    .tooltip(ui::tooltip("Add to Album (A)")),
+                )
+            })
             .child(
                 ui::icon_button(
                     "info",
@@ -1686,6 +1744,7 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::zoom_fit))
             .on_action(cx.listener(Self::play_pause))
             .on_action(cx.listener(Self::toggle_favorite))
+            .on_action(cx.listener(Self::add_to_last_album))
             .occlude()
             .absolute()
             .inset_0()

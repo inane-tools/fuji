@@ -388,6 +388,19 @@ impl PhotoGrid {
                         run(|this, _, _, cx| this.clear_selection(cx), Vec::new()),
                     ));
                 }
+                if self.can_add_to_album() {
+                    items.extend(self.add_to_last_album_item(targets.clone(), cx));
+                    items.push(self.add_to_album_item(
+                        targets.clone(),
+                        menu.position,
+                        if many {
+                            format!("Add {} items to Album\u{2026}", targets.len())
+                        } else {
+                            "Add to Album\u{2026}".into()
+                        },
+                        cx,
+                    ));
+                }
                 if self.can_favorite() {
                     let verb = if self.all_favorite(targets) {
                         "Unfavorite"
@@ -545,6 +558,15 @@ impl PhotoGrid {
                     )
                     .hint("Ctrl+S"),
                 );
+                if self.can_add_to_album() {
+                    items.extend(self.add_to_last_album_item(target.clone(), cx));
+                    items.push(self.add_to_album_item(
+                        target.clone(),
+                        menu.position,
+                        "Add to Album\u{2026}".into(),
+                        cx,
+                    ));
+                }
                 if self.can_favorite() {
                     let verb = if self.all_favorite(&target) {
                         "Unfavorite"

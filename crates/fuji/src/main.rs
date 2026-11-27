@@ -4,6 +4,7 @@
 // still reach crash.log.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod album_picker;
 mod anim;
 mod app;
 mod assets;
@@ -53,6 +54,7 @@ fn main() {
             let saved = session_store::load();
             input::bind_keys(cx);
             grid::bind_keys(cx);
+            album_picker::bind_keys(cx);
             viewer::bind_keys(cx);
             app::bind_keys(cx);
 

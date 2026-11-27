@@ -386,6 +386,8 @@ impl FujiApp {
         }
         let mut subscriptions = Vec::new();
         if let Some(grid) = &grid {
+            let albums = self.albums.clone();
+            grid.update(cx, |grid, cx| grid.set_user_albums(albums, cx));
             let apple_id = account.apple_id.clone();
             subscriptions.push(
                 cx.subscribe_in(
@@ -610,6 +612,13 @@ impl FujiApp {
     /// Replace the album list, keeping the selected album selected if it's
     /// still there (and following a rename).
     fn set_albums(&mut self, albums: Vec<UserAlbum>, cx: &mut Context<Self>) {
+        if let Screen::Main {
+            grid: Some(grid), ..
+        } = &self.screen
+        {
+            let albums = albums.clone();
+            grid.update(cx, |grid, cx| grid.set_user_albums(albums, cx));
+        }
         if albums == self.albums {
             return;
         }

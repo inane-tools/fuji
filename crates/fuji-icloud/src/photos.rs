@@ -8,7 +8,7 @@
 //!
 //! Blocking I/O: call these from a background thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -788,6 +788,137 @@ impl PhotosClient {
         self.set_flag(names, "isFavorite", favorite)
     }
 
+    /// Put items in a user album, the way icloud.com does: one
+    /// `CPLContainerRelation` record per item, named `<asset>-IN-<album>`.
+    /// Items already in it are left alone. Returns how many were added.
+    pub fn add_to_album(&self, album: &str, names: &[String]) -> Result<usize, PhotosError> {
+        let mut added = 0;
+        let started = std::time::Instant::now();
+        for chunk in names.chunks(MAX_PAGE) {
+            let relations: Vec<String> = chunk.iter().map(|n| relation_name(n, album)).collect();
+            // A relation that's there (and not deleted) means it's in already.
+            let present: HashSet<String> = self
+                .lookup(&relations, &["isDeleted"])?
+                .iter()
+                .filter(|r| r["serverErrorCode"].is_null() && r["deleted"] != true)
+                .filter(|r| field(r, "isDeleted").and_then(Value::as_i64) != Some(1))
+                .filter_map(|r| r["recordName"].as_str().map(str::to_string))
+                .collect();
+            let operations: Vec<Value> = chunk
+                .iter()
+                .zip(&relations)
+                .filter(|(_, relation)| !present.contains(*relation))
+                .map(|(name, relation)| {
+                    json!({
+                        "operationType": "create",
+                        "record": {
+                            "recordName": relation,
+                            "recordType": "CPLContainerRelation",
+                            "fields": {
+                                "itemId": { "value": name },
+                                "position": { "value": 1024 },
+                                "containerId": { "value": album },
+                            },
+                        },
+                    })
+                })
+                .collect();
+            album_debug(format_args!(
+                "add to album: {} items, {} in already, looked up in {:?}",
+                chunk.len(),
+                present.len(),
+                started.elapsed()
+            ));
+            if operations.is_empty() {
+                continue;
+            }
+            let data = self.post(
+                "records/modify",
+                &json!({
+                    "operations": operations,
+                    "zoneID": { "zoneName": "PrimarySync" },
+                    "atomic": false,
+                }),
+            )?;
+            let records = data["records"].as_array().cloned().unwrap_or_default();
+            let codes: Vec<&str> = records
+                .iter()
+                .filter_map(|r| r["serverErrorCode"].as_str())
+                .collect();
+            album_debug(format_args!(
+                "add to album: created {} of {} by {:?}, errors {codes:?}",
+                records.len() - codes.len(),
+                operations.len(),
+                started.elapsed()
+            ));
+            if let Some(failed) = records.iter().find(|r| r["serverErrorCode"].is_string()) {
+                return Err(cloudkit_error(
+                    200,
+                    failed["serverErrorCode"].as_str().unwrap_or(""),
+                    failed["reason"].as_str().unwrap_or(""),
+                ));
+            }
+            added += operations.len();
+        }
+        Ok(added)
+    }
+
+    /// Take items out of a user album: delete the records that put them
+    /// in it (a removed item shows in the change feed as just that).
+    /// Returns how many were in it.
+    pub fn remove_from_album(&self, album: &str, names: &[String]) -> Result<usize, PhotosError> {
+        let mut removed = 0;
+        let started = std::time::Instant::now();
+        for chunk in names.chunks(MAX_PAGE) {
+            let relations: Vec<String> = chunk.iter().map(|n| relation_name(n, album)).collect();
+            let operations: Vec<Value> = self
+                .lookup(&relations, &["isDeleted"])?
+                .iter()
+                .filter(|r| r["serverErrorCode"].is_null() && r["deleted"] != true)
+                .filter_map(|r| {
+                    Some(json!({
+                        "operationType": "delete",
+                        "record": {
+                            "recordName": r["recordName"].as_str()?,
+                            "recordChangeTag": r["recordChangeTag"].as_str()?,
+                        },
+                    }))
+                })
+                .collect();
+            if operations.is_empty() {
+                continue;
+            }
+            let data = self.post(
+                "records/modify",
+                &json!({
+                    "operations": operations,
+                    "zoneID": { "zoneName": "PrimarySync" },
+                    "atomic": false,
+                }),
+            )?;
+            let records = data["records"].as_array().cloned().unwrap_or_default();
+            let codes: Vec<&str> = records
+                .iter()
+                .filter_map(|r| r["serverErrorCode"].as_str())
+                .collect();
+            album_debug(format_args!(
+                "remove from album: deleted {} of {} by {:?}, errors {codes:?}",
+                records.len() - codes.len(),
+                operations.len(),
+                started.elapsed()
+            ));
+            if let Some(failed) = records.iter().find(|r| r["serverErrorCode"].is_string()) {
+                return Err(cloudkit_error(
+                    200,
+                    failed["serverErrorCode"].as_str().unwrap_or(""),
+                    failed["reason"].as_str().unwrap_or(""),
+                ));
+            }
+            removed += operations.len();
+        }
+        Ok(removed)
+    }
+
     /// Set a 0/1 field on each asset.
     fn set_flag(&self, names: &[String], flag: &str, on: bool) -> Result<(), PhotosError> {
         for chunk in names.chunks(MAX_PAGE) {
@@ -1451,6 +1582,18 @@ const DESIRED_KEYS: &[&str] = &[
 ];
 
 /// A field's `value`, if present.
+/// A line on stderr with FUJI_DEBUG set (counts and timings, no values).
+fn album_debug(message: std::fmt::Arguments) {
+    if std::env::var_os("FUJI_DEBUG").is_some() {
+        eprintln!("fuji-icloud: photos: {message}");
+    }
+}
+
+/// The record that puts an item in a user album: named after both.
+fn relation_name(asset: &str, album: &str) -> String {
+    format!("{asset}-IN-{album}")
+}
+
 fn field<'a>(record: &'a Value, name: &str) -> Option<&'a Value> {
     record["fields"].get(name)?.get("value")
 }
@@ -1799,6 +1942,11 @@ mod tests {
             album.count_id().as_deref(),
             Some("CPLContainerRelationNotDeletedByAssetDate:ABC-123")
         );
+    }
+
+    #[test]
+    fn album_relations_are_named_like_icloud_com() {
+        assert_eq!(relation_name("ASSET1", "ALBUM-2"), "ASSET1-IN-ALBUM-2");
     }
 
     #[test]
