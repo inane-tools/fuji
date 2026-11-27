@@ -82,19 +82,31 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 /// Items per full-record page (with download URLs).
-pub(crate) const PAGE: usize = 100;
+/// Small, because iCloud takes about 50 ms per full record: a short page
+/// gets the first thumbnails on screen sooner.
+pub(crate) const PAGE: usize = 50;
 /// Full-record pages kept in memory.
-const MAX_PAGES: usize = 40;
-const MAX_PAGE_REQUESTS: usize = 2;
+const MAX_PAGES: usize = 80;
+const MAX_PAGE_REQUESTS: usize = 4;
 /// Pages waiting to be requested. Older ones are dropped: after a fast
 /// scroll, what was passed on the way no longer matters.
 const MAX_QUEUED_PAGES: usize = 6;
 /// Items per index-scan request (small records, no URLs).
 const SCAN_PAGE: usize = 200;
-const MAX_SCAN_REQUESTS: usize = 6;
-const MAX_THUMB_REQUESTS: usize = 8;
+/// The first index-scan page, shorter so an album's first screen comes soon.
+const FIRST_SCAN_PAGE: usize = 40;
+const MAX_SCAN_REQUESTS: usize = net::BULK_THREADS;
+const MAX_THUMB_REQUESTS: usize = 10;
 /// Extra content kept built above and below the viewport.
 const OVERSCAN: f32 = 600.;
+/// Thumbnails are fetched ahead this many viewports below the screen (and
+/// half as far above), after what's on screen.
+const LOOKAHEAD_VIEWPORTS: f32 = 1.5;
+/// Record pages requested for the lookahead at once, so it never crowds out
+/// pages for what's on screen.
+const LOOKAHEAD_PAGES: usize = 2;
+/// Items looked at for the lookahead, at most.
+const LOOKAHEAD_ITEMS: usize = 300;
 /// Decoded thumbnails kept in memory, at least; more when zoomed out.
 const IMAGE_CACHE_SIZE: usize = 120;
 const TILE_GAP: f32 = 4.;
@@ -159,6 +171,7 @@ struct Scan {
     progressive: bool,
     /// The change feed's position when the scan began.
     token: Option<String>,
+    started: Instant,
 }
 
 /// The photo to keep still under the pointer while the zoom changes.
@@ -294,6 +307,8 @@ pub struct PhotoGrid {
     /// Pages to request, most urgent last.
     page_queue: Vec<usize>,
     pages_in_flight: usize,
+    /// Single records the viewer asked for ahead of their page (each once).
+    singles_asked: HashSet<AssetId>,
     // Thumbnails.
     disk_thumbs: Option<Arc<HashSet<String>>>,
     thumbs_ready: HashMap<AssetId, Arc<Path>>,
@@ -303,6 +318,8 @@ pub struct PhotoGrid {
     thumbs_in_flight: HashSet<AssetId>,
     /// Thumbnails to fetch, highest priority last.
     thumb_queue: Vec<(AssetId, Resource)>,
+    /// Since when the screen has been missing thumbnails (FUJI_DEBUG timing).
+    screen_wanted: Option<Instant>,
     error: Option<SharedString>,
     image_cache: Entity<LruImageCache>,
     image_cache_size: usize,
@@ -414,12 +431,14 @@ impl PhotoGrid {
             pages_requested: HashSet::new(),
             page_queue: Vec::new(),
             pages_in_flight: 0,
+            singles_asked: HashSet::new(),
             disk_thumbs: None,
             thumbs_ready: HashMap::new(),
             wanted_thumbs: Vec::new(),
             thumbs_failed: HashSet::new(),
             thumbs_in_flight: HashSet::new(),
             thumb_queue: Vec::new(),
+            screen_wanted: None,
             error: None,
             image_cache: cx.new(|cx| LruImageCache::new(IMAGE_CACHE_SIZE, cx)),
             image_cache_size: IMAGE_CACHE_SIZE,
@@ -635,6 +654,16 @@ impl PhotoGrid {
     pub fn asset(&self, index: usize) -> Option<&Asset> {
         let item = self.index.get(index)?;
         self.assets.get(&AssetId(item.id.clone()))
+    }
+
+    /// The id of the item at `index`, known before its full record is.
+    pub fn item_id(&self, index: usize) -> Option<AssetId> {
+        Some(self.index.get(index)?.asset_id())
+    }
+
+    /// The shape (width / height) of the item at `index`, from the index.
+    pub fn item_aspect(&self, index: usize) -> Option<f32> {
+        Some(self.index.get(index)?.aspect)
     }
 
     /// The thumbnail of the item at `index`, if it's here yet.

@@ -708,15 +708,27 @@ impl PhotoGrid {
         if !flying {
             // Thumbnails for what's on screen, top to bottom.
             let on_screen = layout.rows_in(top, top + viewport_h);
-            let visible: Vec<usize> = layout.rows[on_screen]
-                .iter()
-                .filter_map(|row| match &row.kind {
-                    RowKind::Tiles(tiles) => Some(tiles.iter().map(|t| t.index)),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            self.request_visible(&visible, cx);
+            let items = |rows: &[layout::Row]| -> Vec<usize> {
+                rows.iter()
+                    .filter_map(|row| match &row.kind {
+                        RowKind::Tiles(tiles) => Some(tiles.iter().map(|t| t.index)),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect()
+            };
+            let visible = items(&layout.rows[on_screen.clone()]);
+            // Then ahead: below first (nearest first), then above.
+            let reach = viewport_h * LOOKAHEAD_VIEWPORTS;
+            let below = on_screen.end..layout.rows_in(top, top + viewport_h + reach).end;
+            let above = layout.rows_in(top - reach / 2., top).start..on_screen.start;
+            let mut ahead = items(&layout.rows[below]);
+            let mut behind = items(&layout.rows[above]);
+            behind.reverse();
+            ahead.append(&mut behind);
+            // Zoomed far out, that's many tiles: keep each frame cheap.
+            ahead.truncate(LOOKAHEAD_ITEMS);
+            self.request_visible(&visible, &ahead, cx);
         }
 
         let selecting = !self.selected.is_empty();

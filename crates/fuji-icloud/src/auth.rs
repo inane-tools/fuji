@@ -34,6 +34,9 @@ const WIDGET_KEY: &str = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 /// Apple's error code for a wrong verification code.
 const WRONG_CODE: i64 = -21669;
+/// Idle connections kept per host (and in all), at least as many as the
+/// app's network threads.
+const MAX_IDLE: usize = 64;
 const JSON_ACCEPT: &str = "application/json, text/javascript";
 
 #[derive(Debug, thiserror::Error)]
@@ -133,6 +136,11 @@ impl AuthClient {
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(30)))
             .user_agent(USER_AGENT)
+            // Keep a connection for every request that runs at once (the app
+            // has dozens): ureq keeps only 3 per host by default, so the rest
+            // paid a new TLS handshake each time.
+            .max_idle_connections(MAX_IDLE)
+            .max_idle_connections_per_host(MAX_IDLE)
             .build();
         Self {
             agent: Agent::new_with_config(config),

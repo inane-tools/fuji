@@ -67,6 +67,19 @@ pub fn path_for(dir: &Path, id: &AssetId) -> PathBuf {
     dir.join(format!("{name}.jpg"))
 }
 
+/// The cached file for `id`, if there is one (marked as recently used).
+pub fn cached(dir: &Path, id: &AssetId) -> Option<PathBuf> {
+    let path = path_for(dir, id);
+    if !path.exists() {
+        return None;
+    }
+    // Mark as recently used, for pruning.
+    if let Ok(file) = fs::File::options().append(true).open(&path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+    Some(path)
+}
+
 /// Download the thumbnail unless it's already cached. Returns its path.
 pub fn ensure(
     client: &PhotosClient,
@@ -74,15 +87,21 @@ pub fn ensure(
     id: &AssetId,
     resource: &Resource,
 ) -> Result<PathBuf, PhotosError> {
-    let path = path_for(dir, id);
-    if path.exists() {
-        // Mark as recently used, for pruning.
-        if let Ok(file) = fs::File::options().append(true).open(&path) {
-            let _ = file.set_modified(std::time::SystemTime::now());
-        }
+    if let Some(path) = cached(dir, id) {
         return Ok(path);
     }
+    let path = path_for(dir, id);
+    let started = std::time::Instant::now();
     let bytes = client.download(resource)?;
+    if crate::net::debug() {
+        // The folder's own name only ("thumbs", "previews2"): its parent is the account.
+        let kind = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        eprintln!(
+            "download: {kind} {} KB in {} ms",
+            bytes.len() / 1024,
+            started.elapsed().as_millis()
+        );
+    }
     let io_error = |err: std::io::Error| PhotosError::Unexpected {
         status: 0,
         message: format!("couldn't write thumbnail cache: {err}"),

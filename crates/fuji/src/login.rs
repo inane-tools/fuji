@@ -530,8 +530,9 @@ impl LoginView {
                             .text_color(theme::text_meta())
                             .child("Text a code to:"),
                     )
-                    .children(list.iter().cloned().map(|phone| {
+                    .children(list.iter().map(|phone| {
                         let label = phone.number.clone();
+                        let phone = phone.clone();
                         link_button(
                             ElementId::NamedInteger("phone".into(), phone.id),
                             label,

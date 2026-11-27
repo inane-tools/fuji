@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -251,6 +252,8 @@ pub struct PhotosClient {
     shared_endpoint: Option<String>,
     /// Each memory's photos, once read.
     memory_assets: Mutex<HashMap<Arc<str>, Arc<Vec<String>>>>,
+    /// The library said it's ready once: it stays so, no need to ask again.
+    ready: AtomicBool,
     dsid: String,
     query: Vec<(&'static str, String)>,
 }
@@ -281,6 +284,7 @@ impl PhotosClient {
                 )
             }),
             memory_assets: Mutex::default(),
+            ready: AtomicBool::new(false),
             dsid: account.dsid.clone(),
             query: vec![
                 ("clientBuildNumber", CLIENT_BUILD_NUMBER.into()),
@@ -295,7 +299,12 @@ impl PhotosClient {
 
     /// Check that the library is ready to query. Apple sometimes reports it as
     /// still indexing on one call and ready on the next, so retry a few times.
+    /// Once it has been ready, this answers at once (every album opened
+    /// used to wait for this request first).
     pub fn check_ready(&self) -> Result<(), PhotosError> {
+        if self.ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         for attempt in 0..3 {
             let data = self.post(
                 "records/query",
@@ -305,6 +314,7 @@ impl PhotosClient {
                 }),
             )?;
             if data["records"][0]["fields"]["state"]["value"].as_str() == Some("FINISHED") {
+                self.ready.store(true, Ordering::Relaxed);
                 return Ok(());
             }
             if attempt < 2 {

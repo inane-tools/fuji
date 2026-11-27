@@ -54,6 +54,8 @@ const CONTEXT: &str = "Viewer";
 const MAX_PREVIEW_REQUESTS: usize = 3;
 /// How far ahead and behind to fetch previews.
 const PREFETCH: usize = 2;
+/// The long edge assumed for a photo whose record hasn't arrived.
+const NOMINAL_EDGE: f32 = 2048.;
 /// How long the fade out takes before the viewer is removed.
 const CLOSE_MS: u64 = 130;
 /// How far a photo slides in when stepping to it.
@@ -116,6 +118,11 @@ pub struct Viewer {
     previews_ready: HashMap<AssetId, Arc<Path>>,
     previews_failed: HashSet<AssetId>,
     previews_in_flight: HashSet<AssetId>,
+    /// Photos whose preview was looked for on disk (once each).
+    disk_checked: HashSet<AssetId>,
+    /// When the current photo was opened or stepped to, until its preview
+    /// shows (FUJI_DEBUG timing).
+    opened_at: Option<Instant>,
     image_cache: Entity<LruImageCache>,
     /// The filmstrip's small thumbnails, kept apart from the large images.
     strip_cache: Entity<LruImageCache>,
@@ -198,6 +205,8 @@ impl Viewer {
             previews_ready: HashMap::new(),
             previews_failed: HashSet::new(),
             previews_in_flight: HashSet::new(),
+            disk_checked: HashSet::new(),
+            opened_at: Some(Instant::now()),
             // What's on screen (preview and thumbnail) and the photo before:
             // stepping back is instant, and full-size decodes don't pile up.
             image_cache: cx.new(|cx| LruImageCache::new(4, cx)),
@@ -266,21 +275,38 @@ impl Viewer {
         }
         let first = self.index.saturating_sub(PREFETCH);
         let last = (self.index + PREFETCH).min(count - 1);
+        // Current first, then the next ones, then the previous ones.
+        let order: Vec<usize> = std::iter::once(self.index)
+            .chain(self.index + 1..=last)
+            .chain((first..self.index).rev())
+            .collect();
         if let Some(grid) = self.grid.upgrade() {
             grid.update(cx, |grid, cx| {
-                for ix in [self.index, last, first] {
+                // These records alone first (a round trip each), then their pages.
+                for &ix in &order {
+                    grid.load_record_now(ix, cx);
+                }
+                // Most urgent last.
+                for ix in [first, last, self.index] {
                     grid.ensure_loaded(ix, cx);
                 }
             });
         }
 
-        // Current first, then the next ones, then the previous ones.
-        let order = std::iter::once(self.index)
-            .chain(self.index + 1..=last)
-            .chain((first..self.index).rev());
         for ix in order {
+            // A preview already on disk shows before the record is here.
+            if let Some(id) = self.grid.upgrade().and_then(|g| g.read(cx).item_id(ix))
+                && !self.previews_ready.contains_key(&id)
+                && self.disk_checked.insert(id.clone())
+                && let Some(path) = thumbs::cached(&self.preview_dir, &id)
+            {
+                if ix == self.index {
+                    self.log_ready("disk");
+                }
+                self.previews_ready.insert(id, path.into());
+            }
             if self.previews_in_flight.len() >= MAX_PREVIEW_REQUESTS {
-                break;
+                continue;
             }
             let Some(asset) = self.asset(ix, cx) else {
                 continue;
@@ -298,6 +324,28 @@ impl Viewer {
             }
             self.start_preview(id, resource, cx);
         }
+        if self
+            .current_id(cx)
+            .is_some_and(|id| self.previews_ready.contains_key(&id))
+        {
+            self.log_ready("already here");
+        }
+    }
+
+    fn current_id(&self, cx: &App) -> Option<AssetId> {
+        self.grid.upgrade()?.read(cx).item_id(self.index)
+    }
+
+    /// Log how long the current photo took to get its preview (FUJI_DEBUG).
+    fn log_ready(&mut self, source: &str) {
+        if let Some(opened) = self.opened_at.take()
+            && net::debug()
+        {
+            eprintln!(
+                "viewer: preview ready {} ms after opening ({source})",
+                opened.elapsed().as_millis()
+            );
+        }
     }
 
     fn start_preview(&mut self, id: AssetId, resource: Resource, cx: &mut Context<Self>) {
@@ -306,11 +354,15 @@ impl Viewer {
         let dir = self.preview_dir.clone();
         cx.spawn(async move |this, cx| {
             let task_id = id.clone();
-            let result = net::run(move || thumbs::ensure(&client, &dir, &task_id, &resource)).await;
+            let result =
+                net::run_viewer(move || thumbs::ensure(&client, &dir, &task_id, &resource)).await;
             this.update(cx, |this, cx| {
                 this.previews_in_flight.remove(&id);
                 match result {
                     Some(Ok(path)) => {
+                        if this.current_id(cx).as_ref() == Some(&id) {
+                            this.log_ready("network");
+                        }
                         this.previews_ready.insert(id, path.into());
                     }
                     _ => {
@@ -555,6 +607,7 @@ impl Viewer {
         self.slide.jump(if index > self.index { 1. } else { -1. });
         self.slide.set(0.);
         self.index = index;
+        self.opened_at = Some(Instant::now());
         self.view = View::FIT;
         self.target = View::FIT;
         self.drag = None;
@@ -640,7 +693,19 @@ impl Viewer {
     /// Layout of the current image in the stage, once the stage has been laid out.
     fn geometry(&self, window: &Window, cx: &App) -> Option<Geometry> {
         let bounds = self.stage_bounds.get()?;
-        let (image_w, image_h) = natural_size(&self.asset(self.index, cx)?)?;
+        let (image_w, image_h) = match self.asset(self.index, cx) {
+            Some(asset) => natural_size(&asset)?,
+            // Until the record is here, the index's shape at a nominal size:
+            // the photo fits the same box either way.
+            None => {
+                let aspect = self.grid.upgrade()?.read(cx).item_aspect(self.index)?;
+                (aspect > 0.).then_some(if aspect >= 1. {
+                    (NOMINAL_EDGE, NOMINAL_EDGE / aspect)
+                } else {
+                    (NOMINAL_EDGE * aspect, NOMINAL_EDGE)
+                })?
+            }
+        };
         Some(Geometry {
             viewport_w: f32::from(bounds.size.width),
             viewport_h: f32::from(bounds.size.height),
@@ -1402,19 +1467,21 @@ impl Render for Viewer {
         self.advance_animation(window, cx);
         let count = self.count(cx);
         let asset = self.asset(self.index, cx);
-        let thumb = asset.as_ref().and_then(|a| {
-            self.grid
-                .upgrade()
-                .and_then(|grid| grid.read(cx).thumbnail_path(&a.id))
-        });
-        let preview = asset
+        // By the item's id, so a cached thumbnail or preview shows before
+        // the full record is here.
+        let id = self.current_id(cx);
+        let thumb = self
+            .grid
+            .upgrade()
+            .and_then(|grid| grid.read(cx).item_thumbnail(self.index));
+        let preview = id
             .as_ref()
-            .and_then(|a| self.previews_ready.get(&a.id).cloned());
-        let preview_failed = asset
+            .and_then(|id| self.previews_ready.get(id).cloned());
+        let preview_failed = id
             .as_ref()
-            .is_some_and(|a| self.previews_failed.contains(&a.id));
+            .is_some_and(|id| self.previews_failed.contains(id));
         let has_preview = asset.as_ref().is_some_and(|a| a.preview.is_some());
-        let loading = asset.is_none() || (has_preview && preview.is_none() && !preview_failed);
+        let loading = preview.is_none() && (asset.is_none() || (has_preview && !preview_failed));
         // Videos play as soon as they're shown.
         self.ensure_video(asset.as_ref(), cx);
         let index_now = self.index;
