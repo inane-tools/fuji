@@ -24,6 +24,7 @@ mod platform;
 mod release;
 mod scrubber;
 mod search;
+mod security_key;
 mod session_store;
 mod settings;
 mod theme;

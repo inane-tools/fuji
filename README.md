@@ -115,7 +115,7 @@ fail to link past Windows' 260-character limit. **Linux** needs Vulkan drivers
 and the Wayland/X11 headers, for example on Debian or Ubuntu:
 
 ```sh
-sudo apt install libvulkan1 libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev
+sudo apt install libvulkan1 libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libudev-dev
 ```
 
 Tests marked `#[ignore]` talk to Apple and print only counts;

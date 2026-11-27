@@ -38,7 +38,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxi-dev libxcursor-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev libdbus-1-dev \
-            libssl-dev libzstd-dev pkg-config
+            libssl-dev libzstd-dev libudev-dev pkg-config
 
       - uses: Swatinem/rust-cache@v2
 

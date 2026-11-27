@@ -336,6 +336,10 @@ impl AuthClient {
             )
             .send_empty()?;
         self.capture(&resp);
+        debug(&format!(
+            "verify/trusteddevice/securitycode (new code): {}",
+            resp.status().as_u16()
+        ));
         // Older accounts get the push automatically and may reject this; that's fine.
         Ok(())
     }
@@ -352,6 +356,55 @@ impl AuthClient {
             .send_json(json!({ "securityCode": { "code": code.trim() } }))?;
         self.capture(&resp);
         check_code_response(&mut resp)?;
+        self.trust_and_login()
+    }
+
+    /// The two-factor page's boot data (`boot_args.direct`), if it has any.
+    pub(crate) fn two_factor_boot(&self) -> Result<Option<Value>, AuthError> {
+        let mut resp = self
+            .auth_headers(self.agent.get(AUTH_ENDPOINT), false, "text/html")
+            .call()?;
+        self.capture(&resp);
+        if !resp.status().is_success() {
+            return Err(unexpected(resp.status().as_u16(), &mut resp));
+        }
+        let html = resp.body_mut().read_to_string()?;
+        let boot = boot_args(&html)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .map(|mut v| v["direct"].take());
+        if let Some(boot) = &boot {
+            debug(&format!(
+                "two-factor page: authFactors {}",
+                boot["twoSV"]["authFactors"]
+            ));
+        }
+        Ok(boot)
+    }
+
+    /// POST JSON to `idmsa.apple.com/appleauth/auth/<path>`; the status and
+    /// the body as text, whatever the status.
+    pub(crate) fn auth_post_raw(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<(u16, String), AuthError> {
+        let mut resp = self
+            .auth_headers(
+                self.agent.post(format!("{AUTH_ENDPOINT}/{path}")),
+                true,
+                JSON_ACCEPT,
+            )
+            .send_json(body)?;
+        self.capture(&resp);
+        let status = resp.status().as_u16();
+        debug(&format!("{path}: {status}"));
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        Ok((status, text))
+    }
+
+    /// After a second factor was accepted (a security key): trust this
+    /// machine and log in to iCloud.
+    pub(crate) fn after_second_factor(&self) -> Result<Account, AuthError> {
         self.trust_and_login()
     }
 
@@ -643,7 +696,7 @@ fn unexpected(status: u16, resp: &mut Response<ureq::Body>) -> AuthError {
 }
 
 /// Pull a readable message out of Apple's error JSON, if there is one.
-fn error_message(body: &str) -> Option<String> {
+pub(crate) fn error_message(body: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
     let from_list = |key: &str| {
         v.get(key)?
