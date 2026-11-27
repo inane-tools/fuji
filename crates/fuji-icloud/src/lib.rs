@@ -13,6 +13,7 @@ pub mod ids;
 pub mod memories;
 pub mod ngm;
 pub mod passkey;
+pub mod pcs;
 pub mod photos;
 mod profile;
 pub mod push;

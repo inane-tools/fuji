@@ -57,6 +57,9 @@ pub enum AuthError {
     /// Approval on a device didn't go through; the message says why.
     #[error("{0}")]
     Bridge(String),
+    /// Access to Advanced Data Protection data wasn't given; the message says why.
+    #[error("{0}")]
+    DataAccess(String),
 }
 
 /// The tokens worth keeping between runs. Store them in the OS keychain.
@@ -77,6 +80,9 @@ pub struct Account {
     pub full_name: String,
     /// Service name (for example `ckdatabasews`) to base URL.
     pub webservices: HashMap<String, String>,
+    /// Services whose data is end-to-end encrypted (Advanced Data
+    /// Protection): the web session needs the user's approval first.
+    pub pcs_required: Vec<String>,
 }
 
 /// What happened after a sign-in step.
@@ -400,6 +406,60 @@ impl AuthClient {
         debug(&format!("{path}: {status}"));
         let text = resp.body_mut().read_to_string().unwrap_or_default();
         Ok((status, text))
+    }
+
+    /// A call to `setup.icloud.com/setup/ws/1/<path>` the way icloud.com
+    /// makes it: client numbers and `dsid` in the query, a JSON body sent as
+    /// text. The status and the JSON answer (`null` if none).
+    pub(crate) fn setup_call(
+        &self,
+        path: &str,
+        dsid: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Value), AuthError> {
+        let client_id = self.client_id();
+        let query = [
+            ("clientBuildNumber", "2522Project44"),
+            ("clientMasteringNumber", "2522B2"),
+            ("clientId", client_id.as_str()),
+            ("dsid", dsid),
+        ];
+        let url = format!("{SETUP_ENDPOINT}/{path}");
+        let mut resp = match body {
+            Some(body) => {
+                let mut req = self.agent.post(&url);
+                for (k, v) in query {
+                    req = req.query(k, v);
+                }
+                req.header("Origin", HOME_ENDPOINT)
+                    .header("Referer", format!("{HOME_ENDPOINT}/"))
+                    .content_type("text/plain;charset=UTF-8")
+                    .send(body.to_string())?
+            }
+            None => {
+                let mut req = self.agent.get(&url);
+                for (k, v) in query {
+                    req = req.query(k, v);
+                }
+                req.header("Origin", HOME_ENDPOINT)
+                    .header("Referer", format!("{HOME_ENDPOINT}/"))
+                    .call()?
+            }
+        };
+        self.capture(&resp);
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    }
+
+    /// Whether the session holds an unexpired cookie with this name.
+    pub(crate) fn has_cookie(&self, name: &str) -> bool {
+        let jar = self.agent.cookie_jar_lock();
+        let found = jar
+            .iter()
+            .any(|c| c.name() == name && !c.value().is_empty());
+        jar.release();
+        found
     }
 
     /// After a second factor was accepted (a security key): trust this
@@ -780,6 +840,18 @@ fn parse_account_login(data: &Value, apple_id: String) -> Result<SignInStep, Aut
         })
         .unwrap_or_default();
 
+    let pcs_required = data
+        .get("webservices")
+        .and_then(Value::as_object)
+        .map(|services| {
+            services
+                .iter()
+                .filter(|(_, svc)| svc.get("pcsRequired").and_then(Value::as_bool) == Some(true))
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let full_name = match text("fullName") {
         name if !name.is_empty() => name,
         _ => format!("{} {}", text("firstName"), text("lastName"))
@@ -795,6 +867,7 @@ fn parse_account_login(data: &Value, apple_id: String) -> Result<SignInStep, Aut
         dsid: text("dsid"),
         full_name,
         webservices,
+        pcs_required,
     }))
 }
 

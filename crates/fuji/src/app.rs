@@ -184,6 +184,8 @@ pub struct FujiApp {
     _collections_load: Option<Task<()>>,
     /// The account picture, once it's been found or fetched.
     avatar: Option<Arc<Path>>,
+    /// Shown under the spinner while resuming, when there's something to do.
+    resuming_note: Option<SharedString>,
     /// The highlight behind the selected tab: its left edge and width,
     /// easing from tab to tab.
     pill_x: Eased,
@@ -234,6 +236,7 @@ impl FujiApp {
             photos: None,
             _collections_load: None,
             avatar: None,
+            resuming_note: None,
             pill_x: Eased::new(0.),
             pill_width: Eased::new(0.),
             pill_placed: false,
@@ -275,7 +278,7 @@ impl FujiApp {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| match result {
-                Ok(account) => this.show_main(account, auth, window, cx),
+                Ok(account) => this.open_library(account, auth, window, cx),
                 Err(err) => {
                     let notice = SharedString::from(err.to_string());
                     this.show_login(Some(apple_id), auth, Some(notice), window, cx);
@@ -301,13 +304,62 @@ impl FujiApp {
             window,
             move |this, _, event, window, cx| match event {
                 LoginEvent::SignedIn(account) => {
-                    this.show_main(account.clone(), login_auth.clone(), window, cx)
+                    this.open_library(account.clone(), login_auth.clone(), window, cx)
                 }
             },
         ));
         self.screen = Screen::Login(login);
         self.avatar = None;
         cx.notify();
+    }
+
+    /// Open the library. With Advanced Data Protection, first get access
+    /// to it, which the user allows on their iPhone.
+    fn open_library(
+        &mut self,
+        account: Account,
+        auth: Arc<AuthClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !auth.needs_photos_access(&account) {
+            self.show_main(account, auth, window, cx);
+            return;
+        }
+        self._login_subscription = None;
+        self.screen = Screen::Resuming;
+        self.resuming_note = Some(
+            "Your account uses Advanced Data Protection. On your iPhone, allow access to your iCloud data."
+                .into(),
+        );
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let task_auth = auth.clone();
+            let task_account = account.clone();
+            let result = cx
+                .background_spawn(async move {
+                    let result = task_auth.photos_access(&task_account, || {});
+                    if result.is_ok() {
+                        // Keep the access cookies for next time.
+                        session_store::persist(&task_auth);
+                    }
+                    result
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.resuming_note = None;
+                match result {
+                    Ok(_) => this.show_main(account, auth, window, cx),
+                    Err(err) => {
+                        let notice = SharedString::from(err.to_string());
+                        let apple_id = Some(account.apple_id.clone());
+                        this.show_login(apple_id, auth, Some(notice), window, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn show_main(
@@ -1295,7 +1347,9 @@ impl Render for FujiApp {
         let body = div().flex_1().min_h_0();
 
         let (grid, settings) = match &self.screen {
-            Screen::Resuming => return root.child(body.child(resuming())),
+            Screen::Resuming => {
+                return root.child(body.child(resuming(self.resuming_note.clone())));
+            }
             Screen::Login(login) => return root.child(body.child(login.clone())),
             Screen::Main { grid, settings, .. } => (grid.clone(), settings.clone()),
         };
@@ -1483,7 +1537,7 @@ fn keep_session_saved(
     (periodic, on_quit)
 }
 
-fn resuming() -> impl IntoElement {
+fn resuming(note: Option<SharedString>) -> impl IntoElement {
     div()
         .size_full()
         .flex()
@@ -1498,6 +1552,15 @@ fn resuming() -> impl IntoElement {
                 .items_center()
                 .gap(px(12.))
                 .child(ui::spinner("resuming", px(22.), theme::text_muted()))
-                .child("Signing in\u{2026}"),
+                .child("Signing in\u{2026}")
+                .when_some(note, |el, note| {
+                    el.child(
+                        div()
+                            .max_w(px(360.))
+                            .text_center()
+                            .text_color(theme::text())
+                            .child(note),
+                    )
+                }),
         )
 }
