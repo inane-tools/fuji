@@ -37,6 +37,7 @@ impl AssetSource for Assets {
                 "videos-active",
                 "albums",
                 "albums-active",
+                "album-add",
                 "shared",
                 "shared-active",
                 "deleted",

@@ -2,8 +2,8 @@
 //! Favorites and Collections as tabs, search, the account), then the page.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,8 +12,8 @@ use fuji_icloud::{
     Account, Album, AuthClient, Memory, PhotosClient, PhotosError, SavedSession, SharedAlbum,
     SmartAlbum, UserAlbum,
 };
+use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt as _, StreamExt as _};
 use gpui::{
     AnimationExt as _, Bounds, Context, ElementId, Entity, Focusable, FontWeight, KeyBinding,
     Pixels, Point, SharedString, Subscription, Task, Window, actions, canvas, div, point,
@@ -173,6 +173,14 @@ pub struct FujiApp {
     memories: Vec<Memory>,
     /// All memories shown on the Collections page, not just the newest.
     memories_expanded: bool,
+    /// How many memories show when expanded: more come in steps, as each
+    /// card's cover is a decoded image held while it's on the page.
+    memories_limit: usize,
+    /// The Collections page's width, measured as drawn (0 until then).
+    collections_width: Rc<std::cell::Cell<f32>>,
+    collections_scroll: gpui::ScrollHandle,
+    /// Memories whose covers have been asked for, from the newest.
+    memory_covers_asked: usize,
     /// Item counts for the Collections page, by album slug.
     counts: HashMap<String, usize>,
     /// Cover thumbnails for the Collections page, by album slug.
@@ -182,6 +190,19 @@ pub struct FujiApp {
     /// The library client and thumbnail folder, for loading Collections.
     photos: Option<(Arc<PhotosClient>, Arc<Path>)>,
     _collections_load: Option<Task<()>>,
+    _memory_covers_load: Vec<Task<()>>,
+    _memories_load: Option<Task<()>>,
+    /// Album covers on their way (kept per call, so a reload doesn't
+    /// cancel them).
+    _cover_loads: Vec<Task<()>>,
+    /// The memories are being read for the first time.
+    memories_loading: bool,
+    /// All the memories are being read ("Show All").
+    memories_all_loading: bool,
+    /// `memories` is all of them, not just the newest.
+    memories_complete: bool,
+    /// Albums whose cover is on its way, by slug.
+    cover_loading: HashSet<String>,
     /// The account picture, once it's been found or fetched.
     avatar: Option<Arc<Path>>,
     /// The highlight behind the selected tab: its left edge and width,
@@ -223,16 +244,29 @@ impl FujiApp {
             shared_albums: Vec::new(),
             memories: Vec::new(),
             memories_expanded: false,
+            memories_limit: 0,
+            collections_width: Rc::default(),
+            collections_scroll: gpui::ScrollHandle::new(),
+            memory_covers_asked: 0,
             counts: HashMap::new(),
             covers: HashMap::new(),
             // Covers are 168 px squares: decoded no bigger than that needs.
             cover_cache: cx.new(|cx| {
                 let mut cache = crate::image_cache::LruImageCache::new(160, cx);
-                cache.set_max_height(512);
+                // Twice the 168 px cover, for HiDPI.
+                cache.set_max_height(336);
+                cache.set_square(true);
                 cache
             }),
             photos: None,
             _collections_load: None,
+            _memory_covers_load: Vec::new(),
+            _memories_load: None,
+            _cover_loads: Vec::new(),
+            memories_loading: false,
+            memories_all_loading: false,
+            memories_complete: false,
+            cover_loading: HashSet::new(),
             avatar: None,
             pill_x: Eased::new(0.),
             pill_width: Eased::new(0.),
@@ -324,6 +358,16 @@ impl FujiApp {
         self.memories.clear();
         self.counts.clear();
         self.covers.clear();
+        self.cover_loading.clear();
+        self._memories_load = None;
+        self._memory_covers_load.clear();
+        self._cover_loads.clear();
+        self.memories_loading = false;
+        self.memories_all_loading = false;
+        self.memories_complete = false;
+        self.memories_expanded = false;
+        self.memories_limit = 0;
+        self.memory_covers_asked = 0;
         if matches!(self.section, Section::Settings | Section::Collection(_)) {
             self.section = Section::Library;
         }
@@ -342,6 +386,8 @@ impl FujiApp {
         }
         let mut subscriptions = Vec::new();
         if let Some(grid) = &grid {
+            let albums = self.albums.clone();
+            grid.update(cx, |grid, cx| grid.set_user_albums(albums, cx));
             let apple_id = account.apple_id.clone();
             subscriptions.push(
                 cx.subscribe_in(
@@ -566,6 +612,13 @@ impl FujiApp {
     /// Replace the album list, keeping the selected album selected if it's
     /// still there (and following a rename).
     fn set_albums(&mut self, albums: Vec<UserAlbum>, cx: &mut Context<Self>) {
+        if let Screen::Main {
+            grid: Some(grid), ..
+        } = &self.screen
+        {
+            let albums = albums.clone();
+            grid.update(cx, |grid, cx| grid.set_user_albums(albums, cx));
+        }
         if albums == self.albums {
             return;
         }
@@ -605,11 +658,16 @@ impl FujiApp {
     }
 
     /// Count what the Collections page shows and find covers for it.
+    /// Memories load on their own, as their list is slow to read.
     fn load_collections(&mut self, cx: &mut Context<Self>) {
-        let Some((client, thumb_dir)) = self.photos.clone() else {
+        let Some((client, _)) = self.photos.clone() else {
             return;
         };
+        self.load_memories(self.memories_expanded, cx);
+        // The albums are known already: their covers needn't wait for the
+        // counts and shared albums below.
         let albums = self.albums.clone();
+        self.load_album_covers(albums.iter().map(UserAlbum::album).collect(), cx);
         self._collections_load = Some(cx.spawn(async move |this, cx| {
             let list_client = client.clone();
             let listed_albums = albums.clone();
@@ -637,17 +695,10 @@ impl FujiApp {
                         counts.insert(index::album_slug(&album.album()), n);
                     }
                 }
-                let memories = list_client.memories().unwrap_or_default();
-                for memory in &memories {
-                    counts.insert(
-                        index::album_slug(&Album::Memory(memory.id.clone())),
-                        memory.assets.len(),
-                    );
-                }
-                (shared, memories, counts)
+                (shared, counts)
             })
             .await;
-            let Some((shared, memories, counts)) = listed else {
+            let Some((shared, counts)) = listed else {
                 return;
             };
             // Covers for what isn't empty. Hidden and Recently Deleted show
@@ -671,63 +722,265 @@ impl FujiApp {
                 })
                 .collect();
             covered.sort_by_key(index::album_slug);
-            // Memories' covers are their key photos, newest memory first.
-            let keys: Vec<(String, String)> = memories
-                .iter()
-                .filter_map(|m| {
-                    let slug = index::album_slug(&Album::Memory(m.id.clone()));
-                    Some((slug, m.key_asset.clone()?))
-                })
-                .collect();
             this.update(cx, |this, cx| {
                 if this.shared_albums != shared {
                     this.shared_albums = shared;
                 }
-                if this.memories != memories {
-                    this.memories = memories;
-                }
-                this.counts = counts;
+                // Memories' counts come with their list.
+                this.counts.retain(|slug, _| slug.starts_with("memory-"));
+                this.counts.extend(counts);
+                this.load_album_covers(covered, cx);
                 cx.notify();
             })
             .ok();
-            // All at once (the network pool limits how many run), each shown
-            // as it arrives.
+        }));
+    }
+
+    /// Covers for `albums` that don't have one and aren't on their way:
+    /// each its first photo, all at once (the network pool limits how many
+    /// run), shown as it arrives.
+    fn load_album_covers(&mut self, albums: Vec<Album>, cx: &mut Context<Self>) {
+        let Some((client, thumb_dir)) = self.photos.clone() else {
+            return;
+        };
+        let albums: Vec<Album> = albums
+            .into_iter()
+            .filter(|a| {
+                let slug = index::album_slug(a);
+                !self.covers.contains_key(&slug) && !self.cover_loading.contains(&slug)
+            })
+            .collect();
+        if albums.is_empty() {
+            return;
+        }
+        cover_debug(&format!("loading {} album covers", albums.len()));
+        self.cover_loading
+            .extend(albums.iter().map(index::album_slug));
+        let task = cx.spawn(async move |this, cx| {
             let mut pending = FuturesUnordered::new();
-            for (slug, key) in keys {
-                let (client, dir) = (client.clone(), thumb_dir.clone());
-                pending.push(
-                    net::run(move || {
-                        let asset = client.asset(&key).ok()??;
-                        let thumb = asset.thumbnail.as_ref()?;
-                        let path = thumbs::ensure(&client, &dir, &asset.id, thumb).ok()?;
-                        Some((slug, path))
-                    })
-                    .boxed_local(),
-                );
-            }
-            for album in covered {
+            for album in albums {
                 let (client, dir) = (client.clone(), thumb_dir.clone());
                 let slug = index::album_slug(&album);
-                pending.push(
-                    net::run(move || {
-                        let first = client.fetch(&album, 0, 1).ok()?.into_iter().next()?;
-                        let thumb = first.thumbnail.as_ref()?;
-                        let path = thumbs::ensure(&client, &dir, &first.id, thumb).ok()?;
-                        Some((slug, path))
-                    })
-                    .boxed_local(),
-                );
+                pending.push(net::run(move || {
+                    let path = (|| {
+                        let first = match client.fetch(&album, 0, 1) {
+                            Ok(page) => match page.into_iter().next() {
+                                Some(first) => first,
+                                None => return cover_failed(&slug, "first page empty"),
+                            },
+                            Err(err) => return cover_failed(&slug, &format!("fetch: {err}")),
+                        };
+                        let Some(thumb) = first.thumbnail.as_ref() else {
+                            return cover_failed(&slug, "first photo has no thumbnail");
+                        };
+                        match thumbs::ensure(&client, &dir, &first.id, thumb) {
+                            Ok(path) => Some(path),
+                            Err(err) => cover_failed(&slug, &format!("download: {err}")),
+                        }
+                    })();
+                    (slug, path)
+                }));
             }
             while let Some(done) = pending.next().await {
-                if let Some(Some((slug, path))) = done {
-                    this.update(cx, |this, cx| {
-                        this.covers.insert(slug, path.into());
-                        cx.notify();
-                    })
-                    .ok();
+                if let Some((slug, path)) = done {
+                    this.update(cx, |this, cx| this.cover_loaded(slug, path, cx))
+                        .ok();
                 }
             }
+        });
+        self._cover_loads.push(task);
+    }
+
+    /// The memories, newest first, and their covers: only the newest few
+    /// unless `all` (reading them all takes a while with many memories).
+    fn load_memories(&mut self, all: bool, cx: &mut Context<Self>) {
+        let Some((client, _)) = self.photos.clone() else {
+            return;
+        };
+        // A newer ask for all of them replaces one for the newest.
+        if self._memories_load.is_some() && (!all || self.memories_all_loading) {
+            return;
+        }
+        // Skeletons only the first time: later, the old list stays up
+        // while it's read again.
+        self.memories_loading = self.memories.is_empty();
+        self.memories_all_loading = all;
+        let started = std::time::Instant::now();
+        self._memories_load = Some(cx.spawn(async move |this, cx| {
+            let memories = net::run(move || {
+                if all {
+                    client.memories()
+                } else {
+                    client.newest_memories(NEWEST_MEMORIES)
+                }
+            })
+            .await;
+            this.update(cx, |this, cx| {
+                this._memories_load = None;
+                this.memories_loading = false;
+                this.memories_all_loading = false;
+                match memories {
+                    Some(Ok(memories)) => {
+                        cover_debug(&format!(
+                            "{} memories listed in {:?}{}",
+                            memories.len(),
+                            started.elapsed(),
+                            if all { " (all)" } else { " (newest)" }
+                        ));
+                        // The newest again, and still the start of the
+                        // whole list we have: keep the whole list.
+                        let unchanged = !all
+                            && this.memories_complete
+                            && this.memories.iter().zip(&memories).all(|(a, b)| a == b);
+                        if !unchanged {
+                            this.counts.retain(|slug, _| !slug.starts_with("memory-"));
+                            for memory in &memories {
+                                this.counts.insert(
+                                    index::album_slug(&Album::Memory(memory.id.clone())),
+                                    memory.assets.len(),
+                                );
+                            }
+                            if this.memories != memories {
+                                this.memories = memories;
+                                this.memory_covers_asked = 0;
+                            }
+                            this.memories_complete = all;
+                        }
+                        if all && !this.memories_expanded {
+                            this.memories_expanded = true;
+                            this.memories_limit = this.memory_step();
+                        }
+                        this.load_memory_covers(cx);
+                    }
+                    Some(Err(err)) => cover_debug(&format!("memories: {err}")),
+                    None => {}
+                }
+                cx.notify();
+            })
+            .ok();
         }));
+    }
+
+    /// How many memory cards the page shows.
+    fn memories_shown(&self) -> usize {
+        let limit = if self.memories_expanded {
+            self.memories_limit
+        } else {
+            // A row, or two if a row is short.
+            let columns = self.collection_columns();
+            if columns <= 4 { columns * 2 } else { columns }
+        };
+        self.memories.len().min(limit)
+    }
+
+    /// Cards in a row of the Collections page.
+    fn collection_columns(&self) -> usize {
+        let width = self.collections_width.get() - 2. * theme::CONTENT_PADDING;
+        if width <= 0. {
+            return 5;
+        }
+        let (card, gap) = collections::CARD_SPACING;
+        (((width + gap) / (card + gap)).floor() as usize).max(1)
+    }
+
+    /// Memories each "Show More" adds: 20 rows.
+    fn memory_step(&self) -> usize {
+        self.collection_columns() * 20
+    }
+
+    /// "Show All" / "Show Fewer": all of them are read the first time.
+    fn toggle_memories(&mut self, cx: &mut Context<Self>) {
+        if self.memories_all_loading {
+            return;
+        }
+        if !self.memories_expanded && !self.memories_complete {
+            self.load_memories(true, cx);
+        } else {
+            self.memories_expanded = !self.memories_expanded;
+            self.memories_limit = self.memory_step();
+            self.load_memory_covers(cx);
+        }
+        cx.notify();
+    }
+
+    /// A cover arrived, or won't (`None`).
+    fn cover_loaded(&mut self, slug: String, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.cover_loading.remove(&slug);
+        if let Some(path) = path {
+            cover_debug(&format!("{slug}: ready"));
+            self.covers.insert(slug, path.into());
+        }
+        cx.notify();
+    }
+
+    /// Covers for the memories the page shows (the newest few, or all when
+    /// expanded) that don't have one yet: their key photos, looked up a
+    /// page at a time, newest first.
+    fn load_memory_covers(&mut self, cx: &mut Context<Self>) {
+        let Some((client, thumb_dir)) = self.photos.clone() else {
+            return;
+        };
+        let shown = self.memories_shown();
+        let wanted: Vec<(String, String)> = self.memories[..shown]
+            .iter()
+            .filter_map(|m| {
+                let slug = index::album_slug(&Album::Memory(m.id.clone()));
+                if self.covers.contains_key(&slug) || self.cover_loading.contains(&slug) {
+                    return None;
+                }
+                Some((slug, m.key_asset.clone()?))
+            })
+            .collect();
+        self.memory_covers_asked = shown;
+        if wanted.is_empty() {
+            return;
+        }
+        cover_debug(&format!("loading {} memory covers", wanted.len()));
+        self.cover_loading
+            .extend(wanted.iter().map(|(slug, _)| slug.clone()));
+        // Kept per call, so expanding doesn't cancel the newest ones.
+        let task = cx.spawn(async move |this, cx| {
+            for page in wanted.chunks(MEMORY_COVER_PAGE) {
+                let names: Vec<String> = page.iter().map(|(_, key)| key.clone()).collect();
+                let lookup_client = client.clone();
+                let assets = net::run(move || lookup_client.assets(&names)).await;
+                let assets: HashMap<String, fuji_icloud::Asset> = match assets {
+                    Some(Ok(assets)) => assets.into_iter().map(|a| (a.id.0.clone(), a)).collect(),
+                    Some(Err(err)) => {
+                        cover_debug(&format!("memory key photos: {err}"));
+                        HashMap::new()
+                    }
+                    None => HashMap::new(),
+                };
+                let mut pending = FuturesUnordered::new();
+                for (slug, key) in page {
+                    let (client, dir, slug) = (client.clone(), thumb_dir.clone(), slug.clone());
+                    let asset = assets.get(key).cloned();
+                    pending.push(net::run(move || {
+                        let path = (|| {
+                            let Some(asset) = asset else {
+                                return cover_failed(&slug, "key photo not found");
+                            };
+                            let Some(thumb) = asset.thumbnail.as_ref() else {
+                                return cover_failed(&slug, "key photo has no thumbnail");
+                            };
+                            match thumbs::ensure(&client, &dir, &asset.id, thumb) {
+                                Ok(path) => Some(path),
+                                Err(err) => cover_failed(&slug, &format!("download: {err}")),
+                            }
+                        })();
+                        (slug, path)
+                    }));
+                }
+                while let Some(done) = pending.next().await {
+                    if let Some((slug, path)) = done {
+                        this.update(cx, |this, cx| this.cover_loaded(slug, path, cx))
+                            .ok();
+                    }
+                }
+            }
+        });
+        self._memory_covers_load.push(task);
     }
 
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
@@ -1269,6 +1522,11 @@ impl FujiApp {
 
 impl Render for FujiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The page got wider (or more memories showed): covers for them.
+        if self.section == Section::Collections && self.memories_shown() > self.memory_covers_asked
+        {
+            self.load_memory_covers(cx);
+        }
         // Light or dark, and the accent, before anything is drawn.
         let system_light = matches!(
             window.appearance(),
@@ -1348,6 +1606,16 @@ impl Render for FujiApp {
 impl FujiApp {
     /// Albums, shared albums, media types and utilities, as cards.
     fn render_collections(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // Room for every cover on the page: GPUI loads images for cards out
+        // of view too, and evicting one in the frame that draws it crashes.
+        let cards = self.memories_shown()
+            + self.albums.len()
+            + self.shared_albums.len()
+            + SmartAlbum::ALL.len()
+            + 8;
+        self.cover_cache.update(cx, |cache, _| {
+            cache.set_capacity((cards + COVER_SPARE).max(160))
+        });
         let card = |this: &Self, collection: Collection, cx: &mut Context<Self>| {
             let album = this.collection_album(collection);
             let slug = album.as_ref().map(index::album_slug).unwrap_or_default();
@@ -1365,6 +1633,7 @@ impl FujiApp {
                         _ => None,
                     },
                     cover: this.covers.get(&slug).cloned(),
+                    loading: this.cover_loading.contains(&slug),
                     icon: collection.icon(),
                     badge: matches!(collection, Collection::Videos | Collection::Smart(_)),
                 },
@@ -1380,34 +1649,64 @@ impl FujiApp {
                 .text_color(theme::text())
                 .child("Collections"),
         );
-        if !self.memories.is_empty() {
-            const NEWEST: usize = 10;
-            let shown = if self.memories_expanded {
-                self.memories.len()
-            } else {
-                self.memories.len().min(NEWEST)
-            };
+        if self.memories_loading && self.memories.is_empty() {
+            let columns = self.collection_columns();
+            let skeletons = if columns <= 4 { columns * 2 } else { columns };
+            let cards = (0..skeletons as u64)
+                .map(collections::skeleton_card)
+                .collect();
+            page = page.child(collections::section("Memories", cards));
+        } else if !self.memories.is_empty() {
+            let shown = self.memories_shown();
             let cards = (0..shown)
                 .map(|i| card(self, Collection::Memory(i), cx))
                 .collect();
-            let toggle = (self.memories.len() > NEWEST).then(|| {
+            let more = !self.memories_complete || self.memories.len() > shown;
+            let toggle = more.then(|| {
+                if self.memories_all_loading {
+                    return div()
+                        .text_size(px(13.))
+                        .text_color(theme::text_muted())
+                        .child(ui::loading_status(
+                            "memories-all-loading",
+                            "Loading\u{2026}",
+                            theme::text_muted(),
+                        ))
+                        .into_any_element();
+                }
                 let label = if self.memories_expanded {
                     "Show Fewer".to_string()
-                } else {
+                } else if self.memories_complete {
                     format!("Show All ({})", self.memories.len())
+                } else {
+                    "Show All".to_string()
                 };
                 ui::link(
                     "memories-all",
                     label,
-                    cx.listener(|this, _, _, cx| {
-                        this.memories_expanded = !this.memories_expanded;
-                        cx.notify();
-                    }),
+                    cx.listener(|this, _, _, cx| this.toggle_memories(cx)),
                 )
                 .text_size(px(13.))
                 .into_any_element()
             });
             page = page.child(collections::section_with("Memories", toggle, cards));
+            let left = self.memories.len() - shown;
+            if self.memories_expanded && left > 0 {
+                page = page.child(
+                    div().mt(px(-12.)).child(
+                        ui::link(
+                            "memories-more",
+                            format!("Show More ({} left)", collections::group_digits(left)),
+                            cx.listener(|this, _, _, cx| {
+                                this.memories_limit += this.memory_step();
+                                this.load_memory_covers(cx);
+                                cx.notify();
+                            }),
+                        )
+                        .text_size(px(13.)),
+                    ),
+                );
+            }
         }
         if !self.albums.is_empty() {
             let cards = (0..self.albums.len())
@@ -1441,14 +1740,39 @@ impl FujiApp {
             .collect();
         page = page.child(collections::section("Utilities", cards));
 
-        div().size_full().child(
-            div()
-                .id("collections")
-                .size_full()
-                .overflow_y_scroll()
-                .bg(theme::surface())
-                .child(page.px(px(theme::CONTENT_PADDING)).pt(px(10.)).pb(px(40.))),
-        )
+        let width = self.collections_width.clone();
+        div()
+            .relative()
+            .size_full()
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        let w = f32::from(bounds.size.width);
+                        if (width.get() - w).abs() > 0.5 {
+                            width.set(w);
+                            window.refresh();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .id("collections")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.collections_scroll)
+                    .bg(theme::surface())
+                    .child(page.px(px(theme::CONTENT_PADDING)).pt(px(10.)).pb(px(40.))),
+            )
+            .child(ui::scrollbar(
+                "collections-scrollbar",
+                self.collections_scroll.clone(),
+            ))
     }
 }
 
@@ -1501,3 +1825,22 @@ fn resuming() -> impl IntoElement {
                 .child("Signing in\u{2026}"),
         )
 }
+
+fn cover_debug(message: &str) {
+    if std::env::var_os("FUJI_DEBUG").is_some() {
+        eprintln!("covers: {message}");
+    }
+}
+
+/// Log why an album's cover couldn't be loaded (FUJI_DEBUG), and give up on it.
+fn cover_failed<T>(slug: &str, why: &str) -> Option<T> {
+    cover_debug(&format!("{slug}: {why}"));
+    None
+}
+
+/// Memories read before "Show All": enough for a row on a wide screen.
+const NEWEST_MEMORIES: usize = 24;
+/// Covers kept beyond those on the page, for going back and forth.
+const COVER_SPARE: usize = 40;
+/// Memories' key photos looked up per request when loading their covers.
+const MEMORY_COVER_PAGE: usize = 50;

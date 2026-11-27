@@ -442,6 +442,132 @@ impl RenderOnce for Slider {
     }
 }
 
+// ---- Scrollbar ----------------------------------------------------------------
+
+/// Width of the strip along the right edge that takes the scrollbar's
+/// clicks; the bar itself is thinner, and widens under the pointer.
+const SCROLLBAR_HIT: f32 = 14.;
+const SCROLLBAR_MIN_THUMB: f32 = 36.;
+
+/// A thin scrollbar for a view scrolled with `handle`, to put in the same
+/// (relative) parent after it: drag the thumb, or click the track to jump.
+/// Nothing shows while everything fits.
+pub fn scrollbar(id: impl Into<ElementId>, handle: gpui::ScrollHandle) -> Scrollbar {
+    Scrollbar {
+        id: id.into(),
+        handle,
+    }
+}
+
+#[derive(IntoElement)]
+pub struct Scrollbar {
+    id: ElementId,
+    handle: gpui::ScrollHandle,
+}
+
+impl RenderOnce for Scrollbar {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Where a drag started (pointer y, scroll position), kept between frames.
+        let drag = window.use_keyed_state(self.id, cx, |_, _| None::<(f32, f32)>);
+        let handle = self.handle;
+        canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |bounds, hitbox, window, cx| {
+                let view = handle.bounds();
+                let max = f32::from(handle.max_offset().height);
+                let height = f32::from(bounds.size.height);
+                if max <= 0.5 || height <= 0. {
+                    return;
+                }
+                let scrolled = (-f32::from(handle.offset().y)).clamp(0., max);
+                let content = f32::from(view.size.height) + max;
+                let thumb_h = (height * height / content)
+                    .max(SCROLLBAR_MIN_THUMB)
+                    .min(height);
+                let travel = (height - thumb_h).max(1.);
+                let thumb_y = scrolled / max * travel;
+                let held = drag.read(cx).is_some();
+                let wide = held || hitbox.is_hovered(window);
+                let width = if wide { 8. } else { 5. };
+                let thumb = Bounds::new(
+                    gpui::point(bounds.right() - px(width + 3.), bounds.top() + px(thumb_y)),
+                    gpui::size(px(width), px(thumb_h)),
+                );
+                window.paint_quad(
+                    gpui::fill(
+                        thumb,
+                        theme::text_meta().opacity(if wide { 0.7 } else { 0.4 }),
+                    )
+                    .corner_radii(px(width / 2.)),
+                );
+
+                let scroll_to = {
+                    let handle = handle.clone();
+                    move |y: f32, window: &mut Window| {
+                        let y = y.clamp(0., max);
+                        handle.set_offset(gpui::point(handle.offset().x, px(-y)));
+                        window.refresh();
+                    }
+                };
+                let (down_drag, down_scroll) = (drag.clone(), scroll_to.clone());
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if !(phase.bubble()
+                        && event.button == MouseButton::Left
+                        && hitbox.is_hovered(window))
+                    {
+                        return;
+                    }
+                    let y = f32::from(event.position.y - bounds.top());
+                    let start = if y >= thumb_y && y <= thumb_y + thumb_h {
+                        scrolled
+                    } else {
+                        // On the track: put the thumb's middle there.
+                        let to = (y - thumb_h / 2.) / travel * max;
+                        down_scroll(to, window);
+                        to.clamp(0., max)
+                    };
+                    down_drag.update(cx, |drag, cx| {
+                        *drag = Some((y, start));
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                });
+                let move_drag = drag.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if !phase.bubble() {
+                        return;
+                    }
+                    let Some((from, start)) = *move_drag.read(cx) else {
+                        return;
+                    };
+                    if event.dragging() {
+                        let y = f32::from(event.position.y - bounds.top());
+                        scroll_to(start + (y - from) / travel * max, window);
+                    } else {
+                        move_drag.update(cx, |drag, cx| {
+                            *drag = None;
+                            cx.notify();
+                        });
+                    }
+                });
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase.bubble() && drag.read(cx).is_some() {
+                        drag.update(cx, |drag, cx| {
+                            *drag = None;
+                            cx.notify();
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(SCROLLBAR_HIT))
+    }
+}
+
 // ---- Context menu -----------------------------------------------------------
 
 pub struct MenuItem {
