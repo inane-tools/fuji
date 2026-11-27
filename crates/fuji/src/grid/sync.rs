@@ -34,6 +34,7 @@ impl PhotoGrid {
         self.pages_requested.clear();
         self.page_queue.clear();
         self.pages_in_flight = 0;
+        self.singles_asked.clear();
         self.thumbs_failed.clear();
         self.thumbs_in_flight.clear();
         self.thumb_queue.clear();
@@ -156,6 +157,7 @@ impl PhotoGrid {
         self.pages_requested.clear();
         self.page_queue.clear();
         self.pages_in_flight = 0;
+        self.singles_asked.clear();
     }
 
     /// Check for changes in the background, if nothing else is going on.
