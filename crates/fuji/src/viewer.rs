@@ -1073,6 +1073,10 @@ impl Viewer {
         let mut bar_fill = theme::surface();
         bar_fill.a = 0.72;
         div()
+            // Clicks on the bar stay on it: the previous/next edges and the
+            // photo run under it, so a click on Info also went to the next
+            // photo (and two quick ones zoomed).
+            .block_mouse_except_scroll()
             .absolute()
             .top_0()
             .left_0()
