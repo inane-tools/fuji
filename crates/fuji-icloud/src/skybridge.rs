@@ -57,6 +57,9 @@ pub struct Skybridge {
     counter: u32,
     dsid: String,
     reused: bool,
+    /// The handle the devices were looked up under: each message names it
+    /// as the recipient (`tP`), matching the session tokens the lookup gave.
+    handle: String,
 }
 
 /// A connection kept between runs (see [`Skybridge::saved`]): the same push
@@ -175,6 +178,7 @@ impl Skybridge {
         handle: &str,
     ) -> Result<Self, AuthError> {
         let timer = std::time::Instant::now();
+        let debug = std::env::var_os("FUJI_DEBUG").is_some();
         let lap = |what: &str| {
             if std::env::var_os("FUJI_DEBUG").is_some() {
                 eprintln!("skybridge: {what} at {:?}", timer.elapsed());
@@ -233,6 +237,19 @@ impl Skybridge {
                 Some(Device { endpoint, keys })
             })
             .collect();
+        if debug {
+            let scheme = |u: &str| u.split(':').next().unwrap_or("").to_string();
+            eprintln!(
+                "skybridge: own handle {} the looked-up handle (own {}, looked up {})",
+                if registration.uri == handle {
+                    "is"
+                } else {
+                    "differs from"
+                },
+                scheme(&registration.uri),
+                scheme(handle),
+            );
+        }
         Ok(Self {
             push,
             identity,
@@ -242,6 +259,7 @@ impl Skybridge {
             counter,
             dsid: dsid.to_string(),
             reused,
+            handle: handle.to_string(),
         })
     }
 
@@ -304,10 +322,15 @@ impl Skybridge {
             "t".into(),
             Plist::String(BASE64.encode(&device.endpoint.push_token)),
         );
-        entry.insert("tP".into(), Plist::String(self.registration.uri.clone()));
+        // The recipient is the handle the devices were looked up under (as
+        // icloud.com does), not our own handle: the session tokens are for it.
+        entry.insert("tP".into(), Plist::String(self.handle.clone()));
 
+        // A version 4 UUID, as icloud.com sends.
         let mut uuid = [0u8; 16];
         rand::fill(&mut uuid);
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
         let mut envelope = Dictionary::new();
         envelope.insert("E".into(), Plist::String("pair-ec".into()));
         envelope.insert("c".into(), Plist::Integer(NICE_DATA.into()));
@@ -332,19 +355,48 @@ impl Skybridge {
     pub fn receive(&mut self, timeout: Duration) -> Result<Option<Reply>, AuthError> {
         let deadline = Instant::now() + timeout;
         let topic = push::topic_hash(ICLOUD_WEB_TOPIC);
+        let debug = std::env::var_os("FUJI_DEBUG").is_some();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let Some(p) = self.push.next_push(left)? else {
                 return Ok(None);
             };
             if p.topic_hash != topic {
+                if debug {
+                    eprintln!("skybridge: push on another topic, skipped");
+                }
                 continue;
             }
             let Some(envelope) = crate::ids::parse_bplist(&p.raw).and_then(Plist::into_dictionary)
             else {
+                if debug {
+                    eprintln!("skybridge: push that isn't a plist, skipped");
+                }
                 continue;
             };
             if envelope.get("E").and_then(Plist::as_string) != Some("pair-ec") {
+                if debug && envelope.get("c").and_then(Plist::as_signed_integer) == Some(255) {
+                    // A delivery status for something we sent: `s` is the code.
+                    let num = |k: &str| envelope.get(k).and_then(Plist::as_signed_integer);
+                    let sender = envelope
+                        .get("t")
+                        .and_then(bytes_of)
+                        .and_then(|t| self.devices.iter().position(|d| d.endpoint.push_token == t));
+                    eprintln!(
+                        "skybridge: delivery status s={:?} e={:?} from device {sender:?}",
+                        num("s"),
+                        num("e"),
+                    );
+                    continue;
+                }
+                if debug {
+                    let keys: Vec<&str> = envelope.keys().map(String::as_str).collect();
+                    eprintln!(
+                        "skybridge: message with encryption {:?} (keys {keys:?}, command {:?}), skipped",
+                        envelope.get("E").and_then(Plist::as_string),
+                        envelope.get("c").and_then(Plist::as_signed_integer),
+                    );
+                }
                 continue;
             }
             let (Some(from), Some(sealed)) = (
@@ -358,6 +410,9 @@ impl Skybridge {
                 .iter()
                 .position(|d| d.endpoint.push_token == from)
             else {
+                if debug {
+                    eprintln!("skybridge: a message from an unknown sender, skipped");
+                }
                 continue;
             };
             let own = self.own();
@@ -369,6 +424,9 @@ impl Skybridge {
                 continue;
             };
             let Ok(reply) = serde_json::from_slice::<Value>(&maybe_gunzip(message)) else {
+                if debug {
+                    eprintln!("skybridge: a message from device {index} isn't JSON, skipped");
+                }
                 continue;
             };
             let part = match (reply["i"].as_u64(), reply["t"].as_u64()) {
@@ -402,6 +460,9 @@ impl Skybridge {
             let exchange = uuid::Uuid::new_v4().to_string().to_uppercase();
             let body = json!({ "kv": { "s": { "v": 1, "t": exchange } } });
             let step1 = self.send(index, body, Some(session_token))?;
+            if std::env::var_os("FUJI_DEBUG").is_some() {
+                eprintln!("skybridge: asked device {index} to verify the key");
+            }
             pending.push(Some(Pending {
                 exchange,
                 step1,

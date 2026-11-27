@@ -29,10 +29,24 @@ use crate::spake::Prover;
 
 /// The topic when the two-factor page doesn't name one.
 const DEFAULT_TOPIC: &str = "com.apple.idmsauthwidget";
-/// How long to wait for the device's first message (the widget waits 10 s).
-const FIRST_PUSH: Duration = Duration::from_secs(30);
+/// How long to wait for a device to approve. The widget puts no deadline on
+/// this; the caller shows the code screen meanwhile, so be generous.
+const FIRST_PUSH: Duration = Duration::from_secs(180);
 /// How long to wait for the device in later steps.
 const NEXT_PUSH: Duration = Duration::from_secs(60);
+
+/// How a device approval started.
+#[derive(Debug)]
+pub enum BridgeStart {
+    /// A device approved: finish with the code it shows ([`AuthClient::finish_bridge`]).
+    Approval(Box<BridgeApproval>),
+    /// A device approved, but Apple chose plain code checking: submit the
+    /// code it shows with [`AuthClient::submit_device_code`]. Don't ask for
+    /// a new one; that would prompt the devices again.
+    PlainCode,
+    /// Not offered for this sign-in: ask for a code ([`AuthClient::request_device_code`]).
+    NotOffered,
+}
 
 /// An approval in progress: waiting for the user to type the device's code.
 pub struct BridgeApproval {
@@ -48,6 +62,37 @@ impl std::fmt::Debug for BridgeApproval {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("BridgeApproval(..)")
     }
+}
+
+/// Diagnostics on stderr when `FUJI_DEBUG` is set. Never logs secrets.
+fn debug(message: &str) {
+    if std::env::var_os("FUJI_DEBUG").is_some() {
+        eprintln!("fuji-icloud: bridge: {message}");
+    }
+}
+
+/// What a push carried, for the debug log: field names and step, no values.
+fn describe(payload: &Value) -> String {
+    let has = |name: &str| payload.get(name).is_some_and(|v| !v.is_null());
+    let present: Vec<&str> = [
+        "salt",
+        "data",
+        "encryptedCode",
+        "sessionUUID",
+        "idmsdata",
+        "akdata",
+        "mid",
+    ]
+    .into_iter()
+    .filter(|n| has(n))
+    .collect();
+    let txnid =
+        text(payload, "txnid").map_or("none", |t| if t.ends_with("_W") { "_W" } else { "other" });
+    format!(
+        "nextStep={:?} ec={} txnid={txnid} fields={present:?}",
+        next_step(payload),
+        payload.get("ec").map_or("none".into(), Value::to_string),
+    )
 }
 
 fn bridge_error(message: impl Into<String>) -> AuthError {
@@ -103,8 +148,10 @@ impl BridgeApproval {
                 continue;
             }
             let Some(payload) = push.payload else {
+                debug("push without a payload");
                 continue;
             };
+            debug(&format!("push: {}", describe(&payload)));
             if let Some(ec) = payload
                 .get("ec")
                 .and_then(Value::as_i64)
@@ -114,9 +161,24 @@ impl BridgeApproval {
                     "Your device stopped the approval (error {ec})."
                 )));
             }
-            let session = text(&payload, "sessionUUID");
-            if session.is_some() && session != Some(self.session_uuid.as_str()) {
-                continue;
+            // Plain code checking ("_W") names the session by our push token
+            // (base64, third part of `txnid`), not by `sessionUUID`.
+            if let Some(txnid) = text(&payload, "txnid").filter(|t| t.ends_with("_W")) {
+                let ours = txnid
+                    .split('_')
+                    .nth(2)
+                    .and_then(b64_decode)
+                    .is_some_and(|t| t.eq_ignore_ascii_case(self.ptkn.as_bytes()));
+                if !ours {
+                    debug("push: _W for another push token, skipped");
+                    continue;
+                }
+            } else {
+                let session = text(&payload, "sessionUUID");
+                if session.is_some() && session != Some(self.session_uuid.as_str()) {
+                    debug("push: for another session, skipped");
+                    continue;
+                }
             }
             self.remember(&payload);
             return Ok(payload);
@@ -148,20 +210,17 @@ impl BridgeApproval {
 
 impl AuthClient {
     /// After the password, when two-factor is needed: ask the user's devices
-    /// to approve, and wait until one has. Then the user types the code it
-    /// shows into [`Self::finish_bridge`]. `None` if this sign-in doesn't
-    /// offer approval this way (use the code from [`Self::request_device_code`]).
-    pub fn start_bridge(&self) -> Result<Option<BridgeApproval>, AuthError> {
+    /// to approve, and wait (up to a few minutes) until one has. Blocks, so
+    /// show the code screen meanwhile.
+    pub fn start_bridge(&self) -> Result<BridgeStart, AuthError> {
         let Some(config) = self.bridge_config()? else {
-            return Ok(None);
+            debug("not offered on the two-factor page");
+            return Ok(BridgeStart::NotOffered);
         };
         self.start_bridge_with(&config)
     }
 
-    fn start_bridge_with(
-        &self,
-        config: &BridgeConfig,
-    ) -> Result<Option<BridgeApproval>, AuthError> {
+    fn start_bridge_with(&self, config: &BridgeConfig) -> Result<BridgeStart, AuthError> {
         let topic = config.apns_topic.as_deref().unwrap_or(DEFAULT_TOPIC);
         let host = push::host_for(config.apns_environment.as_deref().unwrap_or("prod"));
         let push = PushConnection::connect(host, &[topic])?;
@@ -186,22 +245,50 @@ impl AuthClient {
         };
         if text(&payload, "txnid").is_some_and(|t| t.ends_with("_W")) {
             // Apple chose plain code checking: no key exchange this time.
+            debug("approved, plain code checking");
             approval.push.close();
-            return Ok(None);
+            return Ok(BridgeStart::PlainCode);
         }
         approval.salt = text(&payload, "salt")
             .and_then(b64_decode)
             .ok_or_else(|| bridge_error("Your device sent no salt."))?;
-        Ok(Some(approval))
+        debug("approved, key exchange");
+        Ok(BridgeStart::Approval(Box::new(approval)))
     }
 
     /// Finish with the code the device shows. Returns the account and the
     /// key now shared with that device.
     pub fn finish_bridge(
         &self,
-        mut approval: BridgeApproval,
+        approval: BridgeApproval,
         code: &str,
     ) -> Result<(Account, PairingKey), AuthError> {
+        let pairing = self.pair_with_code(approval, code)?;
+        match self.after_bridge()? {
+            SignInStep::Done(account) => Ok((account, pairing)),
+            SignInStep::NeedsCode => Err(bridge_error(
+                "Apple still wants a verification code after the approval",
+            )),
+        }
+    }
+
+    /// Finish an on-demand approval (see [`AuthClient::begin_on_demand`])
+    /// with the code the device shows: only the key shared with the device,
+    /// the session is already signed in.
+    pub fn finish_pairing(
+        &self,
+        approval: BridgeApproval,
+        code: &str,
+    ) -> Result<PairingKey, AuthError> {
+        self.pair_with_code(approval, code)
+    }
+
+    /// The key exchange with the code, and Apple's check of the real code.
+    fn pair_with_code(
+        &self,
+        mut approval: BridgeApproval,
+        code: &str,
+    ) -> Result<PairingKey, AuthError> {
         let code = code.trim();
         let prover = Prover::new(&approval.salt, code);
         let message1 = BASE64.encode(prover.message1());
@@ -260,20 +347,14 @@ impl AuthClient {
         );
         approval.push.close();
 
-        let pairing = PairingKey {
+        Ok(PairingKey {
             key: BASE64.encode(&agreed.shared_key),
             mid: approval
                 .state
                 .get("mid")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-        };
-        match self.after_bridge()? {
-            SignInStep::Done(account) => Ok((account, pairing)),
-            SignInStep::NeedsCode => Err(bridge_error(
-                "Apple still wants a verification code after the approval",
-            )),
-        }
+        })
     }
 
     fn bridge_post(&self, path: &str, body: &Value) -> Result<(), AuthError> {

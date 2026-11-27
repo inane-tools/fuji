@@ -120,6 +120,12 @@ pub fn save_pairing(pairing: &fuji_icloud::PairingKey) {
     }
 }
 
+/// Forget the pairing with the iPhone (and the device connection). Blocking.
+pub fn clear_pairing() {
+    write(PAIRING_KEY, None);
+    clear_bridge();
+}
+
 /// The saved pairing key, unless it has expired.
 pub fn load_pairing() -> Option<fuji_icloud::PairingKey> {
     let record: PairingRecord = serde_json::from_str(&read(PAIRING_KEY)?).ok()?;

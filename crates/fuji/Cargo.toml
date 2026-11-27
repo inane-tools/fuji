@@ -52,6 +52,10 @@ windows = { version = "0.61", features = [
 # `#[implement]` expands to paths in this crate.
 windows-core = "0.61"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Security keys over USB for two-factor (Linux has no system WebAuthn).
+authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"] }
+
 [target.'cfg(windows)'.build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 embed-resource = "3"

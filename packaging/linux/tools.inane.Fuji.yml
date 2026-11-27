@@ -11,7 +11,9 @@ finish-args:
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
-  - --device=dri
+  # GPU, and USB security keys for two-factor sign-in (they need raw HID
+  # access, which only `all` grants; it includes the GPU).
+  - --device=all
   - --socket=pulseaudio
   # The saved sign-in's key, in the system keyring.
   - --talk-name=org.freedesktop.secrets

@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use std::sync::Mutex;
 
-use fuji_icloud::{Account, AuthClient, AuthError, BridgeApproval, SignInStep, TrustedPhone};
+use fuji_icloud::{
+    Account, AuthClient, AuthError, BridgeApproval, BridgeStart, SecurityKeyChallenge, SignInStep,
+    TrustedPhone,
+};
 use gpui::{
     Animation, AnimationExt as _, App, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, SharedString, Subscription, Window, div, ease_out_quint, prelude::*, px,
@@ -15,9 +18,42 @@ use gpui::{
 
 use crate::assets::icon;
 use crate::input::{FocusNext, FocusPrev, Submitted, TextInput};
+use crate::security_key::{self, KeyError};
 use crate::{passkey, platform, session_store, theme};
 
 const CODE_LENGTH: usize = 6;
+/// How long a typed code waits for a device approval that's on its way.
+const APPROVAL_GRACE: Duration = Duration::from_secs(5);
+
+/// Approval on a device ("bridge"), which runs in the background while the
+/// code screen is up.
+#[derive(Default)]
+enum BridgeSlot {
+    /// None running: codes go to plain verification.
+    #[default]
+    Idle,
+    /// Waiting for a device to approve.
+    Waiting,
+    /// A device approved; its code finishes the key exchange.
+    Ready(Box<BridgeApproval>),
+    /// A device approved; its code goes to plain verification.
+    Plain,
+}
+
+#[derive(Default)]
+struct BridgeState {
+    /// Bumped to cancel: a background task whose generation is stale
+    /// leaves the slot alone and asks Apple for nothing more.
+    generation: u64,
+    slot: BridgeSlot,
+}
+
+impl BridgeState {
+    fn cancel(&mut self) {
+        self.generation += 1;
+        self.slot = BridgeSlot::Idle;
+    }
+}
 
 pub enum LoginEvent {
     SignedIn(Account),
@@ -31,6 +67,14 @@ enum Stage {
         sms: Option<TrustedPhone>,
         phones: Option<Vec<TrustedPhone>>,
     },
+    /// The account signs in with a security key; Apple sends no codes.
+    SecurityKey {
+        /// The challenge to sign; `None` to fetch a new one (after Apple
+        /// turned down an answer).
+        challenge: Option<SecurityKeyChallenge>,
+        /// The key has a PIN: show the field.
+        needs_pin: bool,
+    },
 }
 
 impl Stage {
@@ -38,6 +82,7 @@ impl Stage {
         match self {
             Stage::Credentials => "stage-credentials",
             Stage::Code { .. } => "stage-code",
+            Stage::SecurityKey { .. } => "stage-security-key",
         }
     }
 }
@@ -48,15 +93,17 @@ pub struct LoginView {
     apple_id: Entity<TextInput>,
     password: Entity<TextInput>,
     code: Entity<TextInput>,
+    /// The security key's PIN, when it has one.
+    key_pin: Entity<TextInput>,
     busy: bool,
     /// The busy wait is the passkey dialog.
     passkey_busy: bool,
     error: Option<SharedString>,
     notice: Option<SharedString>,
     focus_handle: FocusHandle,
-    /// Approval on a device in progress ("bridge"); the typed code finishes
-    /// it and pairs fuji with that device.
-    bridge: Arc<Mutex<Option<BridgeApproval>>>,
+    /// Approval on a device ("bridge"); when it went through, the typed
+    /// code finishes it and pairs fuji with that device.
+    bridge: Arc<Mutex<BridgeState>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -87,6 +134,7 @@ impl LoginView {
         });
         let password = cx.new(|cx| TextInput::new("Password", cx).masked());
         let code = cx.new(|cx| TextInput::new("6-digit code", cx));
+        let key_pin = cx.new(|cx| TextInput::new("Security key PIN", cx).masked());
 
         let subscriptions = vec![
             cx.subscribe_in(
@@ -101,6 +149,9 @@ impl LoginView {
             }),
             cx.subscribe_in(&code, window, |this, _, _: &Submitted, window, cx| {
                 this.submit_code(window, cx);
+            }),
+            cx.subscribe_in(&key_pin, window, |this, _, _: &Submitted, window, cx| {
+                this.use_security_key(window, cx);
             }),
             // Submit as soon as all six digits are in.
             cx.observe_in(&code, window, |this, code, window, cx| {
@@ -129,6 +180,7 @@ impl LoginView {
             apple_id: apple_id_input,
             password,
             code,
+            key_pin,
             busy: false,
             passkey_busy: false,
             error: None,
@@ -161,48 +213,212 @@ impl LoginView {
                     if let Ok(SignInStep::Done(_)) = &step {
                         session_store::persist(&auth);
                     }
-                    let mut approval = None;
-                    if let Ok(SignInStep::NeedsCode) = &step {
-                        // Ask the devices to approve; this also pairs fuji with
-                        // the one that does. Otherwise, a plain code.
-                        match auth.start_bridge() {
-                            Ok(Some(a)) => approval = Some(a),
-                            Ok(None) => {
-                                let _ = auth.request_device_code();
-                            }
+                    // Accounts with security keys get no codes: ask for the key.
+                    let key = match &step {
+                        Ok(SignInStep::NeedsCode) => match auth.security_key_challenge() {
+                            Ok(key) => key,
                             Err(err) => {
                                 if std::env::var_os("FUJI_DEBUG").is_some() {
-                                    eprintln!("bridge: couldn't start: {err}");
+                                    eprintln!("security key: couldn't read the page: {err}");
                                 }
-                                let _ = auth.request_device_code();
+                                None
                             }
-                        }
-                    }
-                    (step, approval)
+                        },
+                        _ => None,
+                    };
+                    (step, key)
                 })
                 .await;
-            let (result, approval) = result;
+            let (result, key) = result;
             this.update_in(cx, |this, window, cx| {
                 this.set_busy(false, cx);
                 this.password.update(cx, |p, cx| p.clear(cx));
                 match result {
                     Ok(SignInStep::Done(account)) => cx.emit(LoginEvent::SignedIn(account)),
+                    Ok(SignInStep::NeedsCode) if key.is_some() => {
+                        this.stage = Stage::SecurityKey {
+                            challenge: key,
+                            needs_pin: false,
+                        };
+                        this.notice = None;
+                        this.use_security_key(window, cx);
+                    }
                     Ok(SignInStep::NeedsCode) => {
                         this.stage = Stage::Code {
                             sms: None,
                             phones: None,
                         };
-                        this.notice = approval.is_some().then(|| {
-                            "Allow the sign-in on your device, then enter the code it shows.".into()
-                        });
-                        *this.bridge.lock().unwrap() = approval;
+                        this.notice = Some(
+                            "Allow the sign-in on your iPhone, iPad or Mac, then enter the code it shows."
+                                .into(),
+                        );
                         this.code.focus_handle(cx).focus(window);
+                        this.start_bridge(window, cx);
                         cx.notify();
                     }
                     Err(err) => this.fail(err, cx),
                 }
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Ask the security key to sign Apple's challenge (the user touches it),
+    /// then send the answer to Apple.
+    fn use_security_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Stage::SecurityKey {
+            challenge,
+            needs_pin,
+        } = &self.stage
+        else {
+            return;
+        };
+        if self.busy {
+            return;
+        }
+        let pin = needs_pin.then(|| self.key_pin.read(cx).text().to_string());
+        if pin.as_deref() == Some("") {
+            self.error = Some("Enter your security key's PIN.".into());
+            cx.notify();
+            return;
+        }
+        let challenge = challenge.clone();
+        let handle = platform::native_handle(window).unwrap_or(0);
+        self.set_busy(true, cx);
+        let auth = self.auth.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            // On failure: the key's error or Apple's, and whether Apple saw the challenge.
+            let result: Result<Account, (Option<KeyError>, Option<AuthError>, bool)> = cx
+                .background_spawn(async move {
+                    let challenge = match challenge {
+                        Some(c) => c,
+                        None => match auth.security_key_challenge() {
+                            Ok(Some(c)) => c,
+                            Ok(None) => {
+                                return Err((
+                                    Some(KeyError::Failed(
+                                        "Apple stopped asking for a security key. Sign in again."
+                                            .into(),
+                                    )),
+                                    None,
+                                    false,
+                                ));
+                            }
+                            Err(err) => return Err((None, Some(err), false)),
+                        },
+                    };
+                    let assertion = security_key::sign(handle, &challenge, pin)
+                        .map_err(|e| (Some(e), None, false))?;
+                    // Apple has seen this challenge now: a retry needs a new one.
+                    let account = auth
+                        .submit_security_key(&challenge, &assertion)
+                        .map_err(|e| (None, Some(e), true))?;
+                    session_store::persist(&auth);
+                    Ok(account)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.set_busy(false, cx);
+                match result {
+                    Ok(account) => cx.emit(LoginEvent::SignedIn(account)),
+                    Err((key_err, auth_err, spent)) => {
+                        if let Stage::SecurityKey {
+                            challenge,
+                            needs_pin,
+                        } = &mut this.stage
+                        {
+                            if spent {
+                                *challenge = None;
+                            }
+                            if matches!(key_err, Some(KeyError::NeedsPin | KeyError::WrongPin(_))) {
+                                *needs_pin = true;
+                            }
+                        }
+                        match (key_err, auth_err) {
+                            (Some(KeyError::NeedsPin), _) => {
+                                this.notice = Some(KeyError::NeedsPin.message().into());
+                                this.key_pin.focus_handle(cx).focus(window);
+                            }
+                            (Some(err), _) => {
+                                if matches!(err, KeyError::WrongPin(_)) {
+                                    this.key_pin.update(cx, |p, cx| p.clear(cx));
+                                    this.key_pin.focus_handle(cx).focus(window);
+                                }
+                                this.error = Some(err.message().into());
+                            }
+                            (None, Some(err)) => this.fail(err, cx),
+                            (None, None) => {}
+                        }
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask the devices to approve, in the background; the code screen is
+    /// already up, so a code from anywhere else still works meanwhile. A
+    /// device that approves also gets paired with fuji.
+    fn start_bridge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = {
+            let mut state = self.bridge.lock().unwrap();
+            state.cancel();
+            state.slot = BridgeSlot::Waiting;
+            state.generation
+        };
+        let auth = self.auth.clone();
+        let bridge = self.bridge.clone();
+        let debug = std::env::var_os("FUJI_DEBUG").is_some();
+        cx.spawn_in(window, async move |this, cx| {
+            let notice = cx
+                .background_spawn(async move {
+                    let current = || bridge.lock().unwrap().generation == generation;
+                    let started = auth.start_bridge();
+                    if !current() {
+                        return None;
+                    }
+                    let (slot, notice) = match started {
+                        Ok(BridgeStart::Approval(approval)) => (
+                            BridgeSlot::Ready(approval),
+                            "Enter the code your device shows.",
+                        ),
+                        Ok(BridgeStart::PlainCode) => {
+                            (BridgeSlot::Plain, "Enter the code your device shows.")
+                        }
+                        Ok(BridgeStart::NotOffered) | Err(_) => {
+                            if let Err(err) = &started
+                                && debug
+                            {
+                                eprintln!("bridge: no approval: {err}");
+                            }
+                            // Ask for a code the older way.
+                            let _ = auth.request_device_code();
+                            (
+                                BridgeSlot::Idle,
+                                "Enter the code shown on your device, or have one texted to you.",
+                            )
+                        }
+                    };
+                    let mut state = bridge.lock().unwrap();
+                    if state.generation != generation {
+                        return None;
+                    }
+                    state.slot = slot;
+                    Some(notice)
+                })
+                .await;
+            if let Some(notice) = notice {
+                this.update(cx, |this, cx| {
+                    if matches!(this.stage, Stage::Code { sms: None, .. }) {
+                        this.notice = Some(notice.into());
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -306,7 +522,29 @@ impl LoginView {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let approval = bridge.lock().unwrap().take();
+                    // A device approval may be a moment from arriving (the
+                    // widget waits too). If one came, take it. If none has
+                    // yet, leave it running: this code may be from a text,
+                    // and the device may still approve after a wrong one.
+                    let deadline = std::time::Instant::now() + APPROVAL_GRACE;
+                    let slot = loop {
+                        let mut state = bridge.lock().unwrap();
+                        if matches!(state.slot, BridgeSlot::Waiting) {
+                            if phone_id.is_none() && std::time::Instant::now() < deadline {
+                                drop(state);
+                                std::thread::sleep(Duration::from_millis(200));
+                                continue;
+                            }
+                            break BridgeSlot::Waiting;
+                        }
+                        let slot = std::mem::take(&mut state.slot);
+                        state.cancel();
+                        break slot;
+                    };
+                    let approval = match slot {
+                        BridgeSlot::Ready(approval) => Some(*approval),
+                        _ => None,
+                    };
                     let account = match (phone_id, approval) {
                         (Some(id), _) => auth.submit_sms_code(id, &code),
                         (None, Some(approval)) => match auth.finish_bridge(approval, &code) {
@@ -332,6 +570,8 @@ impl LoginView {
                         (None, None) => auth.submit_device_code(&code),
                     };
                     if account.is_ok() {
+                        // Signed in: stop an approval still waiting.
+                        bridge.lock().unwrap().cancel();
                         session_store::persist(&auth);
                     }
                     account
@@ -388,6 +628,7 @@ impl LoginView {
         if self.busy {
             return;
         }
+        self.bridge.lock().unwrap().cancel();
         self.set_busy(true, cx);
         let auth = self.auth.clone();
         let id = phone.id;
@@ -417,8 +658,9 @@ impl LoginView {
     }
 
     fn back_to_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.bridge.lock().unwrap().take();
+        self.bridge.lock().unwrap().cancel();
         self.stage = Stage::Credentials;
+        self.key_pin.update(cx, |p, cx| p.clear(cx));
         self.error = None;
         self.notice = None;
         self.code.update(cx, |c, cx| c.clear(cx));
@@ -431,7 +673,7 @@ impl LoginView {
         if busy {
             self.error = None;
         }
-        for input in [&self.apple_id, &self.password, &self.code] {
+        for input in [&self.apple_id, &self.password, &self.code, &self.key_pin] {
             input.update(cx, |i, cx| i.set_disabled(busy, cx));
         }
         cx.notify();
@@ -556,12 +798,54 @@ impl LoginView {
     }
 }
 
+impl LoginView {
+    fn render_security_key(
+        &self,
+        needs_pin: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let subtitle = if security_key::SUPPORTED {
+            "Your Apple Account uses security keys. Plug yours in and touch it when it blinks."
+        } else {
+            "Your Apple Account uses security keys, which Fuji can't use on this system yet."
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Use your security key", subtitle))
+            .when(needs_pin, |el| el.child(self.key_pin.clone()))
+            .when(security_key::SUPPORTED, |el| {
+                el.child(primary_button(
+                    "use-key",
+                    if self.busy {
+                        "Waiting for your security key\u{2026}"
+                    } else if needs_pin {
+                        "Continue"
+                    } else {
+                        "Try again"
+                    },
+                    self.busy,
+                    cx.listener(|this, _, window, cx| this.use_security_key(window, cx)),
+                ))
+            })
+            .child(link_button(
+                "back",
+                "Use a different Apple Account",
+                cx.listener(|this, _, window, cx| this.back_to_credentials(window, cx)),
+            ))
+    }
+}
+
 impl Render for LoginView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let stage = self.stage.clone();
         let body = match &stage {
             Stage::Credentials => self.render_credentials(cx).into_any_element(),
             Stage::Code { sms, phones } => self.render_code(sms, phones, cx).into_any_element(),
+            Stage::SecurityKey { needs_pin, .. } => {
+                self.render_security_key(*needs_pin, cx).into_any_element()
+            }
         };
 
         // Dialog recipe: popover surface, 16px rounding, one deep shadow.

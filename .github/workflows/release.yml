@@ -80,7 +80,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxi-dev libxcursor-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev libdbus-1-dev \
-            libssl-dev libzstd-dev pkg-config file desktop-file-utils
+            libssl-dev libzstd-dev libudev-dev pkg-config file desktop-file-utils
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace --release
