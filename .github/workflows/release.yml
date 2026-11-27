@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      codename: ${{ steps.version.outputs.codename }}
     steps:
       - uses: actions/checkout@v4
       - id: version
@@ -34,6 +35,9 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "codename=$(python3 scripts/release_notes.py codename "$version")" >> "$GITHUB_OUTPUT"
+          # The release's notes (docs/releases/<version>.md) must exist.
+          python3 scripts/release_notes.py notes "$version"
 
   windows:
     name: Windows installer
@@ -185,7 +189,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          python3 scripts/release_notes.py notes "${{ needs.version.outputs.version }}" > "$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "Fuji ${{ needs.version.outputs.version }}" \
-            --generate-notes \
+            --title "$GITHUB_REF_NAME ${{ needs.version.outputs.codename }}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest \
             --verify-tag

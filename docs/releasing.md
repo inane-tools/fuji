@@ -31,20 +31,26 @@ The second line prints the public half for `PUBLIC_KEY`.
 
 ## Each release
 
-1. Set the version in the workspace `Cargo.toml` (`[workspace.package]`)
-   and commit it. A new minor version gets the next codename (see
-   `crates/fuji/src/release.rs`).
-2. Tag that commit and push the tag:
+1. Set the version in the workspace `Cargo.toml` (`[workspace.package]`).
+   A new minor version gets the next codename (see
+   `crates/fuji/src/release.rs`); patch releases keep their minor's.
+2. Add the release to `CHANGELOG.md`, and write its short notes in
+   `docs/releases/<version>.md`: one line that opens
+   `Fuji 1.0.1 **Kanagawa-oki** fixes …`, then a few bullets with the key
+   words in bold. Commit.
+3. Tag that commit and push the tag:
 
    ```sh
    git tag v1.0.1
    git push origin v1.0.1
    ```
 
-3. CI checks that the tag matches the version, runs the tests, builds
-   and packages Windows and Linux, signs each file, and publishes the
-   release with generated notes. Edit the notes on GitHub afterwards if
-   you like.
+4. CI checks that the tag matches the version and that the notes exist,
+   runs the tests, builds and packages Windows and Linux, signs each
+   file, and publishes the release as `v1.0.1 Kanagawa-oki`. The notes
+   are the file from step 2, then a link to the changelog and how to
+   install (`scripts/release_notes.py` puts them together; run
+   `python3 scripts/release_notes.py notes 1.0.1` to preview them).
 
 To try the packaging without publishing, run the Release workflow by hand
 (Actions → Release → Run workflow): it does everything but publish, and
