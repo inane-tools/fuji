@@ -9,15 +9,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Div, ElementId, FontWeight, ObjectFit, SharedString, Stateful,
-    Window, div, img, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Div, ElementId, FontWeight,
+    ObjectFit, SharedString, Stateful, Window, div, img, prelude::*, pulsating_between, px,
 };
 
 use crate::assets::icon;
-use crate::theme;
+use crate::{anim, theme};
 
 /// Size of a card's cover.
 const COVER: f32 = 168.;
+/// Space between cards.
+const GAP: f32 = 18.;
+/// A card's width and the space between cards, for counting what fits.
+pub const CARD_SPACING: (f32, f32) = (COVER, GAP);
 
 /// One thing on the page.
 pub struct Card {
@@ -32,6 +36,53 @@ pub struct Card {
     /// types.
     pub icon: &'static str,
     pub badge: bool,
+    /// The cover photo is on its way.
+    pub loading: bool,
+}
+
+/// Something gently pulsing: it's loading. Still when motion is reduced.
+fn pulse(id: ElementId, el: Div) -> AnyElement {
+    if anim::reduced() {
+        return el.into_any_element();
+    }
+    el.with_animation(
+        id,
+        Animation::new(std::time::Duration::from_millis(1100))
+            .repeat()
+            .with_easing(pulsating_between(0.35, 1.)),
+        |el, t| el.opacity(t),
+    )
+    .into_any_element()
+}
+
+/// A stand-in for a card that's still loading: a pulsing cover and lines
+/// for its title and date.
+pub fn skeleton_card(key: u64) -> Stateful<Div> {
+    let bar = |width: f32, height: f32| {
+        div()
+            .w(px(width))
+            .h(px(height))
+            .rounded(px(4.))
+            .bg(theme::placeholder())
+    };
+    div()
+        .id(ElementId::NamedInteger("collection-skeleton".into(), key))
+        .w(px(COVER))
+        .child(pulse(
+            ElementId::NamedInteger("skeleton-pulse".into(), key),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .size(px(COVER))
+                        .rounded(px(12.))
+                        .bg(theme::placeholder()),
+                )
+                .child(div().mt(px(4.)).child(bar(COVER * 0.6, 11.)))
+                .child(bar(COVER * 0.4, 10.)),
+        ))
 }
 
 /// A titled run of cards that wraps onto new rows.
@@ -52,7 +103,7 @@ pub fn section_with(
         .child(
             div()
                 .flex()
-                .items_baseline()
+                .items_center()
                 .gap(px(12.))
                 .child(
                     div()
@@ -61,9 +112,11 @@ pub fn section_with(
                         .text_color(theme::text())
                         .child(title),
                 )
-                .children(action),
+                // Centred, then down to the heading's baseline: the smaller
+                // text sits higher in its line.
+                .children(action.map(|a| div().relative().top(px(2.)).child(a))),
         )
-        .child(div().flex().flex_wrap().gap(px(18.)).children(cards))
+        .child(div().flex().flex_wrap().gap(px(GAP)).children(cards))
 }
 
 /// A cover photo with the name and count under it.
@@ -81,7 +134,20 @@ pub fn card(
         .items_center()
         .justify_center()
         .map(|el| match card.cover {
-            Some(path) => el.child(img(path).size_full().object_fit(ObjectFit::Cover)),
+            // Rounded itself: the clip doesn't round an image's corners.
+            Some(path) => el.child(
+                img(path)
+                    .size_full()
+                    .rounded(px(12.))
+                    .object_fit(ObjectFit::Cover),
+            ),
+            None if card.loading => el.child(pulse(
+                ElementId::NamedInteger("cover-pulse".into(), card.key),
+                div()
+                    .size_full()
+                    .rounded(px(12.))
+                    .bg(theme::text_meta().opacity(0.12)),
+            )),
             None => el.child(icon(card.icon, px(34.), theme::text_meta())),
         })
         .when(card.badge, |el| {
@@ -107,6 +173,7 @@ pub fn card(
                 .top_0()
                 .left_0()
                 .size_full()
+                .rounded(px(12.))
                 .group_hover("collection-card", |el| el.bg(gpui::white().opacity(0.08))),
         );
     div()

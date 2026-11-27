@@ -366,37 +366,36 @@ impl PhotosClient {
     /// The memories Photos made, newest first, each with the photos it
     /// shows (remembered, so opening one needn't ask again).
     pub fn memories(&self) -> Result<Vec<Memory>, PhotosError> {
+        // The index only goes oldest first, a page per request, and iCloud
+        // takes its time per record: ask for a wave of pages at once.
         let mut found = Vec::new();
         let mut rank = 0;
-        loop {
-            let data = self.post(
-                "records/query",
-                &json!({
-                    "query": {
-                        "recordType": "CPLMemoryNotIsRejectedByCreateDate",
-                        "filterBy": [
-                            {
-                                "fieldName": "startRank",
-                                "fieldValue": { "type": "INT64", "value": rank },
-                                "comparator": "EQUALS",
-                            },
-                            {
-                                "fieldName": "direction",
-                                "fieldValue": { "type": "STRING", "value": "ASCENDING" },
-                                "comparator": "EQUALS",
-                            },
-                        ],
-                    },
-                    "resultsLimit": MEMORY_PAGE,
-                    "desiredKeys": ["title", "subtitle", "assetList", "isFavorite", "createDate"],
-                    "zoneID": { "zoneName": "PrimarySync" },
-                }),
-            )?;
-            let records = data["records"].as_array().cloned().unwrap_or_default();
-            rank += records.len();
-            found.extend(records.iter().filter_map(memories::parse));
-            if records.len() < MEMORY_PAGE || rank > 10_000 {
-                break;
+        'waves: loop {
+            let pages: Vec<Result<Vec<Value>, PhotosError>> = std::thread::scope(|s| {
+                let wave: Vec<_> = (0..MEMORY_WAVE)
+                    .map(|i| {
+                        let start = rank + i * MEMORY_PAGE;
+                        s.spawn(move || self.memory_page(start, MEMORY_PAGE))
+                    })
+                    .collect();
+                wave.into_iter()
+                    .map(|page| {
+                        page.join().unwrap_or_else(|_| {
+                            Err(PhotosError::Unexpected {
+                                status: 0,
+                                message: "reading memories failed".into(),
+                            })
+                        })
+                    })
+                    .collect()
+            });
+            for page in pages {
+                let records = page?;
+                rank += records.len();
+                found.extend(records.iter().filter_map(memories::parse));
+                if records.len() < MEMORY_PAGE || rank > 10_000 {
+                    break 'waves;
+                }
             }
         }
         found.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
@@ -409,6 +408,172 @@ impl PhotosClient {
     }
 
     /// The photos a memory shows, asking iCloud if they aren't known yet.
+    /// The newest memories, about `n` of them, without reading the whole
+    /// list. The index reads up from a rank and has no count, and its order
+    /// isn't simply by date: so first read one memory at a few ranks, all at
+    /// once, to see which end is newer. Newest at the start: read the start.
+    /// At the end: find the end (one memory every 512 ranks, then every 32)
+    /// and read that. Neither: read them all.
+    pub fn newest_memories(&self, n: usize) -> Result<Vec<Memory>, PhotosError> {
+        const COARSE: usize = 512;
+        const FINE: usize = 32;
+        // A few ranks are enough to see the order, and few requests at once
+        // leave room for the album covers loading meanwhile.
+        let coarse: Vec<usize> = vec![0, 512, 1024, 2048, 4096, 8192];
+        // The start is read meanwhile: it's the answer when the index is
+        // newest first, as it has been.
+        let (probed, head) = std::thread::scope(|s| {
+            let head = s.spawn(|| self.memory_range(0, n + FINE));
+            let probed = self.probe_memories(&coarse);
+            (probed, head.join())
+        });
+        let probed = probed?;
+        let present: Vec<(usize, i64)> = coarse
+            .iter()
+            .zip(&probed)
+            .filter_map(|(rank, date)| Some((*rank, (*date)?)))
+            .collect();
+        let Some(&(last, _)) = present.last() else {
+            return Ok(Vec::new());
+        };
+        let dates: Vec<i64> = present.iter().map(|(_, d)| *d).collect();
+        let newest_first = dates.windows(2).all(|w| w[0] >= w[1]);
+        let oldest_first = dates.windows(2).all(|w| w[0] <= w[1]);
+        let records = if newest_first && !oldest_first {
+            debug("memories: the index is newest first");
+            match head {
+                Ok(head) => head?,
+                Err(_) => self.memory_range(0, n + FINE)?,
+            }
+        } else if oldest_first && !newest_first {
+            debug("memories: the index is oldest first");
+            // The next probed rank past the last there, or the cap.
+            let next = coarse
+                .iter()
+                .find(|r| **r > last)
+                .copied()
+                .unwrap_or(10_000);
+            let fine: Vec<usize> = (last..next).step_by(COARSE).collect();
+            let last = self
+                .probe_memories(&fine)?
+                .iter()
+                .zip(&fine)
+                .filter(|(date, _)| date.is_some())
+                .map(|(_, rank)| *rank)
+                .last()
+                .unwrap_or(last);
+            let fine: Vec<usize> = (0..COARSE / FINE).map(|i| last + i * FINE).collect();
+            let end = fine
+                .iter()
+                .zip(self.probe_memories(&fine)?)
+                .filter(|(_, date)| date.is_some())
+                .map(|(rank, _)| *rank)
+                .last()
+                .unwrap_or(last);
+            // The list ends somewhere in [end, end + FINE).
+            self.memory_range((end + 1).saturating_sub(n), n + FINE)?
+        } else {
+            debug("memories: no order to the index (or one page); reading them all");
+            let mut all = self.memories()?;
+            all.truncate(n);
+            return Ok(all);
+        };
+        let mut found: Vec<Memory> = records.iter().filter_map(memories::parse).collect();
+        found.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
+        found.truncate(n);
+        if let Ok(mut known) = self.memory_assets.lock() {
+            for memory in &found {
+                known.insert(memory.id.clone(), memory.assets.clone());
+            }
+        }
+        Ok(found)
+    }
+
+    /// `count` memory records from `start`, read in small pieces at once
+    /// (iCloud takes its time per record, not per request).
+    fn memory_range(&self, start: usize, count: usize) -> Result<Vec<Value>, PhotosError> {
+        const PIECE: usize = 8;
+        let pieces: Vec<Result<Vec<Value>, PhotosError>> = std::thread::scope(|s| {
+            let reads: Vec<_> = (start..start + count)
+                .step_by(PIECE)
+                .map(|from| {
+                    let len = PIECE.min(start + count - from);
+                    s.spawn(move || self.memory_page(from, len))
+                })
+                .collect();
+            reads
+                .into_iter()
+                .map(|read| {
+                    read.join().unwrap_or_else(|_| {
+                        Err(PhotosError::Unexpected {
+                            status: 0,
+                            message: "reading memories failed".into(),
+                        })
+                    })
+                })
+                .collect()
+        });
+        let mut records = Vec::with_capacity(count);
+        for piece in pieces {
+            records.extend(piece?);
+        }
+        Ok(records)
+    }
+
+    /// The date of the memory at each of `ranks` (`None` past the end),
+    /// reading them all at once.
+    fn probe_memories(&self, ranks: &[usize]) -> Result<Vec<Option<i64>>, PhotosError> {
+        let found: Vec<Result<Option<i64>, PhotosError>> = std::thread::scope(|s| {
+            let probes: Vec<_> = ranks
+                .iter()
+                .map(|&rank| s.spawn(move || self.memory_page(rank, 1)))
+                .collect();
+            probes
+                .into_iter()
+                .map(|probe| match probe.join() {
+                    Ok(page) => page.map(|records| {
+                        records
+                            .first()
+                            .map(|r| r["fields"]["createDate"]["value"].as_i64().unwrap_or(0))
+                    }),
+                    Err(_) => Err(PhotosError::Unexpected {
+                        status: 0,
+                        message: "reading memories failed".into(),
+                    }),
+                })
+                .collect()
+        });
+        found.into_iter().collect()
+    }
+
+    /// One page of `CPLMemory` records from `rank`, oldest first.
+    fn memory_page(&self, rank: usize, limit: usize) -> Result<Vec<Value>, PhotosError> {
+        let data = self.post(
+            "records/query",
+            &json!({
+                "query": {
+                    "recordType": "CPLMemoryNotIsRejectedByCreateDate",
+                    "filterBy": [
+                        {
+                            "fieldName": "startRank",
+                            "fieldValue": { "type": "INT64", "value": rank },
+                            "comparator": "EQUALS",
+                        },
+                        {
+                            "fieldName": "direction",
+                            "fieldValue": { "type": "STRING", "value": "ASCENDING" },
+                            "comparator": "EQUALS",
+                        },
+                    ],
+                },
+                "resultsLimit": limit,
+                "desiredKeys": ["title", "subtitle", "assetList", "isFavorite", "createDate"],
+                "zoneID": { "zoneName": "PrimarySync" },
+            }),
+        )?;
+        Ok(data["records"].as_array().cloned().unwrap_or_default())
+    }
+
     fn memory_assets(&self, id: &Arc<str>) -> Result<Arc<Vec<String>>, PhotosError> {
         if let Some(known) = self
             .memory_assets
@@ -478,6 +643,12 @@ impl PhotosClient {
                     .unwrap_or_else(|| missing_asset(asset))
             })
             .collect())
+    }
+
+    /// Assets by record name, looked up a page at once (memories' key
+    /// photos, say). Ones that are gone come back without a thumbnail.
+    pub fn assets(&self, names: &[String]) -> Result<Vec<Asset>, PhotosError> {
+        self.assets_by_name(names, DESIRED_KEYS)
     }
 
     /// One asset by its record name (a memory's key photo, say).
@@ -1217,7 +1388,9 @@ fn master_name(asset: &Value) -> Option<&str> {
 
 /// Just enough to index and lay out the library.
 /// Memories asked for at a time.
-const MEMORY_PAGE: usize = 100;
+const MEMORY_PAGE: usize = 50;
+/// Memory pages asked for at once.
+const MEMORY_WAVE: usize = 16;
 
 const SCAN_KEYS: &[&str] = &[
     "recordName",
@@ -1692,5 +1865,11 @@ mod tests {
             error_for(500, "oops"),
             PhotosError::Unexpected { status: 500, .. }
         ));
+    }
+}
+
+fn debug(message: &str) {
+    if std::env::var_os("FUJI_DEBUG").is_some() {
+        eprintln!("fuji-icloud: photos: {message}");
     }
 }

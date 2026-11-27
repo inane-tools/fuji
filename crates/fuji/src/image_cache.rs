@@ -35,6 +35,8 @@ pub struct LruImageCache {
     capacity: usize,
     /// Decode files no taller than this (0: as they are).
     max_height: u32,
+    /// Crop files to their middle square.
+    square: bool,
     tick: u64,
     items: HashMap<u64, Entry>,
 }
@@ -54,6 +56,7 @@ impl LruImageCache {
         Self {
             capacity,
             max_height: 0,
+            square: false,
             tick: 0,
             items: HashMap::with_capacity(capacity),
         }
@@ -68,6 +71,13 @@ impl LruImageCache {
     /// are). Images already decoded at another height are redone as drawn.
     pub fn set_max_height(&mut self, height: u32) {
         self.max_height = height;
+    }
+
+    /// Crop images from files to their middle square, for square tiles
+    /// with rounded corners: GPUI rounds the corners of the image as
+    /// fitted, which a cropping fit puts outside the tile.
+    pub fn set_square(&mut self, square: bool) {
+        self.square = square;
     }
 
     fn evict_oldest(&mut self, window: &mut Window, cx: &mut App) {
@@ -93,6 +103,7 @@ impl LruImageCache {
     fn start(
         resource: &Resource,
         height: u32,
+        square: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> ImageCacheItem {
@@ -100,7 +111,7 @@ impl LruImageCache {
             Resource::Path(path) if height > 0 => {
                 let path = path.clone();
                 cx.background_executor()
-                    .spawn(async move { decode_scaled(&path, height) })
+                    .spawn(async move { decode_scaled(&path, height, square) })
                     .shared()
             }
             _ => {
@@ -159,7 +170,7 @@ impl gpui::ImageCache for LruImageCache {
                     {
                         cx.drop_image(image, Some(window));
                     }
-                    entry.next = Some((want, Self::start(resource, want, window, cx)));
+                    entry.next = Some((want, Self::start(resource, want, self.square, window, cx)));
                 }
             }
             // Meanwhile, the old size (if it ever finished).
@@ -172,7 +183,7 @@ impl gpui::ImageCache for LruImageCache {
         while self.items.len() >= self.capacity {
             self.evict_oldest(window, cx);
         }
-        let item = Self::start(resource, want, window, cx);
+        let item = Self::start(resource, want, self.square, window, cx);
         self.items.insert(
             key,
             Entry {
@@ -188,10 +199,24 @@ impl gpui::ImageCache for LruImageCache {
 
 /// Decode an image file no taller than `height`, as GPUI keeps images
 /// (BGRA).
-fn decode_scaled(path: &Path, height: u32) -> Result<Arc<RenderImage>, ImageCacheError> {
+fn decode_scaled(
+    path: &Path,
+    height: u32,
+    square: bool,
+) -> Result<Arc<RenderImage>, ImageCacheError> {
     let io = |err: std::io::Error| ImageCacheError::Io(Arc::new(err));
     let bytes = std::fs::read(path).map_err(io)?;
-    let image = image::load_from_memory(&bytes).map_err(|err| io(std::io::Error::other(err)))?;
+    let mut image =
+        image::load_from_memory(&bytes).map_err(|err| io(std::io::Error::other(err)))?;
+    if square {
+        let side = image.width().min(image.height());
+        image = image.crop_imm(
+            (image.width() - side) / 2,
+            (image.height() - side) / 2,
+            side,
+            side,
+        );
+    }
     let image = if image.height() > height {
         // Wide panoramas keep their full width at this height.
         image.thumbnail(u32::MAX, height)
@@ -235,7 +260,7 @@ mod tests {
         image::RgbaImage::from_pixel(400, 200, image::Rgba([255, 0, 0, 255]))
             .save(&path)
             .unwrap();
-        let image = decode_scaled(&path, 64).unwrap();
+        let image = decode_scaled(&path, 64, false).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         let size = image.size(0);
         assert_eq!((size.width.0, size.height.0), (128, 64));
