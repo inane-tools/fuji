@@ -93,6 +93,8 @@ const MAX_PAGE_REQUESTS: usize = 4;
 const MAX_QUEUED_PAGES: usize = 6;
 /// Items per index-scan request (small records, no URLs).
 const SCAN_PAGE: usize = 200;
+/// The first index-scan page, shorter so an album's first screen comes soon.
+const FIRST_SCAN_PAGE: usize = 40;
 const MAX_SCAN_REQUESTS: usize = net::BULK_THREADS;
 const MAX_THUMB_REQUESTS: usize = 10;
 /// Extra content kept built above and below the viewport.

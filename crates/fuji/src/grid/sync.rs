@@ -196,6 +196,7 @@ impl PhotoGrid {
         let album = self.album.clone();
         let want_token = self.follows_changes();
         cx.spawn(async move |this, cx| {
+            let asked = Instant::now();
             let count = net::run(move || {
                 client.check_ready()?;
                 // Taken before the scan, so changes made during it are
@@ -204,6 +205,14 @@ impl PhotoGrid {
                 Ok::<_, PhotosError>((client.count(&album)?, token))
             })
             .await;
+            if net::debug()
+                && let Some(Ok((count, _))) = &count
+            {
+                eprintln!(
+                    "grid: album counted ({count} items) in {} ms, scanning",
+                    asked.elapsed().as_millis()
+                );
+            }
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -379,7 +388,7 @@ impl PhotoGrid {
         };
         while scan.in_flight < MAX_SCAN_REQUESTS && scan.next_rank < scan.count {
             let start = scan.next_rank;
-            let limit = SCAN_PAGE.min(scan.count - start);
+            let limit = scan_page_len(start).min(scan.count - start);
             scan.next_rank += limit;
             scan.in_flight += 1;
 
@@ -434,7 +443,7 @@ impl PhotoGrid {
         // is moved once, however the pages arrive.
         let mut arrived = Vec::new();
         while let Some(page) = scan.pages.remove(&scan.joined) {
-            scan.joined += SCAN_PAGE.min(scan.count - scan.joined);
+            scan.joined += scan_page_len(scan.joined).min(scan.count - scan.joined);
             arrived.extend(page);
         }
         let done = scan.in_flight == 0 && scan.next_rank >= scan.count;
@@ -442,6 +451,13 @@ impl PhotoGrid {
 
         if progressive {
             if !arrived.is_empty() {
+                if net::debug() && scan.joined == arrived.len() {
+                    eprintln!(
+                        "grid: first {} items shown {} ms into the scan",
+                        arrived.len(),
+                        scan.started.elapsed().as_millis()
+                    );
+                }
                 let tz = jiff::tz::TimeZone::system();
                 let days = layout::days(&arrived, &tz);
                 self.append_album_items(arrived, days);
@@ -452,20 +468,25 @@ impl PhotoGrid {
         }
         if done {
             if let Some(scan) = self.scan.take() {
-                if std::env::var_os("FUJI_DEBUG").is_some() {
+                // The usual rescan of a cached album finds it as it was:
+                // keep the records already loaded (and those on the way).
+                let unchanged = !progressive && scan.fresh.as_slice() == self.album_items();
+                if net::debug() {
                     eprintln!(
-                        "grid: indexed {} items in {:.1?}",
+                        "grid: indexed {} items in {:.1?}{}",
                         scan.count,
-                        scan.started.elapsed()
+                        scan.started.elapsed(),
+                        if unchanged { " (unchanged)" } else { "" }
                     );
                 }
                 self.token = scan.token;
-                if !progressive {
+                // Shown as it arrived (progressive), ranks never moved.
+                if !progressive && !unchanged {
                     self.set_index(scan.fresh);
+                    self.forget_pages();
                 }
                 self.count_gap = scan.count as isize - self.album_len() as isize;
                 self.gap_misses = 0;
-                self.forget_pages();
                 self.reapply_recent();
                 if !progressive {
                     let listed = self.album_items().to_vec();
@@ -501,5 +522,43 @@ impl PhotoGrid {
         let gap = self.count_gap;
         cx.background_spawn(async move { index::save(&path, items, token, gap) })
             .detach();
+    }
+}
+
+/// Items in the index-scan page starting at `start`. The first pages are
+/// short, since iCloud answers in time per record: a new album's first
+/// screen shows in about a second instead of waiting for 200 records.
+/// The rest are full; all of them run at once.
+fn scan_page_len(start: usize) -> usize {
+    match start {
+        s if s < FIRST_SCAN_PAGE => FIRST_SCAN_PAGE - s,
+        s if s < FIRST_SCAN_PAGE * 3 => FIRST_SCAN_PAGE * 3 - s,
+        _ => SCAN_PAGE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_pages_start_short_and_tile_the_album() {
+        let mut starts = Vec::new();
+        let mut rank = 0;
+        while rank < 800 {
+            starts.push((rank, scan_page_len(rank)));
+            rank += scan_page_len(rank);
+        }
+        assert_eq!(
+            starts,
+            [
+                (0, 40),
+                (40, 80),
+                (120, 200),
+                (320, 200),
+                (520, 200),
+                (720, 200)
+            ]
+        );
     }
 }
