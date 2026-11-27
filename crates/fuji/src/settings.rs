@@ -12,6 +12,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::pairing::PairingCard;
 use crate::{anim, release, theme, ui};
 
 pub const MIN_ROW_HEIGHT: f32 = 72.;
@@ -175,6 +176,8 @@ pub struct SettingsView {
     flipped: Option<&'static str>,
     /// The Open Source list is open.
     credits_open: bool,
+    /// Pairing with the iPhone for search.
+    pairing: gpui::Entity<PairingCard>,
     scroll: ScrollHandle,
     _settings: Subscription,
 }
@@ -186,6 +189,7 @@ impl SettingsView {
         name: SharedString,
         apple_id: SharedString,
         cache_dirs: Vec<PathBuf>,
+        pairing: gpui::Entity<PairingCard>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self {
@@ -197,6 +201,7 @@ impl SettingsView {
             clearing: false,
             flipped: None,
             credits_open: false,
+            pairing,
             scroll: ScrollHandle::new(),
             _settings: cx.observe_global::<Settings>(|_, cx| cx.notify()),
         };
@@ -900,6 +905,7 @@ impl Render for SettingsView {
                             .child("Settings"),
                     )
                     .child(account)
+                    .child(self.pairing.clone())
                     .child(appearance)
                     .child(storage)
                     .child(credits)
@@ -909,7 +915,7 @@ impl Render for SettingsView {
     }
 }
 
-enum Tone {
+pub(crate) enum Tone {
     Default,
     /// The disclaimer.
     Warn,
@@ -918,7 +924,7 @@ enum Tone {
 }
 
 /// A flat card: fills, no outlines.
-fn section(tone: Tone) -> gpui::Div {
+pub(crate) fn section(tone: Tone) -> gpui::Div {
     let card = div()
         .flex()
         .flex_col()
@@ -943,7 +949,7 @@ fn section(tone: Tone) -> gpui::Div {
 }
 
 /// A section's title, and what it's about.
-fn heading(title: &'static str, description: Option<&'static str>) -> gpui::Div {
+pub(crate) fn heading(title: &'static str, description: Option<&'static str>) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -988,7 +994,7 @@ fn social(
 }
 
 /// A setting: what it is on the left, its control on the right.
-fn row(
+pub(crate) fn row(
     title: &'static str,
     description: impl Into<SharedString>,
     divided: bool,

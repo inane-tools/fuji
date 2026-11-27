@@ -260,9 +260,35 @@ impl AuthClient {
     /// key now shared with that device.
     pub fn finish_bridge(
         &self,
-        mut approval: BridgeApproval,
+        approval: BridgeApproval,
         code: &str,
     ) -> Result<(Account, PairingKey), AuthError> {
+        let pairing = self.pair_with_code(approval, code)?;
+        match self.after_bridge()? {
+            SignInStep::Done(account) => Ok((account, pairing)),
+            SignInStep::NeedsCode => Err(bridge_error(
+                "Apple still wants a verification code after the approval",
+            )),
+        }
+    }
+
+    /// Finish an on-demand approval (see [`AuthClient::begin_on_demand`])
+    /// with the code the device shows: only the key shared with the device,
+    /// the session is already signed in.
+    pub fn finish_pairing(
+        &self,
+        approval: BridgeApproval,
+        code: &str,
+    ) -> Result<PairingKey, AuthError> {
+        self.pair_with_code(approval, code)
+    }
+
+    /// The key exchange with the code, and Apple's check of the real code.
+    fn pair_with_code(
+        &self,
+        mut approval: BridgeApproval,
+        code: &str,
+    ) -> Result<PairingKey, AuthError> {
         let code = code.trim();
         let prover = Prover::new(&approval.salt, code);
         let message1 = BASE64.encode(prover.message1());
@@ -321,20 +347,14 @@ impl AuthClient {
         );
         approval.push.close();
 
-        let pairing = PairingKey {
+        Ok(PairingKey {
             key: BASE64.encode(&agreed.shared_key),
             mid: approval
                 .state
                 .get("mid")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-        };
-        match self.after_bridge()? {
-            SignInStep::Done(account) => Ok((account, pairing)),
-            SignInStep::NeedsCode => Err(bridge_error(
-                "Apple still wants a verification code after the approval",
-            )),
-        }
+        })
     }
 
     fn bridge_post(&self, path: &str, body: &Value) -> Result<(), AuthError> {

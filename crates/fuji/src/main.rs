@@ -19,6 +19,7 @@ mod input;
 mod layout;
 mod login;
 mod net;
+mod pairing;
 mod passkey;
 mod platform;
 mod release;

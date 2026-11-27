@@ -27,6 +27,7 @@ use crate::device_search::DeviceSearch;
 use crate::grid::{GridEvent, PhotoGrid};
 use crate::input::TextInput;
 use crate::login::{LoginEvent, LoginView};
+use crate::pairing::{PairingCard, PairingEvent};
 use crate::settings::{SettingsEvent, SettingsView};
 use crate::{index, net, session_store, theme, thumbs, titlebar, ui};
 
@@ -186,6 +187,8 @@ pub struct FujiApp {
     avatar: Option<Arc<Path>>,
     /// Shown under the spinner while resuming, when there's something to do.
     resuming_note: Option<SharedString>,
+    /// The Settings card for pairing with the iPhone (search).
+    pairing: Option<Entity<PairingCard>>,
     /// The highlight behind the selected tab: its left edge and width,
     /// easing from tab to tab.
     pill_x: Eased,
@@ -237,6 +240,7 @@ impl FujiApp {
             _collections_load: None,
             avatar: None,
             resuming_note: None,
+            pairing: None,
             pill_x: Eased::new(0.),
             pill_width: Eased::new(0.),
             pill_placed: false,
@@ -432,8 +436,32 @@ impl FujiApp {
             thumbs::cache_dir(&account.dsid),
             thumbs::preview_dir(&account.dsid),
         ];
+        let pairing = {
+            let (auth, account) = (auth.clone(), account.clone());
+            cx.new(|cx| PairingCard::new(auth, account, false, window, cx))
+        };
+        {
+            let (account, auth) = (account.clone(), auth.clone());
+            subscriptions.push(
+                cx.subscribe(&pairing, move |this, _, event, cx| match event {
+                    PairingEvent::Paired => this.start_device_search(&account, auth.clone(), cx),
+                    PairingEvent::Unpaired => {
+                        this.device_search = None;
+                        this._device_query = None;
+                        this.with_grid(cx, |grid, cx| grid.set_device_pending(None, cx));
+                    }
+                }),
+            );
+        }
+        self.pairing = Some(pairing.clone());
         let settings = cx.new(|cx| {
-            SettingsView::new(name.into(), account.apple_id.clone().into(), cache_dirs, cx)
+            SettingsView::new(
+                name.into(),
+                account.apple_id.clone().into(),
+                cache_dirs,
+                pairing,
+                cx,
+            )
         });
         subscriptions.push(
             cx.subscribe_in(
@@ -884,8 +912,14 @@ impl FujiApp {
                     DeviceSearch::start(auth, dsid, apple_id, pairing.key)
                 })
                 .await;
-            this.update(cx, |this, _| this.device_search = search.map(Arc::new))
-                .ok();
+            this.update(cx, |this, cx| {
+                let paired = search.is_some();
+                this.device_search = search.map(Arc::new);
+                if let Some(card) = this.pairing.clone() {
+                    card.update(cx, |card, cx| card.set_paired(paired, cx));
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -931,7 +965,12 @@ impl FujiApp {
                         if std::env::var_os("FUJI_DEBUG").is_some() {
                             eprintln!("device search: {err}");
                         }
-                        this.with_grid(cx, |grid, cx| grid.set_device_pending(None, cx));
+                        let message =
+                            SharedString::from(format!("Couldn't search with your iPhone. {err}"));
+                        this.with_grid(cx, |grid, cx| {
+                            grid.set_device_pending(None, cx);
+                            grid.set_status(ui::Status::Failed(message), cx);
+                        });
                     }
                 }
             })

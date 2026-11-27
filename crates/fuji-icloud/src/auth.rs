@@ -35,6 +35,8 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 /// Apple's error code for a wrong verification code.
 const WRONG_CODE: i64 = -21669;
 const JSON_ACCEPT: &str = "application/json, text/javascript";
+/// icloud.com's current build, as its setup calls name it (both numbers).
+const SETUP_CLIENT_BUILD: &str = "2642Build23";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -83,6 +85,9 @@ pub struct Account {
     /// Services whose data is end-to-end encrypted (Advanced Data
     /// Protection): the web session needs the user's approval first.
     pub pcs_required: Vec<String>,
+    /// The alternate account ID (`dsInfo.aDsID`, like `000123-05-<uuid>`),
+    /// which on-demand 2FA wraps its token with.
+    pub adsid: Option<String>,
 }
 
 /// What happened after a sign-in step.
@@ -110,6 +115,18 @@ struct State {
     session_token: Option<String>,
     trust_token: Option<String>,
     account_country: Option<String>,
+    /// While a second factor is asked for again from a signed-in session
+    /// ("on-demand 2FA"): the token icloud.com gets for it, sent as
+    /// `X-Apple-Identity-Token`, and the `X-Apple-2FA-App` Apple hands back.
+    identity_token: Option<String>,
+    two_fa_app: Option<String>,
+    /// The sign-in page's `twoFactorAuthAppKey` and `twoFactorAuthEnv`, which
+    /// the on-demand two-factor page is asked for with (`?tfaak=&ev=`).
+    two_fa_app_key: Option<(String, String)>,
+    /// From the widget page, sent back while on-demand as the widget does:
+    /// `X-Apple-Auth-Attributes` (latest from Apple) and `X-Apple-Domain-Id`.
+    auth_attributes: Option<String>,
+    domain_id: Option<String>,
 }
 
 pub struct AuthClient {
@@ -365,16 +382,23 @@ impl AuthClient {
         self.trust_and_login()
     }
 
-    /// The two-factor page's boot data (`boot_args.direct`), if it has any.
-    pub(crate) fn two_factor_boot(&self) -> Result<Option<Value>, AuthError> {
+    /// The two-factor page's HTML.
+    fn two_factor_html(&self) -> Result<String, AuthError> {
         let mut resp = self
-            .auth_headers(self.agent.get(AUTH_ENDPOINT), false, "text/html")
+            .auth_headers(self.two_factor_page(), false, "text/html")
             .call()?;
         self.capture(&resp);
+        let status = resp.status().as_u16();
+        debug(&format!("two-factor page: {status}"));
         if !resp.status().is_success() {
-            return Err(unexpected(resp.status().as_u16(), &mut resp));
+            return Err(unexpected(status, &mut resp));
         }
-        let html = resp.body_mut().read_to_string()?;
+        Ok(resp.body_mut().read_to_string()?)
+    }
+
+    /// The two-factor page's boot data (`boot_args.direct`), if it has any.
+    pub(crate) fn two_factor_boot(&self) -> Result<Option<Value>, AuthError> {
+        let html = self.two_factor_html()?;
         let boot = boot_args(&html)
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .map(|mut v| v["direct"].take());
@@ -408,6 +432,121 @@ impl AuthClient {
         Ok((status, text))
     }
 
+    /// Start asking for a second factor again from this signed-in session,
+    /// as icloud.com does to pair with the iPhone for search when sign-in
+    /// didn't (a security key or a plain code). Until [`Self::end_on_demand`],
+    /// the two-factor calls (`bridge_config`, `start_bridge`, ...) run in
+    /// that context.
+    pub fn begin_on_demand(&self, account: &Account) -> Result<(), AuthError> {
+        let dsid = account.dsid.as_str();
+        let adsid = account
+            .adsid
+            .as_deref()
+            .ok_or_else(|| AuthError::Unexpected {
+                status: 200,
+                message: "iCloud didn't give the account's alternate ID".into(),
+            })?;
+        let client_id = self.client_id();
+        let mut resp = self
+            .agent
+            .post(format!("{SETUP_ENDPOINT}/fetchOnDemandWsToken"))
+            .query("clientBuildNumber", SETUP_CLIENT_BUILD)
+            .query("clientMasteringNumber", SETUP_CLIENT_BUILD)
+            .query("clientId", &client_id)
+            .query("dsid", dsid)
+            .header("Origin", HOME_ENDPOINT)
+            .header("Referer", format!("{HOME_ENDPOINT}/"))
+            .send_empty()?;
+        self.capture(&resp);
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        debug(&format!(
+            "fetchOnDemandWsToken: {status} success={} error={}",
+            v["success"], v["error"]
+        ));
+        let token = v["onDemand2FAToken"]
+            .as_str()
+            .filter(|t| !t.is_empty() && v["success"] == true)
+            .ok_or_else(|| AuthError::Unexpected {
+                status,
+                message: v["error"]
+                    .as_str()
+                    .unwrap_or("Apple wouldn't start pairing")
+                    .to_string(),
+            })?;
+        // icloud.com sends the token wrapped with the account's alternate
+        // ID: base64("<aDsID>:<token>").
+        let token = BASE64.encode(format!("{adsid}:{token}"));
+        let page = self.two_fa_app_key()?;
+        debug(&format!(
+            "on-demand: widget page has app key {}, auth attributes {}",
+            page.app_key.is_some(),
+            page.auth_attributes.is_some(),
+        ));
+        let mut st = self.state.lock().unwrap();
+        st.identity_token = Some(token);
+        st.two_fa_app = None;
+        st.two_fa_app_key = page.app_key;
+        st.domain_id = page.domain_id;
+        // The widget's replayed headers start empty: the page's
+        // `authAttributes`, and no sign-in session yet (Apple's answers
+        // fill those in, and later requests send them back).
+        st.auth_attributes = page.auth_attributes;
+        st.scnt = None;
+        st.session_id = None;
+        Ok(())
+    }
+
+    /// The two-factor page: in the on-demand context, with the app key the
+    /// widget passes.
+    fn two_factor_page(&self) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+        let st = self.state.lock().unwrap();
+        let req = self.agent.get(AUTH_ENDPOINT);
+        match (&st.identity_token, &st.two_fa_app_key) {
+            (Some(_), Some((key, env))) => req.query("tfaak", key).query("ev", env),
+            _ => req,
+        }
+    }
+
+    /// `twoFactorAuthAppKey` and `twoFactorAuthEnv` from the sign-in
+    /// widget's page, as the widget has them when it starts (and its session
+    /// headers, kept by `capture`).
+    fn two_fa_app_key(&self) -> Result<WidgetPage, AuthError> {
+        let client_id = self.client_id();
+        // The page the widget loads for on-demand 2FA (`odc=1`): plain
+        // `auth/signin`, as first-party OAuth is off then.
+        let mut resp = self
+            .agent
+            .get(format!("{AUTH_ENDPOINT}/signin"))
+            .query("widgetKey", WIDGET_KEY)
+            .query("language", "en_US")
+            .query("skVersion", "7")
+            .query("odc", "1")
+            .query("iframeId", &client_id)
+            .header("Referer", format!("{HOME_ENDPOINT}/"))
+            .call()?;
+        debug(&format!(
+            "on-demand widget page: {}",
+            resp.status().as_u16()
+        ));
+        // Its cookies apply, but not its headers: the widget's script can't
+        // see a page load's headers, so it starts from the page's own data.
+        self.cookies.record(&resp);
+        let html = resp.body_mut().read_to_string().unwrap_or_default();
+        Ok(parse_widget_page(&html))
+    }
+
+    /// Leave the on-demand context.
+    pub fn end_on_demand(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.identity_token = None;
+        st.two_fa_app = None;
+        st.two_fa_app_key = None;
+        st.auth_attributes = None;
+        st.domain_id = None;
+    }
+
     /// A call to `setup.icloud.com/setup/ws/1/<path>` the way icloud.com
     /// makes it: client numbers and `dsid` in the query, a JSON body sent as
     /// text. The status and the JSON answer (`null` if none).
@@ -419,8 +558,8 @@ impl AuthClient {
     ) -> Result<(u16, Value), AuthError> {
         let client_id = self.client_id();
         let query = [
-            ("clientBuildNumber", "2522Project44"),
-            ("clientMasteringNumber", "2522B2"),
+            ("clientBuildNumber", SETUP_CLIENT_BUILD),
+            ("clientMasteringNumber", SETUP_CLIENT_BUILD),
             ("clientId", client_id.as_str()),
             ("dsid", dsid),
         ];
@@ -471,27 +610,13 @@ impl AuthClient {
     /// The two-factor page's settings for approval on a device ("bridge"),
     /// if Apple offers it for this sign-in.
     pub fn bridge_config(&self) -> Result<Option<BridgeConfig>, AuthError> {
-        let mut resp = self
-            .auth_headers(self.agent.get(AUTH_ENDPOINT), false, "text/html")
-            .call()?;
-        self.capture(&resp);
-        if !resp.status().is_success() {
-            return Err(unexpected(resp.status().as_u16(), &mut resp));
-        }
-        let html = resp.body_mut().read_to_string()?;
+        let html = self.two_factor_html()?;
         Ok(parse_bridge_config(&html))
     }
 
     /// Phone numbers that can get a code by text message.
     pub fn trusted_phones(&self) -> Result<Vec<TrustedPhone>, AuthError> {
-        let mut resp = self
-            .auth_headers(self.agent.get(AUTH_ENDPOINT), false, "text/html")
-            .call()?;
-        self.capture(&resp);
-        if !resp.status().is_success() {
-            return Err(unexpected(resp.status().as_u16(), &mut resp));
-        }
-        let html = resp.body_mut().read_to_string()?;
+        let html = self.two_factor_html()?;
         Ok(parse_trusted_phones(&html))
     }
 
@@ -563,11 +688,14 @@ impl AuthClient {
 
     /// POST JSON to `idmsa.apple.com/appleauth/auth/<path>`; only the status.
     pub(crate) fn bridge_post_status(&self, path: &str, body: &Value) -> Result<u16, AuthError> {
+        // The widget leaves the on-demand token off the closing "done" post.
+        let done = body.get("data").and_then(Value::as_str) == Some("ZG9uZQ==");
         let mut resp = self
-            .auth_headers(
+            .auth_headers_with(
                 self.agent.post(format!("{AUTH_ENDPOINT}/{path}")),
                 true,
                 JSON_ACCEPT,
+                !done,
             )
             .send_json(body)?;
         self.capture(&resp);
@@ -673,32 +801,100 @@ impl AuthClient {
         origin: bool,
         accept: &str,
     ) -> ureq::RequestBuilder<B> {
+        self.auth_headers_with(req, origin, accept, true)
+    }
+
+    /// [`Self::auth_headers`]; `identity` false leaves out the on-demand
+    /// identity token (the widget does for the closing "done" bridge posts).
+    fn auth_headers_with<B>(
+        &self,
+        req: ureq::RequestBuilder<B>,
+        origin: bool,
+        accept: &str,
+        identity: bool,
+    ) -> ureq::RequestBuilder<B> {
         let st = self.state.lock().unwrap();
         let mut req = req
             .header("Accept", accept)
             .header("Content-Type", "application/json")
-            .header("X-Apple-OAuth-Client-Id", WIDGET_KEY)
-            .header("X-Apple-OAuth-Client-Type", "firstPartyAuth")
-            .header("X-Apple-OAuth-Redirect-URI", HOME_ENDPOINT)
-            .header("X-Apple-OAuth-Require-Grant-Code", "true")
-            .header("X-Apple-OAuth-Response-Mode", "web_message")
-            .header("X-Apple-OAuth-Response-Type", "code")
-            .header("X-Apple-OAuth-State", st.client_id.as_str())
             .header("X-Apple-Widget-Key", WIDGET_KEY);
-        if origin {
+        if st.identity_token.is_none() {
+            // Sign-in runs as first-party OAuth; the widget turns that off
+            // for on-demand 2FA, and sends none of these then.
             req = req
-                .header("Origin", AUTH_ROOT)
-                .header("Referer", format!("{AUTH_ROOT}/"));
+                .header("X-Apple-OAuth-Client-Id", WIDGET_KEY)
+                .header("X-Apple-OAuth-Client-Type", "firstPartyAuth")
+                .header("X-Apple-OAuth-Redirect-URI", HOME_ENDPOINT)
+                .header("X-Apple-OAuth-Require-Grant-Code", "true")
+                .header("X-Apple-OAuth-Response-Mode", "web_message")
+                .header("X-Apple-OAuth-Response-Type", "code")
+                .header("X-Apple-OAuth-State", st.client_id.as_str());
         } else {
+            // icloud.com's widget uses sign-in version 2.
             req = req
-                .header("Origin", HOME_ENDPOINT)
-                .header("Referer", format!("{HOME_ENDPOINT}/"));
+                .header("X-Apple-Privacy-Consent", "true")
+                .header("X-Apple-Privacy-Consent-Accepted", "true");
         }
-        if let Some(scnt) = &st.scnt {
-            req = req.header("scnt", scnt.as_str());
+        if st.identity_token.is_some() {
+            // On-demand 2FA: as the widget inside Apple's page sends them, the
+            // page as referrer, Origin only on posts, and the session headers
+            // only once Apple's answers have given them.
+            let referer = format!(
+                "{AUTH_ENDPOINT}/signin?widgetKey={WIDGET_KEY}&language=en_US&skVersion=7&odc=1&iframeId={}",
+                st.client_id
+            );
+            if origin {
+                req = req.header("Origin", AUTH_ROOT);
+            }
+            // Replayed from Apple's answers since the widget started.
+            if let Some(scnt) = &st.scnt {
+                req = req.header("scnt", scnt.as_str());
+            }
+            if let Some(id) = &st.session_id {
+                req = req.header("X-Apple-ID-Session-Id", id.as_str());
+            }
+            req = req
+                .header("Referer", referer)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                // A request from Apple's own page, as the browser marks it.
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Dest", "empty")
+                .header("X-Apple-Locale", "en_US")
+                .header("X-Apple-Offer-Security-Upgrade", "1")
+                .header("X-Apple-I-FD-Client-Info", client_info());
+        } else {
+            if origin {
+                req = req
+                    .header("Origin", AUTH_ROOT)
+                    .header("Referer", format!("{AUTH_ROOT}/"));
+            } else {
+                req = req
+                    .header("Origin", HOME_ENDPOINT)
+                    .header("Referer", format!("{HOME_ENDPOINT}/"));
+            }
+            if let Some(scnt) = &st.scnt {
+                req = req.header("scnt", scnt.as_str());
+            }
+            if let Some(id) = &st.session_id {
+                req = req.header("X-Apple-ID-Session-Id", id.as_str());
+            }
         }
-        if let Some(id) = &st.session_id {
-            req = req.header("X-Apple-ID-Session-Id", id.as_str());
+        if st.identity_token.is_some() {
+            req = req.header("X-Apple-Frame-Id", st.client_id.as_str());
+            if let Some(v) = &st.auth_attributes {
+                req = req.header("X-Apple-Auth-Attributes", v.as_str());
+            }
+            if let Some(v) = &st.domain_id {
+                req = req.header("X-Apple-Domain-Id", v.as_str());
+            }
+        }
+        if identity && let Some(token) = &st.identity_token {
+            req = req.header("X-Apple-Identity-Token", token.as_str());
+            if let Some(app) = &st.two_fa_app {
+                req = req.header("X-Apple-2FA-App", app.as_str());
+            }
         }
         req
     }
@@ -729,6 +925,14 @@ impl AuthClient {
         }
         if let Some(v) = get("X-Apple-ID-Account-Country") {
             st.account_country = Some(v);
+        }
+        if st.identity_token.is_some()
+            && let Some(v) = get("X-Apple-2FA-App")
+        {
+            st.two_fa_app = Some(v);
+        }
+        if let Some(v) = get("X-Apple-Auth-Attributes") {
+            st.auth_attributes = Some(v);
         }
     }
 }
@@ -865,6 +1069,7 @@ fn parse_account_login(data: &Value, apple_id: String) -> Result<SignInStep, Aut
             apple_id
         },
         dsid: text("dsid"),
+        adsid: Some(text("aDsID")).filter(|a| !a.is_empty()),
         full_name,
         webservices,
         pcs_required,
@@ -965,6 +1170,83 @@ fn parse_bridge_config(html: &str) -> Option<BridgeConfig> {
     (config != BridgeConfig::default()).then_some(config)
 }
 
+/// `twoFactorAuthAppKey` and `twoFactorAuthEnv`.
+type AppKey = (String, String);
+
+/// What the widget sends as `X-Apple-I-FD-Client-Info`: browser, language,
+/// time zone, version, and an empty fingerprint.
+fn client_info() -> String {
+    json!({
+        "U": USER_AGENT,
+        "L": "en-US",
+        "Z": "GMT+00:00",
+        "V": "1.1",
+        "F": "",
+    })
+    .to_string()
+}
+
+/// A string or number field (`"name":"…"` or `"name":3`) in the widget page.
+fn boot_field(html: &str, name: &str) -> Option<String> {
+    let marker = format!("\"{name}\":");
+    let rest = html[html.find(&marker)? + marker.len()..].trim_start();
+    let value: String = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?.to_string(),
+        None => rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect(),
+    };
+    (!value.is_empty()).then_some(value)
+}
+
+/// What the on-demand widget page gives the widget.
+#[derive(Debug, Default, PartialEq)]
+struct WidgetPage {
+    app_key: Option<AppKey>,
+    domain_id: Option<String>,
+    auth_attributes: Option<String>,
+}
+
+/// Every `boot_args` block in a page, parsed.
+fn all_boot_args(html: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(marker) = rest.find("class=\"boot_args\"") {
+        let Some(open) = rest[marker..].find('>') else {
+            break;
+        };
+        let start = marker + open + 1;
+        let Some(len) = rest[start..].find("</script>") else {
+            break;
+        };
+        if let Ok(v) = serde_json::from_str(rest[start..start + len].trim()) {
+            out.push(v);
+        }
+        rest = &rest[start + len..];
+    }
+    out
+}
+
+/// The widget page's boot data: `direct` of the block that has the app key.
+fn parse_widget_page(html: &str) -> WidgetPage {
+    let text = |v: &Value| match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let direct = all_boot_args(html)
+        .into_iter()
+        .map(|mut v| v["direct"].take())
+        .find(|d| d.get("twoFactorAuthAppKey").is_some())
+        .unwrap_or(Value::Null);
+    WidgetPage {
+        app_key: text(&direct["twoFactorAuthAppKey"]).zip(text(&direct["twoFactorAuthEnv"])),
+        domain_id: text(&direct["domainId"]).or_else(|| boot_field(html, "domainId")),
+        auth_attributes: text(&direct["authAttributes"]),
+    }
+}
+
 fn debug_enabled() -> bool {
     std::env::var_os("FUJI_DEBUG").is_some()
 }
@@ -1038,6 +1320,19 @@ mod tests {
         assert_eq!(c.apns_environment.as_deref(), Some("PROD"));
         assert_eq!(c.apns_topic.as_deref(), Some("com.example.topic"));
         assert_eq!(parse_bridge_config("<html></html>"), None);
+    }
+
+    #[test]
+    fn reads_the_widget_page() {
+        let html = r#"<script type="application/json" class="boot_args">{"direct":{"x":1}}</script>
+            <script type="application/json" class="boot_args">{"direct":{"twoFactorAuthEnv":1,
+            "twoFactorAuthAppKey":"AbC+\/=","authAttributes":"attrs"},"additional":{}}</script>
+            <script>var c = {"domainId":3};</script>"#;
+        let page = parse_widget_page(html);
+        assert_eq!(page.app_key, Some(("AbC+/=".to_string(), "1".to_string())));
+        assert_eq!(page.auth_attributes.as_deref(), Some("attrs"));
+        assert_eq!(page.domain_id.as_deref(), Some("3"));
+        assert_eq!(parse_widget_page("<html></html>"), WidgetPage::default());
     }
 
     #[test]
