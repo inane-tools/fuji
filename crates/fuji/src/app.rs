@@ -178,6 +178,7 @@ pub struct FujiApp {
     memories_limit: usize,
     /// The Collections page's width, measured as drawn (0 until then).
     collections_width: Rc<std::cell::Cell<f32>>,
+    collections_scroll: gpui::ScrollHandle,
     /// Memories whose covers have been asked for, from the newest.
     memory_covers_asked: usize,
     /// Item counts for the Collections page, by album slug.
@@ -245,6 +246,7 @@ impl FujiApp {
             memories_expanded: false,
             memories_limit: 0,
             collections_width: Rc::default(),
+            collections_scroll: gpui::ScrollHandle::new(),
             memory_covers_asked: 0,
             counts: HashMap::new(),
             covers: HashMap::new(),
@@ -1754,9 +1756,14 @@ impl FujiApp {
                     .id("collections")
                     .size_full()
                     .overflow_y_scroll()
+                    .track_scroll(&self.collections_scroll)
                     .bg(theme::surface())
                     .child(page.px(px(theme::CONTENT_PADDING)).pt(px(10.)).pb(px(40.))),
             )
+            .child(ui::scrollbar(
+                "collections-scrollbar",
+                self.collections_scroll.clone(),
+            ))
     }
 }
 

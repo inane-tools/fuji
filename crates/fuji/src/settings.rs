@@ -872,7 +872,7 @@ impl Render for SettingsView {
                     ),
             );
 
-        div()
+        let page = div()
             .id("settings")
             .size_full()
             .overflow_y_scroll()
@@ -905,7 +905,12 @@ impl Render for SettingsView {
                     .child(credits)
                     .child(disclaimer)
                     .child(about),
-            )
+            );
+        div()
+            .relative()
+            .size_full()
+            .child(page)
+            .child(ui::scrollbar("settings-scrollbar", self.scroll.clone()))
     }
 }
 
