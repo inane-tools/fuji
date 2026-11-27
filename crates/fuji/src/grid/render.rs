@@ -132,6 +132,45 @@ impl PhotoGrid {
                     )
                     .tooltip(ui::tooltip("Download (Ctrl+S)")),
                 )
+                .when(self.can_favorite(), |el| {
+                    let all = self.all_favorite(&self.selected.iter().copied().collect::<Vec<_>>());
+                    el.child(
+                        ui::icon_button(
+                            "selection-favorite",
+                            if all { "heart-fill" } else { "favorites" },
+                            cx.listener(|this, _, window, cx| {
+                                this.favorite_selection(&FavoriteSelection, window, cx)
+                            }),
+                        )
+                        .tooltip(ui::tooltip(if all {
+                            "Unfavorite (.)"
+                        } else {
+                            "Favorite (.)"
+                        })),
+                    )
+                })
+                .when(self.can_add_to_album(), |el| {
+                    el.child(
+                        ui::icon_button(
+                            "selection-add-to-album",
+                            "album-add",
+                            cx.listener(|this, event: &ClickEvent, window, cx| {
+                                // Under the button, its right edge near the pointer.
+                                let at = event.position();
+                                let position = point(at.x + px(16.), at.y + px(24.));
+                                let indices = this.selected.iter().copied().collect();
+                                this.open_album_picker(
+                                    indices,
+                                    position,
+                                    gpui::Corner::TopRight,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .tooltip(ui::tooltip("Add to Album (A)")),
+                    )
+                })
                 .when(self.can_delete(), |el| {
                     el.child(
                         ui::icon_button(
