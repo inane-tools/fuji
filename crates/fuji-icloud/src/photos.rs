@@ -460,7 +460,7 @@ impl PhotosClient {
                 .zip(&fine)
                 .filter(|(date, _)| date.is_some())
                 .map(|(_, rank)| *rank)
-                .last()
+                .next_back()
                 .unwrap_or(last);
             let fine: Vec<usize> = (0..COARSE / FINE).map(|i| last + i * FINE).collect();
             let end = fine
@@ -468,7 +468,7 @@ impl PhotosClient {
                 .zip(self.probe_memories(&fine)?)
                 .filter(|(_, date)| date.is_some())
                 .map(|(rank, _)| *rank)
-                .last()
+                .next_back()
                 .unwrap_or(last);
             // The list ends somewhere in [end, end + FINE).
             self.memory_range((end + 1).saturating_sub(n), n + FINE)?
