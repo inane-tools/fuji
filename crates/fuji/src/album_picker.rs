@@ -540,11 +540,9 @@ impl PhotoGrid {
         let picker = self.albums.open.as_ref()?;
         let albums = self.shown_albums(cx);
         let count = picker.items.len();
-        let subtitle = if count == 1 {
-            "1 item".to_string()
-        } else {
-            format!("{} items", crate::collections::group_digits(count))
-        };
+        // How many, when it's a selection; one photo goes without saying.
+        let subtitle =
+            (count > 1).then(|| format!("{} items", crate::collections::group_digits(count)));
         let last = self.albums.last.clone();
         let highlighted = picker.highlighted;
         let this = cx.weak_entity();
@@ -683,12 +681,12 @@ impl PhotoGrid {
                     .text_color(theme::text())
                     .child("Add to Album"),
             )
-            .child(
+            .children(subtitle.map(|subtitle| {
                 div()
                     .text_size(px(12.))
                     .text_color(theme::text_muted())
-                    .child(subtitle),
-            );
+                    .child(subtitle)
+            }));
 
         let up = this.clone();
         let down = this.clone();

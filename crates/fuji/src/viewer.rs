@@ -425,7 +425,7 @@ impl Viewer {
     /// end, where Info opens.
     fn add_to_album(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.index;
-        let position = gpui::point(window.viewport_size().width - px(14.), px(BAR_ROW + 8.));
+        let position = self.picker_position(window);
         self.info_open = false;
         if let Some(grid) = self.grid.upgrade() {
             grid.update(cx, |grid, cx| {
@@ -444,7 +444,7 @@ impl Viewer {
         cx: &mut Context<Self>,
     ) {
         let index = self.index;
-        let position = gpui::point(window.viewport_size().width - px(14.), px(BAR_ROW + 8.));
+        let position = self.picker_position(window);
         if let Some(grid) = self.grid.upgrade() {
             grid.update(cx, |grid, cx| {
                 grid.add_to_last_album(
@@ -457,6 +457,17 @@ impl Viewer {
         }
         self.show_chrome(cx);
         cx.notify();
+    }
+
+    /// Where the album list hangs from (its top right): under the top bar's
+    /// right end, where Info opens. The viewer sits below the app's own bar,
+    /// so from the stage's place in the window.
+    fn picker_position(&self, window: &Window) -> Point<Pixels> {
+        let (right, top) = match self.stage_bounds.get() {
+            Some(bounds) => (bounds.right(), bounds.top()),
+            None => (window.viewport_size().width, px(0.)),
+        };
+        gpui::point(right - px(14.), top + px(BAR_ROW + 8.))
     }
 
     fn album_picker_open(&self, cx: &App) -> bool {
