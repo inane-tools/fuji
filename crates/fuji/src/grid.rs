@@ -82,16 +82,18 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 /// Items per full-record page (with download URLs).
-pub(crate) const PAGE: usize = 100;
+/// Small, because iCloud takes about 50 ms per full record: a short page
+/// gets the first thumbnails on screen sooner.
+pub(crate) const PAGE: usize = 50;
 /// Full-record pages kept in memory.
-const MAX_PAGES: usize = 40;
-const MAX_PAGE_REQUESTS: usize = 2;
+const MAX_PAGES: usize = 80;
+const MAX_PAGE_REQUESTS: usize = 4;
 /// Pages waiting to be requested. Older ones are dropped: after a fast
 /// scroll, what was passed on the way no longer matters.
 const MAX_QUEUED_PAGES: usize = 6;
 /// Items per index-scan request (small records, no URLs).
 const SCAN_PAGE: usize = 200;
-const MAX_SCAN_REQUESTS: usize = 6;
+const MAX_SCAN_REQUESTS: usize = net::BULK_THREADS;
 const MAX_THUMB_REQUESTS: usize = 8;
 /// Extra content kept built above and below the viewport.
 const OVERSCAN: f32 = 600.;
@@ -159,6 +161,7 @@ struct Scan {
     progressive: bool,
     /// The change feed's position when the scan began.
     token: Option<String>,
+    started: Instant,
 }
 
 /// The photo to keep still under the pointer while the zoom changes.

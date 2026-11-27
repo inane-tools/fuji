@@ -365,6 +365,7 @@ impl PhotoGrid {
             fresh: Vec::new(),
             progressive,
             token,
+            started: Instant::now(),
         });
         self.pump_scan(cx);
         cx.notify();
@@ -384,7 +385,7 @@ impl PhotoGrid {
             let album = self.album.clone();
             let generation = self.generation;
             cx.spawn(async move |this, cx| {
-                let result = net::run(move || {
+                let result = net::run_bulk(move || {
                     client
                         .scan(&album, start, limit)
                         .map(|assets| assets.iter().map(IndexItem::from).collect::<Vec<_>>())
@@ -449,6 +450,13 @@ impl PhotoGrid {
         }
         if done {
             if let Some(scan) = self.scan.take() {
+                if std::env::var_os("FUJI_DEBUG").is_some() {
+                    eprintln!(
+                        "grid: indexed {} items in {:.1?}",
+                        scan.count,
+                        scan.started.elapsed()
+                    );
+                }
                 self.token = scan.token;
                 if !progressive {
                     self.set_index(scan.fresh);
